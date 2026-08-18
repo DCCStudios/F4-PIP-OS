@@ -462,14 +462,14 @@ package pipos
             var isColsRow:Boolean = (slot.cols != null && a.cols != null);
             if (isColsRow) {
                // legendary sparkle sits in the ~12px left padding, slightly preceding the name (mockup look).
-               if (a.legendary) { Theme.sparkle(mg, 6, gy, 5, isSel ? 0x0A140A : Theme.WARN); }
+               if (a.legendary) { Theme.legendaryMark(mg, 6, gy, 5, isSel ? 0x0A140A : Theme.WARN); }   // 0.0.60: diamond, not a second star
                if (a.star) {
                   var nameVis:Number = this.optOn ? this._nameNarrowVis : this._nameWideVis;
                   Theme.star(mg, this._markX + nameVis - 8, gy, 6, isSel ? 0x0A140A : Theme.PHOS_BRIGHT);
                }
             } else {
                var mx:Number = 10;
-               if (a.legendary) { Theme.sparkle(mg, mx + 4, gy, 6, isSel ? 0x0A140A : Theme.WARN); mx += MARK_STEP; }
+               if (a.legendary) { Theme.legendaryMark(mg, mx + 4, gy, 6, isSel ? 0x0A140A : Theme.WARN); mx += MARK_STEP; }   // 0.0.60: diamond, not a second star
                if (a.star)      { Theme.star(mg, mx + 4, gy, 6, isSel ? 0x0A140A : Theme.PHOS_BRIGHT); mx += MARK_STEP; }
             }
 

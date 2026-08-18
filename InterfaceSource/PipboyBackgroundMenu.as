@@ -36,8 +36,10 @@ package
       private function draw():void
       {
          var g:* = this.Background_mc.graphics;
-         // dark phosphor ground
-         g.beginFill(GROUND, 1); g.drawRect(0, 0, W, H); g.endFill();
+         // 0.0.60 TRANSPARENCY: the ground is a LIGHT tint, not an opaque plate -- the game world must show
+         // through the whole aperture (the user runs Baka WITHOUT its black background). The shipped SWF is
+         // the bg_transplant build (frame-only art, already open); this keeps the fallback source honest too.
+         g.beginFill(GROUND, 0.22); g.drawRect(0, 0, W, H); g.endFill();
 
          // vignette: successively darker inset frames toward the edges
          var i:int;

@@ -7,6 +7,8 @@ package
    import pipos.VaultBoy;
    import pipos.Debug;
    import pipos.Ticker;
+   import flash.display.Graphics;
+   import flash.display.Shape;
    import flash.display.Sprite;
    import flash.events.Event;
    import flash.events.KeyboardEvent;
@@ -22,7 +24,7 @@ package
    {
       private const DMG_TYPES:Array = ["BALLISTIC","ENERGY","RADIATION","POISON"];
       private static const CATS:Array = ["WEAPONS","APPAREL","AID","MISC","JUNK","MODS","AMMO"];
-      private static const SLOTS:Array = ["HEAD","TORSO","LEFT ARM","RIGHT ARM","LEFT LEG","RIGHT LEG","UNDER ARMOR","OUTFIT","BACKPACK","PIP-BOY"];
+      private static const SLOTS:Array = ["HEAD","TORSO","LEFT ARM","RIGHT ARM","LEFT LEG","RIGHT LEG","UNDER ARMOR","OUTFIT","BACKPACK","WEAPON"];   // 0.0.60: WEAPON row (was the static PIP-BOY row)
 
       private var _chrome:Sprite;
       private var _title:TextField;
@@ -34,6 +36,7 @@ package
       private var _equip:Sprite;
       private var _char:Sprite;
       private var _vb:VaultBoy;
+      private var _charCap:TextField;      // 0.0.60: figure-slot caption ("LIVE CAPTURE" only when 3D active)
       private var _list:PipList;
       private var _card:Sprite;
       private var _quick:Sprite;
@@ -91,7 +94,7 @@ package
       // content bands (title/sub/WT-CAPS/legendary/stat-grid/flavor). The pool is still built for EXPANDED_ROWS
       // (20) up front (PipList maxRows), so 14 collapsed rows are pure visibility -- NO field creation on any
       // interaction path (the pre-sizing that keeps the taller default crash-law-legal).
-      private static const COLLAPSED_ROWS:int = 14;
+      private static const COLLAPSED_ROWS:int = 15;   // 0.0.60: +1 visible row (card compacted again below)
       private static const EXPANDED_ROWS:int = 20;
       private var _expandBtn:Sprite;
       private var _expanded:Boolean = false;
@@ -144,7 +147,7 @@ package
       private var LW:Number  = Theme.ms(470);     // 376     list col width
       // 0.0.43: list panel TALLER (was ms(438)=350.4) so 14 rows show by default; the shortened item card fills
       // the ~150px remaining below. cardTop = BY + _listH + gutter(10); card content bands are compacted to match.
-      private var _listH:Number = Theme.ms(492);  // 393.6   list panel height (card fills the rest below)
+      private var _listH:Number = Theme.ms(524);  // 419.2   0.0.60: taller list (15 rows); card compacts to fit below
 
       private var _inspect:BSButtonHintData;
       private var _drop:BSButtonHintData;
@@ -198,10 +201,13 @@ package
 
       override protected function PopulateButtonHintData():*
       {
-         // Locked spec (M1 mockup): R = Inspect, X = Drop. PCKey is the DISPLAY label; the gamepad
-         // control (R3 / XButton) is unchanged (vanilla-proven). Only the PC-key glyph is corrected.
-         this._inspect = new BSButtonHintData("$INSPECT","R","PSN_R3","Xenon_R3",1,this.doInspect);
-         this._drop    = new BSButtonHintData("$DROP","X","PSN_X","Xenon_X",1,this.doDrop);
+         // 0.0.60 KEY FIX (field-observed swap): the engine routes KEYBOARD keys by its own control map, not
+         // by our PCKey display strings -- keyboard X fires the R3/inspect user event and R is the drop key
+         // (vanilla InvPage ground truth: InspectButton PCKey "X", DropButton PCKey "R"). Displaying R=INSPECT/
+         // X=DROP therefore read swapped in game. Labels now match the engine: X = INSPECT, R = DROP; R is also
+         // claimed directly in onKey (the engine's R->drop dispatch was not reaching this page at all).
+         this._inspect = new BSButtonHintData("$INSPECT","X","PSN_R3","Xenon_R3",1,this.doInspect);
+         this._drop    = new BSButtonHintData("$DROP","R","PSN_X","Xenon_X",1,this.doDrop);
          this._cycle   = new BSButtonHintData("$CYCLE DAMAGE","C","PSN_L1","Xenon_L1",1,this.doCycleDamage);
          this._fav     = new BSButtonHintData("$FAV","Q","PSN_R1","Xenon_R1",1,this.doFav);
          this._sort    = new BSButtonHintData("$SORT","Z","PSN_L3","Xenon_L3",1,this.doSort);
@@ -364,9 +370,12 @@ package
             // P1-B: clip the equipped-item name to the panel via an auto-sized field + scrollRect viewport
             // (SetWidth-free; applyEquip only ever re-sets .text, so the clip holds with no FindFont vector).
             var sv:TextField = Theme.mk(this._equip, 13, Theme.PHOS, false); sv.x = slotCol; sv.y = sy + 2; sv.scrollRect = new Rectangle(0, 0, eqW - slotCol, 17); Theme.setText(sv, "-"); this._equipVal.push(sv);
-            this._equip.graphics.lineStyle(1, Theme.LINE, 0.14); this._equip.graphics.moveTo(0, sy + rowPitch - 3); this._equip.graphics.lineTo(eqW, sy + rowPitch - 3); this._equip.graphics.lineStyle();
+            this._equip.graphics.beginFill(Theme.LINE, 0.14); this._equip.graphics.drawRect(0, sy + rowPitch - 3, eqW, 1); this._equip.graphics.endFill();   // 0.0.60: filled divider (stroke elimination)
          }
-         var cap:TextField = Theme.mk(this._char, 9, Theme.PHOS_DIM, false, "center"); cap.autoSize = "none"; cap.width = this.CCW - 2 * P; cap.multiline = true; cap.wordWrap = true; cap.x = P; cap.y = gh - 150; Theme.setText(cap, "LIVE CAPTURE - DRAG TO ROTATE   ( VAULT BOY PLACEHOLDER - DLL PENDING )");
+         // 0.0.60: equip-change PULSE layer -- a short bright bar at each row's left edge that flares when that
+         // slot's item changes (live feedback for equipping from the list). Graphics-only; faded in onCharPoll.
+         this._eqPulseLayer = new Shape(); this._equip.addChild(this._eqPulseLayer);
+         this._charCap = Theme.mk(this._char, 9, Theme.PHOS_DIM, false, "center"); this._charCap.autoSize = "none"; this._charCap.width = this.CCW - 2 * P; this._charCap.multiline = true; this._charCap.wordWrap = true; this._charCap.x = P; this._charCap.y = gh - 150; Theme.setText(this._charCap, "");   // 0.0.60: caption managed by onCharPoll ("LIVE CAPTURE" only when the 3D figure is live)
          // Parity #qa: the QUICK ACCESS label sits BELOW the icon-box row (mockup order = slots then label). Boxes
          // live in _quick (top at Theme.BB - 84, height 44 -> bottom Theme.BB - 40); the label sits ~6px under them.
          var ql:TextField = Theme.mk(this, 10, Theme.PHOS_DIM, true, "center"); ql.autoSize = "none"; ql.width = this.CCW; ql.x = this.CCX; ql.y = Theme.BB - 34; var qf:* = ql.defaultTextFormat; qf.letterSpacing = 1.6; ql.defaultTextFormat = qf; Theme.setText(ql, "QUICK ACCESS");
@@ -380,27 +389,31 @@ package
          // TITLE: 2-line region (mockup legendary name wraps) + top-right SUB, so both are fixed-box.
          // 0.0.43 SHORT CARD: bands compacted (title 0..30 | chips y32 | legendary y54 | stat grid y70 (pitch 17) |
          // flavor y106) so the whole card fits ~150px and the list panel above can be taller (more visible rows).
-         this._cardTitle = Theme.mk(this._card, 16, Theme.PHOS_BRIGHT, true); this._cardTitle.autoSize = "none"; this._cardTitle.multiline = true; this._cardTitle.wordWrap = true; this._cardTitle.width = CWID0 - 96; this._cardTitle.height = 30; this._cardTitle.x = 0; this._cardTitle.y = 0; Theme.glow(this._cardTitle, Theme.PHOS_BRIGHT, 1);
+         // 0.0.60 SHORTER CARD (round 2, user ask): bands re-compacted -- title 0..24 | chips y24 | legendary y46 |
+         // stat grid y64 (pitch 15) | NO flavor band (the derived line moved to the hover tooltip; the field stays
+         // pooled+hidden). Frees ~25px, giving the list its 15th collapsed row.
+         this._cardTitle = Theme.mk(this._card, 16, Theme.PHOS_BRIGHT, true); this._cardTitle.autoSize = "none"; this._cardTitle.multiline = true; this._cardTitle.wordWrap = true; this._cardTitle.width = CWID0 - 96; this._cardTitle.height = 24; this._cardTitle.x = 0; this._cardTitle.y = 0; Theme.glow(this._cardTitle, Theme.PHOS_BRIGHT, 1);
          this._cardSub = Theme.mk(this._card, 10, Theme.PHOS_DIM, true, "right"); this._cardSub.autoSize = "none"; this._cardSub.width = 150; this._cardSub.height = 14; this._cardSub.x = CWID0 - 150; this._cardSub.y = 4; this._cardSub.visible = false;
          // Legacy damage-mode field parked (kept for pool stability; damage type is now folded into the stat
          // label "DAMAGE . <MODE>"). renderCard keeps it hidden.
          this._cardDmg = Theme.mk(this._card, 11, Theme.WARN, true); this._cardDmg.autoSize = "none"; this._cardDmg.width = 120; this._cardDmg.height = 16; this._cardDmg.x = 0; this._cardDmg.y = 24; this._cardDmg.visible = false;
          // WT / CAPS chip VALUE fields (the chip boxes + icons are drawn in renderCard graphics at these fixed x).
-         this._cardWt = Theme.mk(this._card, 12, Theme.PHOS_BRIGHT, true); this._cardWt.autoSize = "none"; this._cardWt.width = 42; this._cardWt.height = 18; this._cardWt.x = 28; this._cardWt.y = 34; this._cardWt.visible = false;
-         this._cardCaps = Theme.mk(this._card, 12, Theme.PHOS_BRIGHT, true); this._cardCaps.autoSize = "none"; this._cardCaps.width = 42; this._cardCaps.height = 18; this._cardCaps.x = 112; this._cardCaps.y = 34; this._cardCaps.visible = false;
+         this._cardWt = Theme.mk(this._card, 12, Theme.PHOS_BRIGHT, true); this._cardWt.autoSize = "none"; this._cardWt.width = 42; this._cardWt.height = 18; this._cardWt.x = 28; this._cardWt.y = 26; this._cardWt.visible = false;
+         this._cardCaps = Theme.mk(this._card, 12, Theme.PHOS_BRIGHT, true); this._cardCaps.autoSize = "none"; this._cardCaps.width = 42; this._cardCaps.height = 18; this._cardCaps.x = 112; this._cardCaps.y = 26; this._cardCaps.visible = false;
          // LEGENDARY effect line (WARN, visible only when the row is legendary; sparkle drawn in graphics at x6).
-         this._cardLeg = Theme.mk(this._card, 11, Theme.WARN, false); this._cardLeg.autoSize = "none"; this._cardLeg.multiline = true; this._cardLeg.wordWrap = true; this._cardLeg.width = CWID0 - 16; this._cardLeg.height = 16; this._cardLeg.x = 16; this._cardLeg.y = 54; this._cardLeg.visible = false;
+         this._cardLeg = Theme.mk(this._card, 11, Theme.WARN, false); this._cardLeg.autoSize = "none"; this._cardLeg.multiline = true; this._cardLeg.wordWrap = true; this._cardLeg.width = CWID0 - 16; this._cardLeg.height = 16; this._cardLeg.x = 16; this._cardLeg.y = 46; this._cardLeg.visible = false;
          // STAT-PAIR grid: 4 pairs used (2x2), 6 pooled for headroom. Value fields are FIXED-width right-aligned
          // boxes (right edge at colX + CWID/2 - 8), so renderCard sets ONLY .text; labels are auto-size LEFT
          // (proven 0.0.32 pattern, first-texted after the font resolves). CARD_GY must match renderCard.
-         var CARD_GY:Number = 70;   // 0.0.43 SHORT CARD: stat grid top (must match renderCard's gy)
+         var CARD_GY:Number = 64;   // 0.0.60: stat grid top (must match renderCard's gy)
          for (var cpi:int = 0; cpi < 6; cpi++) {
-            var colX0:Number = (cpi % 2 == 0) ? 0 : CWID0 / 2; var rowY0:Number = CARD_GY + Math.floor(cpi / 2) * 17;
+            var colX0:Number = (cpi % 2 == 0) ? 0 : CWID0 / 2; var rowY0:Number = CARD_GY + Math.floor(cpi / 2) * 15;
             var lt0:TextField = Theme.mk(this._card, 11, Theme.PHOS_DIM, false); lt0.x = colX0 + 10; lt0.y = rowY0; lt0.visible = false; this._cardPairL.push(lt0);
             var vt0:TextField = Theme.mk(this._card, 12, Theme.PHOS_BRIGHT, true, "right"); vt0.autoSize = "none"; vt0.width = CWID0 / 2 - 68; vt0.height = 16; vt0.x = colX0 + 60; vt0.y = rowY0; vt0.visible = false; this._cardPairV.push(vt0);
          }
-         // FLAVOR/descriptor sits at a FIXED y below the 2-row grid so renderCard never re-sets its .y after text.
-         this._cardDesc = Theme.mk(this._card, 11, Theme.PHOS_DIM, false); this._cardDesc.autoSize = "none"; this._cardDesc.multiline = true; this._cardDesc.wordWrap = true; this._cardDesc.width = CWID0; this._cardDesc.height = 20; this._cardDesc.x = 0; this._cardDesc.y = CARD_GY + 2 * 17 + 2; this._cardDesc.visible = false;
+         // 0.0.60: flavor band RETIRED from the card (space went to the 15th list row); field stays pooled+hidden
+         // for pool stability. The derived line (aid effect / ammo used-by) still shows in the hover tooltip.
+         this._cardDesc = Theme.mk(this._card, 11, Theme.PHOS_DIM, false); this._cardDesc.autoSize = "none"; this._cardDesc.multiline = true; this._cardDesc.wordWrap = true; this._cardDesc.width = CWID0; this._cardDesc.height = 20; this._cardDesc.x = 0; this._cardDesc.y = CARD_GY + 2 * 15 + 2; this._cardDesc.visible = false;
          var hcols:Array = [["NAME","left"],["AMMO","left"],["WT","right"],["VAL","right"]];
          var innerWd:Number = this.LW - 2 * Theme.PAD;   // 352
          // Parity fix C1: header cells are placed at the SAME list-local x/width as the DATA columns (from
@@ -473,7 +486,7 @@ package
          this.buildInspect();   // pooled fullscreen inspect overlay (topmost page child; hidden until activated)
          // 0.0.57: per-page keybar RESTORED (exonerated -- the radio/data CTDs were the font-donor unload, fixed
          // by the chrome page-def preloader). Vanilla hint bar is now hidden persistently by the chrome.
-         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"R",label:"INSPECT"},{key:"X",label:"DROP"},{key:"C",label:"CYCLE DAMAGE"},{key:"Q",label:"FAV"},{key:"Z",label:"SORT"},{key:"E",label:"EXPAND"},{key:"T",label:"PERK CHART"}], Theme.my(830));   // 0.0.58: raised (was clipped at the frame bottom edge)
+         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"X",label:"INSPECT"},{key:"R",label:"DROP"},{key:"C",label:"CYCLE DAMAGE"},{key:"Q",label:"FAV"},{key:"Z",label:"SORT"},{key:"E",label:"EXPAND"},{key:"T",label:"PERK CHART"}], Theme.my(830));   // 0.0.60: X=INSPECT / R=DROP (engine key map; see hint note)
          // NOTE (0.0.47): the per-page custom keybar was REMOVED. The vanilla shell's button-hint bar is still
          // visible in game and already shows the correct per-page prompts (incl. the dynamic T "LEVEL UP (n)" /
          // perk-chart state), so our own bar just duplicated it. Restyling/repositioning the vanilla bar to the
@@ -501,6 +514,9 @@ package
       // 0.0.20 receiver: the DLL pushes worn-armor names to root1.PipOS_equip (10-elem, panel-row order) once
       // on menu-open. We read it off the shared stage root and update the pooled per-slot fields. UPDATE-TEXT-
       // ONLY: no field creation, no .width (the mechanical FindFont rule; ctor_text_check gates this method).
+      private var _equipLast:Array = null;    // 0.0.60: last applied names (diff -> pulse changed rows)
+      private var _eqPulseLayer:Shape;
+      private var _eqPulse:Array = [];        // per-row pulse alpha 0..1
       private function applyEquip():void
       {
          if (this._equipVal == null || this._equipVal.length == 0) { return; }
@@ -508,14 +524,48 @@ package
             var r:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null;   // == root1 (chrome idiom)
             var eq:* = (r != null) ? r.PipOS_equip : null;
             if (eq == null) { return; }
+            var first:Boolean = (this._equipLast == null);
+            if (first) { this._equipLast = []; }
             for (var i:int = 0; i < this._equipVal.length; i++) {
                var f:TextField = this._equipVal[i];
                if (f == null) { continue; }
                var nm:String = (i < eq.length && eq[i] != null) ? this.stripTags(String(eq[i])) : "";   // #3: strip FIS tag from equipment slot names
-               Theme.setText(f, (nm.length > 0) ? nm : "-");
+               var shown:String = (nm.length > 0) ? nm : "-";
+               // 0.0.60 DIFF-ONLY: setText only when the value actually changed (the DLL re-pushes ~2x/s while
+               // the menu is open, so unconditional setText would reformat 10 fields per push for nothing), and
+               // flare the row's pulse bar on a real change (skip the very first fill).
+               if (this._equipLast[i] != shown) {
+                  Theme.setText(f, shown);
+                  if (!first) { while (this._eqPulse.length <= i) { this._eqPulse.push(0); } this._eqPulse[i] = 1.0; }
+                  this._equipLast[i] = shown;
+               }
             }
          } catch (e:*) { }
       }
+      // Pulse fade (driven from onCharPoll every frame): redraw the left-edge bars for rows with alpha > 0.
+      private function tickEquipPulse(dt:Number):void
+      {
+         if (this._eqPulseLayer == null) { return; }
+         var any:Boolean = false;
+         var g:Graphics = this._eqPulseLayer.graphics; g.clear();
+         for (var i:int = 0; i < this._eqPulse.length; i++) {
+            var a:Number = Number(this._eqPulse[i]);
+            if (a <= 0) { continue; }
+            a -= dt * 0.9;   // ~1.1s fade
+            if (a < 0) { a = 0; }
+            this._eqPulse[i] = a;
+            if (a > 0) {
+               any = true;
+               var sy:Number = 30 + i * 30;
+               g.beginFill(Theme.PHOS_BRIGHT, a);
+               g.drawRect(-8, sy, 3, 24);
+               g.endFill();
+            }
+         }
+         if (!any && this._eqPulseAny) { g.clear(); }
+         this._eqPulseAny = any;
+      }
+      private var _eqPulseAny:Boolean = false;
 
       // POOL BUILDER (called ONCE from buildText, on-stage). Category data changes fire reentrantly inside item
       // clicks (SetQuickkey/SortItemList round-trips), so the strip must NEVER be rebuilt on the change path.
@@ -1015,22 +1065,22 @@ package
             var info:Object = null; try { info = this._itemInfo[bare]; } catch (e3:*) { info = null; }
             if (info != null) { if (info.w != null) { wStr = String(info.w); } if (info.v != null) { vStr = String(info.v); } }
          }
-         g.lineStyle(1, Theme.LINE, 0.4); g.drawRoundRect(0, 32, 74, 20, 6, 6); g.drawRoundRect(84, 32, 74, 20, 6, 6); g.lineStyle();
-         Theme.iconWeight(g, 8, 35, 13, Theme.PHOS); Theme.iconCaps(g, 92, 35, 13, Theme.PHOS);
+         g.lineStyle(1, Theme.LINE, 0.4); g.drawRoundRect(0, 24, 74, 20, 6, 6); g.drawRoundRect(84, 24, 74, 20, 6, 6); g.lineStyle();   // 0.0.60: compacted bands
+         Theme.iconWeight(g, 8, 27, 13, Theme.PHOS); Theme.iconCaps(g, 92, 27, 13, Theme.PHOS);
          Theme.setText(this._cardWt, wStr); this._cardWt.visible = true;
          Theme.setText(this._cardCaps, vStr); this._cardCaps.visible = true;
 
          // LEGENDARY line (only when the row is legendary). Sparkle drawn in graphics; text = effect or generic.
          var isLeg:Boolean = (row != null && row.isLegendary == true);
-         if (isLeg) { Theme.sparkle(g, 6, 60, 5, Theme.WARN); Theme.setText(this._cardLeg, this.cardLegStr(stats, mods)); this._cardLeg.visible = true; }
+         if (isLeg) { Theme.legendaryMark(g, 6, 52, 5, Theme.WARN); Theme.setText(this._cardLeg, this.cardLegStr(stats, mods)); this._cardLeg.visible = true; }   // 0.0.60: matching diamond on the card (compacted y)
          else { this._cardLeg.visible = false; }
 
          // STAT PAIRS (up to 4, per category). UPDATE-ONLY: fixed slots; only .text/.visible/.textColor + diamonds.
          var pairs:Array = this.cardPairsFor(row, stats, type);
-         var gy:Number = 70;   // 0.0.43 SHORT CARD: must match CARD_GY in buildText
+         var gy:Number = 64;   // 0.0.60: must match CARD_GY in buildText
          for (var p:int = 0; p < 6; p++) {
             if (p < 4 && p < pairs.length) {
-               var colX:Number = (p % 2 == 0) ? 0 : CWID / 2; var rowY:Number = gy + Math.floor(p / 2) * 17;
+               var colX:Number = (p % 2 == 0) ? 0 : CWID / 2; var rowY:Number = gy + Math.floor(p / 2) * 15;
                Theme.diamond(g, colX + 3, rowY + 8, 3, Theme.PHOS_DIM);
                var lt:TextField = this._cardPairL[p]; lt.visible = true; Theme.setText(lt, String(pairs[p].t));
                var vv:String = String(pairs[p].v);
@@ -1039,11 +1089,9 @@ package
             } else { this._cardPairL[p].visible = false; this._cardPairV[p].visible = false; }
          }
 
-         // FLAVOR / derived descriptor (aid effect name, ammo used-by, non-legendary apparel effect). Real items
-         // carry no prose, so this is a neutral derived line from data we HAVE -- never fabricated per-item text.
-         var descStr:String = this.cardDescStr(row, stats, type);
-         if (descStr.length > 0) { this._cardDesc.visible = true; Theme.setText(this._cardDesc, descStr); }
-         else { this._cardDesc.visible = false; }
+         // 0.0.60: flavor band retired (space went to the 15th list row); the derived line lives in the hover
+         // tooltip instead. Field stays pooled + permanently hidden.
+         this._cardDesc.visible = false;
       }
 
       // ---- TASK B pure derivation helpers (no TextField access; gated update-only by ctor_text_check) ----
@@ -1120,9 +1168,13 @@ package
             out.push({ t: "RANGE",     v: (stats.range != null) ? String(Math.round(Number(stats.range))) : D });
             out.push({ t: "ACCURACY",  v: (stats.acc != null) ? String(Math.round(Number(stats.acc))) : D });
          } else if (type == "apparel") {
-            out.push({ t: "DMG RESIST",    v: (stats.dr != null) ? String(Math.round(Number(stats.dr))) : D });
-            out.push({ t: "ENERGY RESIST", v: (stats.er != null) ? String(Math.round(Number(stats.er))) : D });
-            out.push({ t: "RAD RESIST",    v: (stats.rr != null) ? String(Math.round(Number(stats.rr))) : D });
+            // 0.0.60 EQUIPPED-COMPARISON: append (+N)/(-N) against the item currently equipped in an
+            // overlapping biped slot (DLL now pushes slots+equipped per armor entry). The equipped item
+            // itself gets no suffix; missing data degrades to the plain value.
+            var cmp:Object = this.equippedComparatorFor(stats);
+            out.push({ t: "DMG RESIST",    v: this.cmpVal(stats.dr, (cmp != null) ? cmp.dr : null, D) });
+            out.push({ t: "ENERGY RESIST", v: this.cmpVal(stats.er, (cmp != null) ? cmp.er : null, D) });
+            out.push({ t: "RAD RESIST",    v: this.cmpVal(stats.rr, (cmp != null) ? cmp.rr : null, D) });
          } else if (type == "aid") {
             out.push({ t: "MAGNITUDE", v: (stats.magnitude != null) ? String(Math.round(Number(stats.magnitude))) : D });
             out.push({ t: "DURATION",  v: (stats.duration != null) ? ((Number(stats.duration) > 0) ? (String(Math.round(Number(stats.duration))) + "s") : "INSTANT") : D });
@@ -1131,6 +1183,34 @@ package
             out.push({ t: "TYPE", v: "AMMO" });
          }
          return out;
+      }
+      // 0.0.60: find the stats entry of the item currently EQUIPPED in a biped slot overlapping the given
+      // apparel's slots (skipping the item itself when it IS the equipped one -- comparing to self is noise).
+      // Scans the pushed stats map; equipped armor entries are few, the scan is a handful of property reads.
+      private function equippedComparatorFor(stats:Object):Object
+      {
+         if (stats == null || stats.slots == null || this._itemStats == null) { return null; }
+         if (stats.equipped == true) { return null; }
+         var mySlots:uint = uint(stats.slots);
+         if (mySlots == 0) { return null; }
+         try {
+            for (var k:String in this._itemStats) {
+               var e:Object = this._itemStats[k];
+               if (e == null || e.equipped != true || e.slots == null) { continue; }
+               if ((uint(e.slots) & mySlots) != 0) { return e; }
+            }
+         } catch (ec:*) {}
+         return null;
+      }
+      // Value + comparison suffix: "24 (+5)" / "24 (-3)" / "24" (equal or no comparator). Missing own value -> dash.
+      private function cmpVal(own:*, other:*, dash:String):String
+      {
+         if (own == null) { return dash; }
+         var v:int = Math.round(Number(own));
+         if (other == null) { return String(v); }
+         var d:int = v - Math.round(Number(other));
+         if (d == 0) { return String(v); }
+         return String(v) + " (" + (d > 0 ? "+" : "") + d + ")";
       }
       // Neutral derived flavor: aid effect name / ammo used-by / a non-legendary apparel effect. Empty otherwise
       // (weapons + plain items get no flavor rather than invented prose).
@@ -1699,15 +1779,18 @@ package
          // Bail on an invalid item index so neither the inspect overlay nor the vanilla ExamineItem fallback ever
          // dispatches ExamineItem(-1) to the DLL -- a collapsed-header INSPECT is a clean no-op.
          if (this.invIdx(this._list.selectedIndex) < 0) { return; }
-         // Gate to WEAPONS + APPAREL (both carry stats + mods per the contract; mockup gates to weapons). Other
-         // categories fall back to the vanilla 3D examine, so the page's INSPECT/R chip is never a dead control.
-         if (this._curTab == 0 || this._curTab == 1) { this.enterInspect(); }
-         else { this.sfx("UIMenuOK"); BGSExternalInterface.call(this.codeObj, "ExamineItem", this.invIdx(this._list.selectedIndex)); }
+         // 0.0.60: ALL categories use the NATIVE ExamineItem (field feedback: the custom vector overlay showed
+         // an emblem instead of the item). The engine opens its 3D examine view -- the REAL modded weapon/armor
+         // model with the engine's own blurred backdrop -- which is exactly the requested behavior. The custom
+         // overlay (enterInspect) is retired from this path but kept compiled for a future stats-compare mode.
+         this.sfx("UIMenuOK");
+         Theme.life("IV.ex" + this.invIdx(this._list.selectedIndex));
+         BGSExternalInterface.call(this.codeObj, "ExamineItem", this.invIdx(this._list.selectedIndex));
       }
       // FIS folders: guard on the MAPPED item index (invIdx), not just selectedIndex>=0 -- an all-collapsed list
       // leaves the selection on a folder header (invIdx==-1), which would otherwise dispatch ItemDrop(-1,1) /
       // SetQuickkey(-1,0) to the DLL. Only act when the selection maps to a real InvItems row.
-      private function doDrop():void    { if (this.invIdx(this._list.selectedIndex) >= 0) { this.sfx("UIMenuOK"); BGSExternalInterface.call(this.codeObj, "ItemDrop", this.invIdx(this._list.selectedIndex), 1); } }
+      private function doDrop():void    { var di:int = this.invIdx(this._list.selectedIndex); if (di >= 0) { this.sfx("UIMenuOK"); Theme.life("IV.dr" + di); BGSExternalInterface.call(this.codeObj, "ItemDrop", di, 1); } }
       private function doCycleDamage():void { this._dmgIndex++; this.sfx("UIMenuPrevNext"); this.renderCard(); }
       private function doFav():void     { if (this.invIdx(this._list.selectedIndex) >= 0) { this.sfx("UIPipBoyFavoriteMenuDPadA"); BGSExternalInterface.call(this.codeObj, "SetQuickkey", this.invIdx(this._list.selectedIndex), 0); } }
       // Z / L3 fallback: cycle our own per-category sort NAME(A-Z) -> WT(desc) -> VAL(desc) -> NAME ... (matches the
@@ -1906,6 +1989,7 @@ package
       // it the moment the contract drops (menu close resets it, so re-opens re-evaluate cleanly).
       private var _charPoll:Ticker;
       private var _char3dOn:Boolean = false;
+      private var _eqPollN:int = 0;
       private function onCharPoll(dt:Number):void
       {
          var avail:Boolean = false;
@@ -1917,8 +2001,13 @@ package
          if (avail != this._char3dOn) {
             this._char3dOn = avail;
             if (this._vb != null) { this._vb.visible = !avail; }
+            if (this._charCap != null) { Theme.setText(this._charCap, avail ? "LIVE CAPTURE" : ""); }   // 0.0.60: caption only when 3D is live
             Theme.life(avail ? "IV.3d1" : "IV.3d0");   // trail: figure slot switched to 3D / back to Vault Boy
          }
+         // 0.0.60: equipment live-refresh. The DLL re-pushes root1.PipOS_equip ~2x/s while the menu is open;
+         // re-apply every ~15 frames (applyEquip is diff-only, so unchanged pushes cost 10 string compares).
+         if (++this._eqPollN >= 15) { this._eqPollN = 0; this.applyEquip(); }
+         this.tickEquipPulse(dt);
       }
       private function onPageUnstage(e:Event):void
       {
@@ -1965,6 +2054,7 @@ package
          // While inspecting, the overlay CAPTURES W/S/R/Escape and the underlying list does NOT act on any key.
          if (this._inspecting) { this.onInspectKey(e.keyCode); return; }
          if (e.keyCode == 69) { this.doExpand(); return; }   // E = expand/collapse the inventory list (QOL-4 hotkey)
+         if (e.keyCode == 82) { this.doDrop(); return; }     // 0.0.60: R = DROP claimed directly (the engine's R dispatch never reached this page)
          this._list.handleKey(e.keyCode);
       }
 

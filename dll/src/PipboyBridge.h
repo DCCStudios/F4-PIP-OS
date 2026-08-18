@@ -12,4 +12,10 @@ namespace PipOS
     public:
         static bool Install();  // register the menu open/close sink
     };
+
+    // 0.0.60: called once per frame from CharacterCapture's main-thread capture task while the Pip-Boy is
+    // open. Rate-limits internally and re-pushes the equipment panel (root1.PipOS_equip) so in-menu equips
+    // show up live (there is no TESEquipEvent source in this commonlib; polling the fixed 10-slot sweep
+    // ~2x/s is cheap and thread-correct).
+    void RepushEquipmentPeriodic();
 }

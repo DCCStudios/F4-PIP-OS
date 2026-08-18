@@ -33,12 +33,14 @@ namespace PipOS
         float VeilAlpha() const { return _veilAlpha; }
         bool  CrtBreathe() const { return _crtBreathe; }
         bool  OpenAnim() const { return _openAnim; }
+        float OpenAnimSpeed() const { return _openAnimSpeed; }   // 0.0.60
         bool  Folders() const { return _folders; }
         bool  ShowRPM() const { return _showRPM; }
 
         float* pVeilAlpha() { return &_veilAlpha; }
         bool*  pCrtBreathe() { return &_crtBreathe; }
         bool*  pOpenAnim() { return &_openAnim; }
+        float* pOpenAnimSpeed() { return &_openAnimSpeed; }      // 0.0.60
         bool*  pFolders() { return &_folders; }
         bool*  pShowRPM() { return &_showRPM; }
         bool*  pLive3D() { return &_live3D; }
@@ -110,6 +112,7 @@ namespace PipOS
         float _veilAlpha{ 0.10f };  // PIP-OS world-dim veil alpha (what WE own; NOT Baka's fPipboyEffectColorRGB)
         bool _crtBreathe{ true };   // Chrome CRT_BREATHE runtime override
         bool _openAnim{ true };     // Chrome OPEN_ANIM runtime override
+        float _openAnimSpeed{ 1.0f };  // 0.0.60: power-on speed multiplier (0.25-4.0; 1 = shipped timing)
         bool _folders{ true };      // Theme.FOLDERS runtime override (FIS/Complex-Sorter folder grouping)
         bool _showRPM{ false };     // Weapon card stat: false = vanilla FIRE RATE (default), true = RPM (rounds/min)
     };

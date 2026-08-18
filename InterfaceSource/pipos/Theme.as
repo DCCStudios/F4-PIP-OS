@@ -244,6 +244,21 @@ package pipos
          g.lineTo(cx - r, cy); g.lineTo(cx - r * 0.28, cy - r * 0.28);
          g.endFill();
       }
+      // 0.0.60 LEGENDARY MARKER: hollow diamond with a center dot -- a clearly different SILHOUETTE from the
+      // favorite star (field feedback: the 4-point sparkle still read as "another star" at 5-6px). Fill-only.
+      public static function legendaryMark(g:Graphics, cx:Number, cy:Number, r:Number, color:uint):void
+      {
+         g.lineStyle();
+         g.beginFill(color, 1);
+         // outer rhombus
+         g.moveTo(cx, cy - r); g.lineTo(cx + r * 0.7, cy); g.lineTo(cx, cy + r); g.lineTo(cx - r * 0.7, cy);
+         g.endFill();
+         // punch the middle back out (darker inner rhombus) then a bright center dot
+         g.beginFill(0x0A140A, 1);
+         g.moveTo(cx, cy - r * 0.55); g.lineTo(cx + r * 0.38, cy); g.lineTo(cx, cy + r * 0.55); g.lineTo(cx - r * 0.38, cy);
+         g.endFill();
+         g.beginFill(color, 1); g.drawCircle(cx, cy, r * 0.18); g.endFill();
+      }
 
       // Mockup .panel: translucent dark fill, rounded 8px, hairline edge, + 4 corner accent ticks.
       public static function panel(g:Graphics, x:Number, y:Number, w:Number, h:Number, borderAlpha:Number = 0.38):void

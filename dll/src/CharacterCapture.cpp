@@ -1,5 +1,6 @@
 #include "PCH.h"
 #include "CharacterCapture.h"
+#include "PipboyBridge.h"
 #include "Settings.h"
 #include "Scaleform/G/GFx_ASMovieRootBase.h"
 
@@ -297,8 +298,12 @@ namespace PipOS
 
             g_renderer = RE::Interface3D::Renderer::GetByName(name);
             if (!g_renderer) {
+                // 0.0.60: kTerminal (0x9), not kStandard3DModel (0x7). PipboyMenu draws at kStandard (0x6) but
+                // the pipboy layer family reaches kPipboy (0x8); at 0x7 the screen-attached quad could composite
+                // UNDER the (Baka-fullscreened) menu -- the "renderer enabled but no figure visible" symptom.
+                // kTerminal sits above both, below game messages/cursor, and only exists while the Pip-Boy is open.
                 g_renderer = RE::Interface3D::Renderer::Create(
-                    name, RE::UI_DEPTH_PRIORITY::kStandard3DModel, fov, false);
+                    name, RE::UI_DEPTH_PRIORITY::kTerminal, fov, false);
             }
             if (!g_renderer) {
                 logger::error("[PipOS][3D] Interface3D renderer creation returned null");
@@ -716,6 +721,9 @@ namespace PipOS
             if (g_available.load() != wasAvailable) {
                 SchedulePushContract();  // clone went live / was released -> tell AS3 (available:true/false)
             }
+            // 0.0.60: piggyback the equipment live-refresh on this main-thread pass (runs while the Pip-Boy is
+            // open regardless of bLive3D -- Tick() early-outs but this line still fires). Rate-limited inside.
+            if (g_pipboyOpen.load()) { RepushEquipmentPeriodic(); }
         }
 
         // WORKER-THREAD-SAFE hook body: on this fork RunActorUpdates fires on BSMTAManager / HighFPSPhysics

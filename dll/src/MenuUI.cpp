@@ -33,8 +33,8 @@ namespace
 
         ImGuiMCP::TextWrapped(
             "Customize the PIP-OS Pip-Boy. Changes apply the next time you open the Pip-Boy. "
-            "Press Save to keep them across sessions (writes the [Customization] block of "
-            "PipOSPipboy.ini); without Save they last only for this session.");
+            "Press Save to keep them across sessions (writes PipOSPipboy_User.ini, which build "
+            "updates never overwrite); without Save they last only for this session.");
         ImGuiMCP::Spacing();
 
         ImGuiMCP::SeparatorText("Background dimming");
@@ -53,6 +53,8 @@ namespace
         ImGuiMCP::TextDisabled("Slow, subtle glow oscillation on the CRT overlay.");
         ImGuiMCP::Checkbox("Power-on open animation", settings->pOpenAnim());
         ImGuiMCP::TextDisabled("Short phosphor fade-in of the chrome + veil each time the Pip-Boy opens.");
+        ImGuiMCP::SliderFloat("Open animation speed", settings->pOpenAnimSpeed(), 0.25F, 4.0F, "%.2fx");
+        ImGuiMCP::TextDisabled("Speed multiplier for the power-on animation. 1.00x = default; higher = faster.");
 
         ImGuiMCP::Spacing();
         ImGuiMCP::SeparatorText("Inventory");
@@ -68,10 +70,9 @@ namespace
         ImGuiMCP::Checkbox("Live 3D character (experimental)", settings->pLive3D());
         ImGuiMCP::TextColored(
             ImGuiMCP::ImVec4(0.90F, 0.62F, 0.16F, 1.0F),
-            "Experimental and OFF by default. Renders a live rotatable equipped-player capture behind the "
-            "menu instead of the Vault Boy. TURNING IT ON/OFF only takes effect after a game RESTART (the "
-            "capture hook is installed once at load), and it is the least-tested option -- leave it off unless "
-            "you are testing it.");
+            "Experimental and OFF by default. Renders a live capture of your equipped character in the "
+            "inventory figure slot instead of the Vault Boy. Applies on the NEXT Pip-Boy open -- close and "
+            "re-open the Pip-Boy after toggling (no game restart needed).");
 
         ImGuiMCP::Spacing();
         ImGuiMCP::SeparatorText("Figure placement (Live 3D)");
@@ -110,6 +111,7 @@ namespace
             *settings->pVeilAlpha() = 0.10F;
             *settings->pCrtBreathe() = true;
             *settings->pOpenAnim() = true;
+            *settings->pOpenAnimSpeed() = 1.0F;
             *settings->pFolders() = true;
             *settings->pShowRPM() = false;
             *settings->pLive3D() = false;

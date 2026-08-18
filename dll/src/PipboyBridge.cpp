@@ -96,7 +96,7 @@ namespace PipOS
         // never derefs. Reads run on the UI-task thread (same proven path as the chrome attach); the whole
         // native section is wrapped in try/catch so a failed read degrades to a blank panel, never a CTD.
         // bit i of TESObjectARMO::bipedModelData.bipedObjectSlots == RE::BIPED_OBJECT index i == CK slot 30+i.
-        void PushEquipmentNow(Scaleform::GFx::Movie* a_view)
+        void PushEquipmentNow(Scaleform::GFx::Movie* a_view, bool a_quiet = false)
         {
             if (!a_view) { return; }
             auto* movieRoot = a_view->asMovieRoot.get();
@@ -121,8 +121,8 @@ namespace PipOS
                 (1u << 15),              // 5 R.LEG       : [A] Right Leg(45)
                 (1u << 6),               // 6 UNDER ARMOR : [U] Torso(36) - undergarment torso layer
                 (1u << 3),               // 7 OUTFIT      : Body(33) - full-body outfit
-                (0x1Fu << 24),           // 8 BACKPACK    : Unnamed1..5(54..58) - common modded backpack slots
-                (1u << 30),              // 9 PIP-BOY     : Pipboy(60)
+                (0xFu << 21),            // 8 BACKPACK    : slots 51-54 (bits 21-24) - the usual backpack slots (user-specified)
+                0u,                      // 9 WEAPON      : filled from the equipped WEAPON below, not from armor slots
             };
             std::array<std::string, 10> names{};  // empty string => AS renders "-"
 
@@ -153,6 +153,24 @@ namespace PipOS
                 } else {
                     logger::info("[PipOS] equip: player/inventoryList null; pushing empty panel");
                 }
+                // 0.0.60: row 9 = the currently EQUIPPED WEAPON (replaces the old static PIP-BOY row). Same
+                // guarded stack sweep, weapons instead of armor; first equipped weapon stack wins.
+                if (pc && pc->inventoryList) {
+                    pc->inventoryList->ForEachStack(
+                        [](RE::BGSInventoryItem& a_item) -> bool {
+                            return a_item.object && a_item.object->As<RE::TESObjectWEAP>() != nullptr;
+                        },
+                        [&](RE::BGSInventoryItem& a_item, RE::BGSInventoryItem::Stack& a_stack) -> bool {
+                            if (!a_stack.IsEquipped()) { return true; }
+                            if (!names[9].empty()) { return false; }
+                            const char* nm = a_item.GetDisplayFullName(a_stack.extra.get());
+                            if ((!nm || nm[0] == '\0') && a_item.object) {
+                                if (auto* w = a_item.object->As<RE::TESObjectWEAP>()) { nm = w->GetFullName(); }
+                            }
+                            if (nm && nm[0] != '\0') { names[9] = nm; }
+                            return names[9].empty();
+                        });
+                }
             } catch (...) {
                 logger::error("[PipOS] equip: native read threw; degrading to gathered/blank panel");
             }
@@ -169,8 +187,10 @@ namespace PipOS
                     arr.PushBack(s);
                 }
                 root.SetMember("PipOS_equip", arr);
-                logger::info("[PipOS] equip: pushed 10 rows (HEAD='{}' TORSO='{}' PIPBOY='{}')",
-                    names[0], names[1], names[9]);
+                if (!a_quiet) {
+                    logger::info("[PipOS] equip: pushed 10 rows (HEAD='{}' TORSO='{}' WEAPON='{}')",
+                        names[0], names[1], names[9]);
+                }
             } catch (...) {
                 logger::error("[PipOS] equip: marshalling threw; skipped (panel stays blank)");
             }
@@ -330,6 +350,8 @@ namespace PipOS
             double        dr{ 0.0 };
             bool          haveEr{ false };   double er{ 0.0 };
             bool          haveRr{ false };   double rr{ 0.0 };
+            std::uint32_t slotMask{ 0 };     // 0.0.60: biped slots (comparison key for the apparel +/- deltas)
+            bool          equipped{ false }; // 0.0.60: stack equipped flag (comparison baseline marker)
 
             // aid
             bool          haveMagDur{ false };
@@ -517,6 +539,8 @@ namespace PipOS
                         ? *static_cast<const RE::TESObjectARMO::InstanceData*>(a_inst)
                         : armo->armorData;
                     a_out.dr = static_cast<double>(ad.rating);
+                    a_out.slotMask = armo->bipedModelData.bipedObjectSlots;      // 0.0.60: comparison key
+                    if (a_stack) { a_out.equipped = a_stack->IsEquipped(); }     // 0.0.60: comparison baseline
                     if (ad.damageTypes) {
                         for (const auto& dt : *ad.damageTypes) {
                             auto* dmgType = dt.first ? dt.first->As<RE::BGSDamageType>() : nullptr;
@@ -709,6 +733,8 @@ namespace PipOS
                                 entry.SetMember("dr", Scaleform::GFx::Value(pod.dr));
                                 if (pod.haveEr) { entry.SetMember("er", Scaleform::GFx::Value(pod.er)); }
                                 if (pod.haveRr) { entry.SetMember("rr", Scaleform::GFx::Value(pod.rr)); }
+                                entry.SetMember("slots", Scaleform::GFx::Value(static_cast<double>(pod.slotMask)));   // 0.0.60
+                                entry.SetMember("equipped", Scaleform::GFx::Value(pod.equipped));                      // 0.0.60
                                 if (pod.haveEffect) {
                                     Scaleform::GFx::Value se;
                                     movieRoot->CreateString(std::addressof(se), pod.effect);
@@ -840,11 +866,12 @@ namespace PipOS
                 obj.SetMember("veil", Scaleform::GFx::Value(static_cast<double>(s->VeilAlpha())));
                 obj.SetMember("breathe", Scaleform::GFx::Value(s->CrtBreathe()));
                 obj.SetMember("openAnim", Scaleform::GFx::Value(s->OpenAnim()));
+                obj.SetMember("openAnimSpeed", Scaleform::GFx::Value(static_cast<double>(s->OpenAnimSpeed())));   // 0.0.60
                 obj.SetMember("folders", Scaleform::GFx::Value(s->Folders()));
                 obj.SetMember("showRPM", Scaleform::GFx::Value(s->ShowRPM()));
                 root.SetMember("PipOS_settings", obj);
-                logger::info("[PipOS] settings: pushed veil={} breathe={} openAnim={} folders={} showRPM={}",
-                    s->VeilAlpha(), s->CrtBreathe(), s->OpenAnim(), s->Folders(), s->ShowRPM());
+                logger::info("[PipOS] settings: pushed veil={} breathe={} openAnim={} speed={} folders={} showRPM={}",
+                    s->VeilAlpha(), s->CrtBreathe(), s->OpenAnim(), s->OpenAnimSpeed(), s->Folders(), s->ShowRPM());
             } catch (...) {
                 logger::error("[PipOS] settings: marshalling threw; skipped (AS uses const fallbacks)");
             }
@@ -1136,6 +1163,19 @@ namespace PipOS
                                     PushItemStatsNow(view);  // 0.0.25: per-item stats + mods + favorites (formID-keyed)
                                     PushSettingsNow(view);   // 0.0.38: customization -> root1.PipOS_settings (veil/breathe/openAnim/folders)
                                     SeedFolderMemNow(view);  // 0.0.59: session folder memory -> root1.PipOS_folderMem
+                                    // 0.0.60 TRANSPARENCY PASS: force BOTH pipboy movies to composite with a
+                                    // fully transparent movie background. Our AS layers have no full-screen
+                                    // opaque fill and the shipped background art is aperture-open, so any
+                                    // remaining world-blocking dark comes from the movie background the engine
+                                    // clears behind each SWF. 0.0f == see-through to the game world.
+                                    if (view) { view->SetBackgroundAlpha(0.0f); }
+                                    if (auto bgMenu = ui->GetMenu(RE::BSFixedString("PipboyBackgroundMenu"))) {
+                                        if (auto* bgView = bgMenu->uiMovie.get()) {
+                                            bgView->SetBackgroundAlpha(0.0f);
+                                            logger::info("[PipOS] transparency: background-menu movie alpha=0");
+                                        }
+                                    }
+                                    logger::info("[PipOS] transparency: pipboy movie background alpha=0");
                                     if (auto* s = Settings::GetSingleton()) {
                                         DiagnoseViewport(view, s->WidescreenSpike());  // spike: default 0 = no-op
                                     }
@@ -1147,6 +1187,24 @@ namespace PipOS
                 return RE::BSEventNotifyControl::kContinue;
             }
         };
+    }
+
+    // 0.0.60: equipment live-refresh driver. Called once per frame from CharacterCapture's main-thread task
+    // while the Pip-Boy is open; every ~30th call re-pushes root1.PipOS_equip via a UI task (quiet -- no log
+    // spam), so equipping from the inventory list updates the EQUIPMENT panel within ~half a second.
+    void RepushEquipmentPeriodic()
+    {
+        static std::uint32_t s_ctr = 0;
+        if (++s_ctr % 30 != 0) { return; }
+        if (auto* task = F4SE::GetTaskInterface()) {
+            task->AddUITask([]() {
+                if (auto* ui = RE::UI::GetSingleton()) {
+                    if (auto menu = ui->GetMenu(kPipboyMenu)) {
+                        if (auto* view = menu->uiMovie.get()) { PushEquipmentNow(view, true); }
+                    }
+                }
+            });
+        }
     }
 
     bool PipboyBridge::Install()

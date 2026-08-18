@@ -163,6 +163,7 @@ package pipos
       // are consumed only via graphics fill alpha (veil) or as booleans gating a Sprite/container .alpha write --
       // no TextField, no geometry -- so the CRASH LAW holds.
       private var _veilAlpha:Number = VEIL_ALPHA;
+      private var _openSpeed:Number = 1;        // 0.0.60: power-on speed multiplier (settings slider; 0.25-4)
       private var _openAnim:Boolean = OPEN_ANIM;
       private var _breathe:Boolean = CRT_BREATHE;
 
@@ -270,6 +271,11 @@ package pipos
             }
             if (s.hasOwnProperty("openAnim")) { this._openAnim = (s.openAnim == true); }
             if (s.hasOwnProperty("breathe")) { this._breathe = (s.breathe == true); }
+            // 0.0.60: open-animation SPEED multiplier (user slider). 1.0 = shipped timing; 2.0 = twice as fast.
+            if (s.hasOwnProperty("openAnimSpeed")) {
+               var os:Number = Number(s.openAnimSpeed);
+               if (!isNaN(os) && os >= 0.25 && os <= 4) { this._openSpeed = os; }
+            }
             if (this._dbg != null) { this._dbg.mark("setOK"); }
          } catch (er:*) { if (this._dbg != null) { this._dbg.mark("setFAIL"); } }
       }
@@ -655,7 +661,7 @@ package pipos
          // opening slit, then settle a phosphor bloom. Sprite scaleY/.alpha/.visible ONLY (container transforms) --
          // no geometry, no TextField. Time-based off dt (30fps root). Self-disarms when the bloom finishes.
          if (this._powerOn) {
-            this._powerT += dt;
+            this._powerT += dt * this._openSpeed;   // 0.0.60: user speed multiplier (slider); 1.0 = shipped timing
             var pt:Number = this._powerT;
             if (pt < POWER_REVEAL) {
                var rp:Number = pt / POWER_REVEAL;

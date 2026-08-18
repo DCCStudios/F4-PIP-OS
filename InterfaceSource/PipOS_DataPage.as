@@ -111,6 +111,17 @@ package
          for (var oi:int = 0; oi < OBJ_POOL; oi++) {
             var r:TextField = Theme.mk(this._detail, 15, Theme.PHOS, false); r.autoSize = "none"; r.multiline = true; r.wordWrap = true; r.width = innerW; r.height = OBJ_SLOT; r.x = 0; r.y = OBJ_Y0 + oi * OBJ_SLOT; r.visible = false; this._objRows.push(r);
          }
+         // 0.0.60 MISC-OBJECTIVE TRACKING: pooled hit sprites over the objective slots. Visible ONLY while the
+         // selected quest is a Misc bucket (formID==0 -- vanilla QuestsTab mechanism: objective-level
+         // SetQuestActive with the objective ENTRY OBJECT). Fixed baked geometry; render toggles .visible only.
+         this._objHits = [];
+         for (var ohi:int = 0; ohi < OBJ_POOL; ohi++) {
+            var hs:Sprite = new Sprite();
+            hs.graphics.beginFill(0, 0.004); hs.graphics.drawRect(0, OBJ_Y0 + ohi * OBJ_SLOT, innerW, OBJ_SLOT - 4); hs.graphics.endFill();
+            hs.name = "o" + ohi; hs.buttonMode = true; hs.visible = false;
+            hs.addEventListener(MouseEvent.MOUSE_DOWN, this.onObjClick);
+            this._detail.addChild(hs); this._objHits.push(hs);
+         }
          // Summary sits at a FIXED y below the common objective range (~7 slots). Fixed => renderDetail never
          // sets its geometry after text (same SetY crash class). Quests with many objectives AND the summary
          // toggled may visually overlap the lower objectives (rare, cosmetic; crash-safe).
@@ -369,18 +380,26 @@ package
          // creation (buildText) -> NO geometry is set on any pooled text-bearing field here, so the SetY ->
          // FindFont(NULL) crash on the quest-click path cannot occur.
          var shown:int = 0;
+         // 0.0.60: Misc bucket (formID==0) => objectives are individually clickable/trackable (vanilla
+         // QuestsTab mechanism). _objMap records shown-row -> _objArray index for the click handler; the
+         // ACTIVE (tracked) objective is marked "[>]".
+         var isMisc:Boolean = (e != null && e.formID == 0);
+         this._objMap = [];
          if (this._objArray != null) {
             for (var o:int = 0; o < this._objArray.length && shown < this._objRows.length; o++) {
                var ob:Object = this._objArray[o]; if (ob == null) { continue; }
                var met:Boolean = (ob.isCompleted == true || ob.completed == true);
+               var act:Boolean = (ob.active == true);
                var row:TextField = this._objRows[shown];
                row.visible = true;
-               Theme.setText(row, (met ? "[x] " : "[ ] ") + (ob.text != null ? String(ob.text) : ""));
-               row.textColor = met ? Theme.PHOS_DIM : Theme.PHOS;
+               Theme.setText(row, (met ? "[x] " : (act ? "[>] " : "[ ] ")) + (ob.text != null ? String(ob.text) : ""));
+               row.textColor = met ? Theme.PHOS_DIM : (act ? Theme.PHOS_BRIGHT : Theme.PHOS);
+               if (shown < this._objHits.length) { (this._objHits[shown] as Sprite).visible = (isMisc && !met); }
+               this._objMap.push(o);
                shown++;
             }
          }
-         for (var k:int = shown; k < this._objRows.length; k++) { this._objRows[k].visible = false; }
+         for (var k:int = shown; k < this._objRows.length; k++) { this._objRows[k].visible = false; if (k < this._objHits.length) { (this._objHits[k] as Sprite).visible = false; } }
          if (this._showSummary && e != null && e.description != null) {
             this._detailSummary.visible = true; Theme.setText(this._detailSummary, String(e.description));
          } else { this._detailSummary.visible = false; }
@@ -392,7 +411,44 @@ package
          else if (this._curTab == 1) { var wo:int = this.mapIndex(this._list.selectedIndex); if (wo < 0 || this._lastData == null || this._lastData.WorkshopsList == null || wo >= this._lastData.WorkshopsList.length) { return; } var w:Object = this._lastData.WorkshopsList[wo]; if (w == null) { return; } this.sfx("UIMenuOK"); BGSExternalInterface.call(this.codeObj, "ShowWorkshopOnMap", w.mapMarkerID); }
       }
       private function doSummary():void { this._showSummary = !this._showSummary; this.sfx("UIMenuPrevNext"); this.renderDetail(this._list.selectedIndex); }
-      private function doTrack():void { if (this._curTab != 0) { return; } var q:Object = this.questAt(this._list.selectedIndex); if (q == null) { return; } this.sfx((q.active == true) ? "UIMenuCancel" : "UIMenuOK"); BGSExternalInterface.call(this.codeObj, "SetQuestActive", q); }
+      private function doTrack():void
+      {
+         if (this._curTab != 0) { return; }
+         var q:Object = this.questAt(this._list.selectedIndex); if (q == null) { return; }
+         // 0.0.60: a Misc bucket (formID==0) is not itself trackable -- Enter tracks its first UNMET objective
+         // (clicking a specific objective row tracks that one; see onObjClick). Real quests track as before.
+         if (q.formID == 0) {
+            if (this._objArray != null) {
+               for (var o:int = 0; o < this._objArray.length; o++) {
+                  var ob:Object = this._objArray[o];
+                  if (ob != null && !(ob.isCompleted == true || ob.completed == true)) { this.trackObjective(ob); return; }
+               }
+            }
+            return;
+         }
+         this.sfx((q.active == true) ? "UIMenuCancel" : "UIMenuOK");
+         BGSExternalInterface.call(this.codeObj, "SetQuestActive", q);
+      }
+      // 0.0.60: objective-row click -> track/untrack that single Misc objective (vanilla: SetQuestActive with
+      // the objective ENTRY OBJECT). Pure dispatch + re-render; no field creation/geometry (crash-law-safe).
+      private var _objHits:Array = [];
+      private var _objMap:Array = [];
+      private function onObjClick(ev:MouseEvent):void
+      {
+         var idx:int = int(ev.currentTarget.name.substr(1));
+         var q:Object = this.questAt(this._list.selectedIndex);
+         if (q == null || q.formID != 0) { return; }
+         if (idx < 0 || idx >= this._objMap.length || this._objArray == null) { return; }
+         var oi:int = int(this._objMap[idx]);
+         if (oi < 0 || oi >= this._objArray.length) { return; }
+         var ob:Object = this._objArray[oi];
+         if (ob != null) { this.trackObjective(ob); }
+      }
+      private function trackObjective(ob:Object):void
+      {
+         this.sfx((ob.active == true) ? "UIPipBoyQuestInactive" : "UIPipBoyQuestActive");
+         BGSExternalInterface.call(this.codeObj, "SetQuestActive", ob);
+      }
 
       // Raw KEY_DOWN drives ONLY the list (up/down/enter). Keybar actions go through ProcessUserEvent
       // named controls (single path). Enter on a row (list press) tracks the quest.

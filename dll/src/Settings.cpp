@@ -49,6 +49,7 @@ namespace PipOS
         _veilAlpha = 0.10f;
         _crtBreathe = true;
         _openAnim = true;
+        _openAnimSpeed = 1.0f;
         _folders = true;
         _showRPM = false;
 
@@ -118,6 +119,14 @@ namespace PipOS
                 continue;
             }
             // 0.0.38 CUSTOMIZATION keys. All optional; a missing key keeps the shipping default set above.
+            if (key == "OPENANIMSPEED") {   // 0.0.60: power-on speed multiplier
+                try {
+                    float f = std::stof(val);
+                    if (f < 0.25f) { f = 0.25f; } else if (f > 4.0f) { f = 4.0f; }
+                    _openAnimSpeed = f;
+                } catch (...) {}
+                continue;
+            }
             if (key == "VEILALPHA") {
                 try {
                     float f = std::stof(val);
@@ -198,6 +207,7 @@ namespace PipOS
         out << "VeilAlpha=" << fmtF(_veilAlpha) << "\n";
         out << "CrtBreathe=" << (_crtBreathe ? "true" : "false") << "\n";
         out << "OpenAnim=" << (_openAnim ? "true" : "false") << "\n";
+        out << "OpenAnimSpeed=" << fmtF(_openAnimSpeed) << "\n";
         out << "Folders=" << (_folders ? "true" : "false") << "\n";
         out << "ShowRPM=" << (_showRPM ? "true" : "false") << "\n";
         out << "bLive3D=" << (_live3D ? "true" : "false") << "\n";
