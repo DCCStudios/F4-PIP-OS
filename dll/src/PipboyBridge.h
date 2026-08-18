@@ -18,4 +18,9 @@ namespace PipOS
     // show up live (there is no TESEquipEvent source in this commonlib; polling the fixed 10-slot sweep
     // ~2x/s is cheap and thread-correct).
     void RepushEquipmentPeriodic();
+
+    // 0.0.62: called once per frame from CharacterCapture's main-thread task while the Pip-Boy is open. Polls
+    // the physical right mouse button and bumps root1.PipOS_rclickN on each press edge so the AS side can open
+    // its context menu (GFx never forwards RIGHT_MOUSE_DOWN to the movie in this runtime).
+    void PollRightClick();
 }

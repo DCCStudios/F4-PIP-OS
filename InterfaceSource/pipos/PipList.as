@@ -171,6 +171,8 @@ package pipos
 
       public function get selectedIndex():int { return this._sel; }
       public function get length():int { return this._entries ? this._entries.length : 0; }
+      public function get hoverIndex():int { return this._hoverIdx; }   // 0.0.62: DLL-forwarded right-click asks which row the cursor is on
+      public function entryAt(i:int):Object { return (i >= 0 && i < this._entries.length) ? this._entries[i] : null; }
 
       public function setItems(entries:Array, adapter:Function):void
       {

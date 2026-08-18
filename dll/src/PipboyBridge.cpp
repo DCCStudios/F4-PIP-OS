@@ -756,6 +756,20 @@ namespace PipOS
 
                             statsMap.SetMember(key.c_str(), entry);
                             ++nStats;
+                            // 0.0.62 DIAGNOSTIC (bounded, one-time): dump the first weapons' key/name/dmg/ammo so a
+                            // test can settle why some weapon cards show no DMG/ammo (P890) while others do (P90) --
+                            // decides whether the entry is MISSING (category/read issue) or PRESENT (an AS join
+                            // issue, i.e. the row/favorite formID key differs from this map key).
+                            {
+                                static int s_wdbg = 0;
+                                if (pod.isWeap && s_wdbg < 28) {
+                                    ++s_wdbg;
+                                    const char* wn = "?";
+                                    if (obj) { if (auto* w = obj->As<RE::TESObjectWEAP>()) { const char* n = w->GetFullName(); if (n && n[0]) { wn = n; } } }
+                                    logger::info("[PipOS] wstat[{}] key={} name='{}' type='{}' dmg={} rpm={} haveAmmo={} ammo='{}'",
+                                        s_wdbg, key, wn, pod.type, pod.dmg, pod.rpm, pod.haveAmmo, pod.haveAmmo ? pod.ammoName : "");
+                                }
+                            }
                             return true;
                         });
                 } else {
@@ -1192,6 +1206,39 @@ namespace PipOS
     // 0.0.60: equipment live-refresh driver. Called once per frame from CharacterCapture's main-thread task
     // while the Pip-Boy is open; every ~30th call re-pushes root1.PipOS_equip via a UI task (quiet -- no log
     // spam), so equipping from the inventory list updates the EQUIPMENT panel within ~half a second.
+    // 0.0.62: right-click forwarder. GFx does not deliver RIGHT_MOUSE_DOWN to the movie in this runtime
+    // (0.0.61 log: the AS breadcrumb IV.rc never fired), so we poll the physical right mouse button here (this
+    // runs on the game main thread, once per frame while the Pip-Boy is open) and bump root1.PipOS_rclickN on
+    // each PRESS edge. The AS side (InvPage.onCharPoll) reads the counter and opens the context menu at the
+    // hovered row. The Pip-Boy ignores right-click natively (it never closed on right-click in the field), so
+    // there is nothing to suppress.
+    // Forward-declare the one Win32 API we need (avoids pulling <Windows.h> and its min/max/other macros into
+    // this TU). VK_RBUTTON == 0x02; the high bit of the return marks the key currently down.
+    extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int a_vKey);
+
+    void PollRightClick()
+    {
+        static bool s_prevDown = false;
+        const bool down = (GetAsyncKeyState(0x02) & 0x8000) != 0;
+        const bool edge = down && !s_prevDown;
+        s_prevDown = down;
+        if (!edge) { return; }
+        static std::uint32_t s_seq = 0;
+        const std::uint32_t seq = ++s_seq;
+        if (auto* task = F4SE::GetTaskInterface()) {
+            task->AddUITask([seq]() {
+                if (auto* ui = RE::UI::GetSingleton()) {
+                    if (auto menu = ui->GetMenu(kPipboyMenu)) {
+                        if (auto* view = menu->uiMovie.get()) {
+                            Scaleform::GFx::Value v(static_cast<double>(seq));
+                            view->SetVariable("root1.PipOS_rclickN", v);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     void RepushEquipmentPeriodic()
     {
         static std::uint32_t s_ctr = 0;

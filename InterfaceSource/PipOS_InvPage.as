@@ -281,7 +281,7 @@ package
          // 0.0.59: raised from BY+6 to BY-2 -- at BY+6 the 18px glyph sat straight over the right-aligned VAL
          // column header (BY+16..). At BY-2 it ends exactly where VAL starts and only overlaps the empty right
          // end of the INVENTORY title band (button added later == on top, so its clicks are unaffected).
-         this._expandBtn = new Sprite(); this._expandBtn.x = this.LX + this.LW - 26; this._expandBtn.y = Theme.BY - 2; this._expandBtn.buttonMode = true; this._expandBtn.addEventListener(MouseEvent.MOUSE_DOWN, this.onExpandBtn); addChild(this._expandBtn); this.drawExpandGlyph();
+         this._expandBtn = new Sprite(); this._expandBtn.x = this.LX + this.LW - 26; this._expandBtn.y = Theme.BY - LIST_HEADROOM + 1; this._expandBtn.buttonMode = true; this._expandBtn.addEventListener(MouseEvent.MOUSE_DOWN, this.onExpandBtn); addChild(this._expandBtn); this.drawExpandGlyph();   // 0.0.62: in the new headroom strip, clear of the title/VAL
          this._card = new Sprite(); this._card.x = this.LX + P; this._card.y = cardTop + P; addChild(this._card);
          this._card.scrollRect = new Rectangle(0, 0, this.LW - 2 * P, (Theme.BB - cardTop) - 2 * P);
          addEventListener(Event.ADDED_TO_STAGE, this.onPageStage);
@@ -303,11 +303,14 @@ package
          }
       }
 
-      // Graphics-only (safe on any path): redraw the list panel background at height h.
+      // 0.0.62: the list panel now extends UPWARD by LIST_HEADROOM so the EXPAND button has its own clean strip
+      // above the "INVENTORY · <CAT>" title (was overlapping the VAL header / title). Rows/headers are unchanged.
+      private static const LIST_HEADROOM:Number = 20;
+      // Graphics-only (safe on any path): redraw the list panel background at height h (extended up by the headroom).
       private function drawListBg(h:Number):void
       {
          var g:* = this._listBg.graphics; g.clear();
-         Theme.panel(g, this.LX, Theme.BY, this.LW, h);
+         Theme.panel(g, this.LX, Theme.BY - LIST_HEADROOM, this.LW, h + LIST_HEADROOM);
       }
 
       // Graphics-only: expand/collapse glyph (font-independent) on the list-panel corner button.
@@ -1092,7 +1095,10 @@ package
                var lt:TextField = this._cardPairL[p]; lt.visible = true; Theme.setText(lt, String(pairs[p].t));
                var vv:String = String(pairs[p].v);
                var vt:TextField = this._cardPairV[p]; vt.visible = true; Theme.setText(vt, vv);
-               vt.textColor = (vv == DASH) ? Theme.PHOS_DIM : Theme.PHOS_BRIGHT;   // dim the "no data" em-dash
+               // 0.0.62: color-code the apparel comparison -- green when this item is BETTER in that stat than
+               // what's equipped, red when worse; otherwise the normal bright value (dim for the no-data dash).
+               var dd:int = (pairs[p].d != null) ? int(pairs[p].d) : 0;
+               vt.textColor = (vv == DASH) ? Theme.PHOS_DIM : ((dd > 0) ? 0x7CFC5A : ((dd < 0) ? Theme.CRIT : Theme.PHOS_BRIGHT));
             } else { this._cardPairL[p].visible = false; this._cardPairV[p].visible = false; }
          }
 
@@ -1179,9 +1185,9 @@ package
             // overlapping biped slot (DLL now pushes slots+equipped per armor entry). The equipped item
             // itself gets no suffix; missing data degrades to the plain value.
             var cmp:Object = this.equippedComparatorFor(stats);
-            out.push({ t: "DMG RESIST",    v: this.cmpVal(stats.dr, (cmp != null) ? cmp.dr : null, D) });
-            out.push({ t: "ENERGY RESIST", v: this.cmpVal(stats.er, (cmp != null) ? cmp.er : null, D) });
-            out.push({ t: "RAD RESIST",    v: this.cmpVal(stats.rr, (cmp != null) ? cmp.rr : null, D) });
+            out.push({ t: "DMG RESIST",    v: this.cmpVal(stats.dr, (cmp != null) ? cmp.dr : null, D), d: this.cmpDelta(stats.dr, (cmp != null) ? cmp.dr : null) });
+            out.push({ t: "ENERGY RESIST", v: this.cmpVal(stats.er, (cmp != null) ? cmp.er : null, D), d: this.cmpDelta(stats.er, (cmp != null) ? cmp.er : null) });
+            out.push({ t: "RAD RESIST",    v: this.cmpVal(stats.rr, (cmp != null) ? cmp.rr : null, D), d: this.cmpDelta(stats.rr, (cmp != null) ? cmp.rr : null) });
          } else if (type == "aid") {
             out.push({ t: "MAGNITUDE", v: (stats.magnitude != null) ? String(Math.round(Number(stats.magnitude))) : D });
             out.push({ t: "DURATION",  v: (stats.duration != null) ? ((Number(stats.duration) > 0) ? (String(Math.round(Number(stats.duration))) + "s") : "INSTANT") : D });
@@ -1218,6 +1224,13 @@ package
          var d:int = v - Math.round(Number(other));
          if (d == 0) { return String(v); }
          return String(v) + " (" + (d > 0 ? "+" : "") + d + ")";
+      }
+      // 0.0.62: comparison delta sign for color-coding (+1 better / -1 worse / 0 equal-or-N/A).
+      private function cmpDelta(own:*, other:*):int
+      {
+         if (own == null || other == null) { return 0; }
+         var d:int = Math.round(Number(own)) - Math.round(Number(other));
+         return (d > 0) ? 1 : ((d < 0) ? -1 : 0);
       }
       // Neutral derived flavor: aid effect name / ammo used-by / a non-legendary apparel effect. Empty otherwise
       // (weapons + plain items get no flavor rather than invented prose).
@@ -1955,7 +1968,21 @@ package
       // FIS folders: guard on the MAPPED item index (invIdx), not just selectedIndex>=0 -- an all-collapsed list
       // leaves the selection on a folder header (invIdx==-1), which would otherwise dispatch ItemDrop(-1,1) /
       // SetQuickkey(-1,0) to the DLL. Only act when the selection maps to a real InvItems row.
-      private function doDrop():void    { var di:int = this.invIdx(this._list.selectedIndex); if (di >= 0) { this.sfx("UIMenuOK"); Theme.life("IV.dr" + di); BGSExternalInterface.call(this.codeObj, "ItemDrop", di, 1); } }
+      private function doDrop():void
+      {
+         var di:int = this.invIdx(this._list.selectedIndex);
+         if (di < 0) { return; }
+         // 0.0.62: diagnostic -- log the selected item's count/favorite/equipped so a test reveals WHY the engine
+         // rejects the drop (the index is proven correct: the same invIdx equips fine). Vanilla drops single items
+         // with count 1 and opens a quantity menu for stacks; we have no quantity UI, so drop the WHOLE stack.
+         var row:Object = (this._lastData != null && this._lastData.InvItems != null && di < this._lastData.InvItems.length) ? this._lastData.InvItems[di] : null;
+         var cnt:int = (row != null && row.count != null) ? int(row.count) : 1; if (cnt < 1) { cnt = 1; }
+         var fav:int = (row != null && row.favorite != null) ? int(row.favorite) : -1;
+         var eqp:* = (row != null && row.hasOwnProperty("equipped")) ? row.equipped : "?";
+         Theme.life("IV.dr" + di + "c" + cnt + "f" + fav + "e" + eqp);
+         this.sfx("UIMenuOK");
+         BGSExternalInterface.call(this.codeObj, "ItemDrop", di, cnt);
+      }
       private function doCycleDamage():void { this._dmgIndex++; this.sfx("UIMenuPrevNext"); this.renderCard(); }
       private function doFav():void     { if (this.invIdx(this._list.selectedIndex) >= 0) { this.sfx("UIPipBoyFavoriteMenuDPadA"); BGSExternalInterface.call(this.codeObj, "SetQuickkey", this.invIdx(this._list.selectedIndex), 0); } }
       // Z / L3 fallback: cycle our own per-category sort NAME(A-Z) -> WT(desc) -> VAL(desc) -> NAME ... (matches the
@@ -2173,7 +2200,29 @@ package
          // re-apply every ~15 frames (applyEquip is diff-only, so unchanged pushes cost 10 string compares).
          if (++this._eqPollN >= 15) { this._eqPollN = 0; this.applyEquip(); }
          this.tickEquipPulse(dt);
+         // 0.0.62 DLL-FORWARDED RIGHT-CLICK: GFx never delivered RIGHT_MOUSE_DOWN (0.0.61 log: IV.rc=0), so the
+         // DLL polls the right button and bumps root1.PipOS_rclickN on each press. Open the context menu at the
+         // row currently under the cursor (PipList tracks the hover). No coords come from the DLL -- we use the
+         // page's own live mouse position, converted to stage coords for onRowContext.
+         try {
+            var rn:* = (this._rrPoll != null) ? this._rrPoll.PipOS_rclickN : null;
+            if (rn != null) {
+               var rv:int = int(rn);
+               if (rv != this._rclickLast) {
+                  this._rclickLast = rv;
+                  Theme.life("IV.rc");
+                  var hi:int = (this._list != null) ? this._list.hoverIndex : -1;
+                  if (!this._ctxOpen && hi >= 0) {
+                     var ent:Object = this._list.entryAt(hi);
+                     var gp:Point = this.localToGlobal(new Point(this.mouseX, this.mouseY));
+                     this.onRowContext(hi, ent, gp.x, gp.y);
+                  } else { this.closeContextMenu(); }
+               }
+            }
+         } catch (erc:*) {}
       }
+      private var _rclickLast:int = 0;
+      private function get _rrPoll():* { try { return (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; } catch (e:*) { return null; } }
       private function onPageUnstage(e:Event):void
       {
          if (stage != null) {

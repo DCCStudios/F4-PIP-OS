@@ -702,6 +702,20 @@ package pipos
                   try { this._menu.InvalidateData(); } catch (em6:*) {}
                   Theme.life("MD.heal");
                   this._medicRedisp = 0;
+                  // 0.0.62 RE-ENTRY FIX: on the FIRST STATUS open the shell's own InvalidateData synchronously
+                  // dispatches the data event that fills the page (trail: MD.flag1>ST.e0>MD.heal). On a page
+                  // SWITCH BACK to a page, clearing _IsLoadingPage succeeds (MD.flag1) so the substitute pump
+                  // below is disabled -- but the shell does NOT re-dispatch, so the freshly-staged page instance
+                  // never receives a data event (trail: MD.flag1>MD.heal, no ST.e) and renders EMPTY (missing
+                  // STATUS meters / DATA quest log). So ALWAYS dispatch one full-mask event to the just-healed
+                  // page here, regardless of the flag-clear result. The page's onPipboyChangeEvent is the normal
+                  // idempotent data path, so a duplicate on first open is harmless.
+                  try {
+                     if (stage != null && mpage.stage != null) {
+                        PipboyChangeEvent.DispatchEvent(new PipboyUpdateMask(4294967295), stage, this._menu.DataObj, mpage.TabNames);
+                        Theme.life("MD.pump");
+                     }
+                  } catch (emp:*) {}
                }
                // 0.0.59: REMOVE the vanilla button-hint bar from the display list. Neither alpha=0 (0.0.46+) nor
                // y=4000/visible=false (0.0.58) survived in the field, and the log explains why: the pages update
@@ -717,6 +731,14 @@ package pipos
                      vb.visible = false; vb.alpha = 0; vb.mouseEnabled = false; vb.mouseChildren = false;
                   }
                } catch (em8:*) {}
+               // 0.0.62: the faint STIMPAK/VAULT BOY/LEVEL-UP prompts still visible behind our keybar are the
+               // SEPARATE Pipboy_BottomBar (Menu_mc child [0]), which stage1b only DIMMED, not hid -- it carries
+               // the engine's own hint line. Fully hide it per tick (our chrome draws its own clock + frame, so
+               // nothing we need lives here). visible=false is a display flag the shell's data redraw won't reset.
+               try {
+                  var bb:* = this._menu.BottomBar_mc;
+                  if (bb != null) { bb.visible = false; bb.mouseEnabled = false; bb.mouseChildren = false; }
+               } catch (em8b:*) {}
                // If the flag stayed stuck, the shell can't pump events; substitute a full-mask re-dispatch every
                // 0.5s -- and IMMEDIATELY when the native page/tab changes (0.0.57: makes sub-tab clicks feel
                // instant instead of waiting for the next 0.5s beat).
