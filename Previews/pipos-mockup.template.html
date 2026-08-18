@@ -1,0 +1,1973 @@
+<meta charset="utf-8">
+<title>PIP-OS V2.7.1</title>
+<style>
+  @font-face{
+    font-family:"Arimo Stalker";
+    src:url(data:font/ttf;base64,@@FONT@@) format("truetype");
+    font-weight:400 700;
+  }
+  :root{
+    --ground:#060a06;
+    --panel:rgba(8,22,12,.78);
+    --phos:#86e08c;
+    --phos-bright:#c9f7c4;
+    --phos-dim:#4d7a53;
+    --phos-faint:#2b4a33;
+    --sel:#5fce67;
+    --sel-ink:#f2fbf2;
+    --sel-shadow:0 1px 3px rgba(0,0,0,.95), 0 0 2px rgba(0,0,0,.9);
+    --warn:#e2b95c;
+    --crit:#e0654f;
+    --line:rgba(134,224,140,.38);
+    --line-dim:rgba(134,224,140,.16);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--ground);
+    color:var(--phos);
+    font-family:"Arimo Stalker","Bahnschrift","Arial Narrow",sans-serif;
+    font-variant-numeric:tabular-nums;
+    overflow:hidden;
+  }
+  #viewport{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--ground)}
+  #stage{position:relative;width:1600px;height:900px;flex:none;transform-origin:center center;overflow:hidden;background:#0a0f0b}
+  #scene{position:absolute;inset:-24px;background:url(data:image/jpeg;base64,@@BG@@) center/cover no-repeat;
+    filter:blur(7px) brightness(.62) saturate(.8)}
+  #scenetint{position:absolute;inset:0;background:
+    linear-gradient(180deg, rgba(6,14,8,.55), rgba(6,14,8,.28) 40%, rgba(6,14,8,.6)),
+    radial-gradient(120% 90% at 50% 40%, transparent 40%, rgba(4,10,6,.55) 100%)}
+  #crt{position:absolute;inset:0;pointer-events:none;z-index:50;
+    background:
+      repeating-linear-gradient(0deg, rgba(0,0,0,.15) 0 1px, transparent 1px 3px),
+      radial-gradient(130% 100% at 50% 50%, transparent 62%, rgba(0,0,0,.5) 100%);
+    mix-blend-mode:multiply;}
+  #glow{position:absolute;inset:0;pointer-events:none;z-index:49;
+    background:radial-gradient(90% 70% at 50% 45%, rgba(134,224,140,.05), transparent 70%);}
+  /* live scanlines: a fine phosphor line pattern that slowly rolls, easing up from nothing on load */
+  #scanroll{position:absolute;inset:0;pointer-events:none;z-index:51;opacity:0;
+    background:repeating-linear-gradient(0deg,
+      rgba(134,224,140,.035) 0 1px, transparent 1px 3px);
+    background-size:100% 3px;mix-blend-mode:screen;
+    animation:scanroll 14s linear infinite, scanin 3.2s ease-out .3s forwards;
+    will-change:background-position,opacity}
+  @keyframes scanroll{from{background-position:0 0}to{background-position:0 3px}}
+  @keyframes scanin{from{opacity:0}to{opacity:.6}}
+  #scanroll::after{content:"";position:absolute;left:0;right:0;height:26%;top:0;
+    background:linear-gradient(180deg, transparent, rgba(134,224,140,.045) 50%, transparent);
+    opacity:0;animation:scansweep 9s ease-in-out 1.4s infinite;will-change:transform,opacity}
+  @keyframes scansweep{
+    0%{transform:translateY(-26%);opacity:0}
+    12%{opacity:1}88%{opacity:1}
+    100%{transform:translateY(400%);opacity:0}}
+  @media (prefers-reduced-motion:reduce){
+    #scanroll{animation:scanin .01s forwards;opacity:.4}#scanroll::after{animation:none;display:none}
+  }
+
+  .txt-bright{color:var(--phos-bright)}
+  .txt-dim{color:var(--phos-dim)}
+  .lbl{text-transform:uppercase;letter-spacing:.1em;font-size:11px;color:var(--phos-dim)}
+
+  /* ---------- chrome ---------- */
+  #topstrip{position:absolute;top:0;left:0;right:0;height:34px;z-index:20;
+    display:flex;align-items:center;justify-content:space-between;padding:0 22px;
+    text-transform:uppercase;letter-spacing:.12em;font-size:11px;color:var(--phos-dim)}
+  #topstrip .os{color:var(--phos);border:1px solid var(--line);padding:2px 10px;background:var(--panel)}
+  #frame{position:absolute;inset:26px 16px 16px 16px;border:1px solid var(--line-dim);z-index:5;border-radius:10px}
+  #frame::before,#frame::after{content:"";position:absolute;width:16px;height:16px;border:1px solid var(--line)}
+  #frame::before{top:-1px;left:-1px;border-right:none;border-bottom:none;border-top-left-radius:10px}
+  #frame::after{bottom:-1px;right:-1px;border-left:none;border-top:none;border-bottom-right-radius:10px}
+
+  #sidebar{position:absolute;top:60px;left:34px;width:176px;bottom:96px;z-index:20;display:flex;flex-direction:column;gap:9px}
+  .side-note{font-size:8.5px;letter-spacing:.16em;color:var(--phos-faint);text-transform:uppercase;padding-left:4px}
+  .tabbtn{position:relative;display:flex;align-items:center;gap:12px;height:54px;padding:0 14px;
+    border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--phos);cursor:pointer;
+    font-family:inherit;text-transform:uppercase;letter-spacing:.14em;font-size:14px}
+  .tabbtn svg{width:21px;height:21px;stroke:currentColor;fill:none;stroke-width:1.6;flex:none}
+  .tabbtn:hover{color:var(--phos-bright);border-color:var(--phos)}
+  .tabbtn:focus-visible{outline:2px solid var(--phos-bright);outline-offset:2px}
+  .tabbtn.active{background:linear-gradient(90deg, rgba(126,232,122,.20), rgba(126,232,122,.05));
+    border-color:var(--phos);color:var(--phos-bright);
+    box-shadow:0 0 14px rgba(134,224,140,.25), inset 0 0 10px rgba(134,224,140,.08)}
+  .tabbtn.active::before{content:"";position:absolute;left:-1px;top:8px;bottom:8px;width:3px;background:var(--sel);border-radius:2px}
+  .tabbtn.ext{height:38px;font-size:10.5px;letter-spacing:.12em;color:var(--phos-dim);border-style:dashed}
+  .tabbtn.ext .badge{margin-left:auto;font-size:8px;letter-spacing:.18em;border:1px solid var(--phos-faint);
+    padding:1px 5px;border-radius:3px;color:var(--phos-faint)}
+  .tabbtn.ext.active{color:var(--phos-bright)}
+  #clockcard{margin-top:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:9px 14px;text-align:center}
+  #clockcard .d{font-size:16px;letter-spacing:.08em;color:var(--phos-bright)}
+  #clockcard .t{font-size:14px;letter-spacing:.12em}
+  #clockcard .v{font-size:8.5px;letter-spacing:.2em;color:var(--phos-faint);margin-top:5px;text-transform:uppercase}
+
+  #keybar{position:absolute;left:0;right:0;bottom:24px;z-index:20;display:flex;justify-content:center;gap:24px}
+  .key{display:flex;align-items:center;gap:8px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+    text-shadow:0 1px 3px rgba(0,0,0,.8)}
+  .key b{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:22px;
+    padding:0 6px;border:1px solid var(--line);border-radius:4px;background:var(--panel);
+    color:var(--phos-bright);font-size:11px}
+
+  main{position:absolute;top:60px;left:240px;right:34px;bottom:96px;z-index:10}
+  .page{position:absolute;inset:0;display:none}
+  .page.shown{display:block}
+  .panel{border:1px solid var(--line);border-radius:8px;background:var(--panel);position:relative}
+  .panel h3{font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--phos);
+    padding:10px 14px 8px;border-bottom:1px solid var(--line-dim)}
+
+  .subtabs{display:flex;align-items:center;gap:30px;height:40px;padding:0 6px;margin-bottom:12px;border-bottom:1px solid var(--line-dim)}
+  .subtab{position:relative;background:none;border:none;color:var(--phos-dim);cursor:pointer;
+    font-family:inherit;font-size:14px;letter-spacing:.16em;text-transform:uppercase;padding:6px 2px;
+    text-shadow:0 1px 3px rgba(0,0,0,.7)}
+  .subtab:hover{color:var(--phos)}
+  .subtab:focus-visible{outline:2px solid var(--phos-bright);outline-offset:2px}
+  .subtab.active{color:var(--phos-bright)}
+  .subtab.active::after{content:"• • •";position:absolute;left:50%;transform:translateX(-50%);
+    bottom:-13px;font-size:7px;letter-spacing:2px;color:var(--sel)}
+  .subtabs .chips{margin-left:auto;display:flex;gap:12px}
+  .chip{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;
+    background:var(--panel);padding:5px 12px;font-size:12px;letter-spacing:.04em}
+  .chip svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.6}
+  .chip .cap{color:var(--phos-bright)}
+
+  .rows{display:flex;flex-direction:column}
+  .row{display:grid;align-items:center;min-height:28px;padding:0 12px;font-size:13px;
+    letter-spacing:.02em;color:var(--phos);cursor:pointer;border-radius:3px}
+  .row:hover{background:rgba(126,232,122,.10)}
+  .row.sel{background:linear-gradient(180deg, #63d26b, #4fbf58);color:var(--sel-ink);
+    text-shadow:var(--sel-shadow);box-shadow:0 0 12px rgba(126,232,122,.3)}
+  .row.sel .txt-dim{color:#d9efd9;text-shadow:var(--sel-shadow)}
+  .row .num,.rows .head .num{text-align:right}
+  .rows .head{display:grid;padding:6px 12px;font-size:9.5px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--phos-dim);cursor:default}
+  .rows .head:hover{background:none}
+
+  /* ---------- INV ---------- */
+  #page-inv .grid{display:grid;grid-template-columns:296px 1fr 470px;gap:16px;height:calc(100% - 52px)}
+  #equip .row{grid-template-columns:92px 1fr;min-height:30px;border-bottom:1px solid var(--line-dim);cursor:default}
+  #equip .row:last-child{border-bottom:none}
+  #equip .slot{font-size:9.5px;letter-spacing:.12em;color:var(--phos-dim);text-transform:uppercase}
+  #centercol{display:flex;flex-direction:column;align-items:center;position:relative}
+  #figurebox{flex:1;width:100%;position:relative;display:flex;align-items:flex-end;justify-content:center;
+    cursor:grab;user-select:none;perspective:1100px;touch-action:none}
+  #glcanvas{display:none;width:426px;height:560px;margin-bottom:26px;position:relative;z-index:2;
+    filter:drop-shadow(0 0 16px rgba(134,224,140,.14)) drop-shadow(0 12px 14px rgba(0,0,0,.55))}
+  #inspecttitle{display:none}
+  /* fullscreen inspect overlay: blur+dim the menu, weapon flies to center, stats fade in */
+  #inspectlay{display:none;position:absolute;inset:0;z-index:30;background:rgba(4,10,6,.38);
+    backdrop-filter:blur(7px) brightness(.62);-webkit-backdrop-filter:blur(7px) brightness(.62)}
+  #inspectlay.on{display:block}
+  #keybar{z-index:35}
+  #glcanvas.flying{transition:transform .45s cubic-bezier(.22,.9,.32,1)}
+  #glcanvas.lgdglow{filter:drop-shadow(0 0 34px rgba(255,214,120,.30)) drop-shadow(0 0 90px rgba(255,200,90,.16)) drop-shadow(0 12px 14px rgba(0,0,0,.55))}
+  #ins-title{position:absolute;top:54px;left:0;right:0;text-align:center;font-size:25px;
+    letter-spacing:.1em;color:var(--phos-bright);text-transform:uppercase;
+    text-shadow:0 0 16px rgba(134,224,140,.55), 0 2px 4px rgba(0,0,0,.8);
+    opacity:0;transition:opacity .3s .1s}
+  #inspectlay.focused #ins-title{opacity:1}
+  /* legendary styling: glowing marker, effect line, badge */
+  .lgd{color:#e8ffd8;text-shadow:0 0 8px rgba(190,255,170,.9)}
+  #ins-leg{position:absolute;top:92px;left:0;right:0;text-align:center;font-size:15px;
+    letter-spacing:.06em;color:#d9f7c8;display:none;opacity:0;transition:opacity .3s .18s;
+    text-shadow:0 0 12px rgba(190,255,170,.75), 0 2px 4px rgba(0,0,0,.8)}
+  #inspectlay.focused #ins-leg{opacity:1}
+  #ins-leg .badge{display:inline-block;margin-right:10px;padding:2px 10px;border:1px solid rgba(214,255,190,.65);
+    border-radius:4px;font-size:10.5px;letter-spacing:.22em;text-transform:uppercase;color:#eaffdc;
+    animation:lgdpulse 2.2s ease-in-out infinite}
+  @keyframes lgdpulse{0%,100%{box-shadow:0 0 6px rgba(190,255,170,.35)}50%{box-shadow:0 0 18px rgba(190,255,170,.85)}}
+  #ic-leg{display:none;padding:6px 14px 0;font-size:12.5px;color:#d9f7c8;
+    text-shadow:0 0 10px rgba(190,255,170,.6)}
+  @media (prefers-reduced-motion:reduce){#ins-leg .badge{animation:none}}
+  #ins-stats{position:absolute;left:64px;bottom:130px;width:270px;opacity:0;transform:translateY(12px);
+    transition:opacity .3s .15s, transform .3s .15s}
+  #ins-mods{position:absolute;right:64px;bottom:130px;width:300px;opacity:0;transform:translateY(12px);
+    transition:opacity .3s .22s, transform .3s .22s}
+  #inspectlay.focused #ins-stats,#inspectlay.focused #ins-mods{opacity:1;transform:none}
+  #ins-stats .row,#ins-mods .row{grid-template-columns:1fr 84px;cursor:default;min-height:29px}
+  #ins-mods .row{grid-template-columns:1fr}
+  #figurebox:active{cursor:grabbing}
+  #figcard{position:relative;width:426px;height:560px;transform-style:preserve-3d;margin-bottom:26px}
+  .figface{position:absolute;inset:0;backface-visibility:hidden;display:flex;align-items:flex-end;justify-content:center}
+  .figface img{height:560px;width:auto;filter:drop-shadow(0 0 16px rgba(134,224,140,.14)) drop-shadow(0 12px 14px rgba(0,0,0,.55))}
+  .figface.back{transform:rotateY(180deg)}
+  #figshadow{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);width:220px;height:26px;
+    border-radius:50%;background:radial-gradient(50% 50% at 50% 50%, rgba(0,0,0,.55), transparent 70%)}
+  #figring{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);width:250px;height:38px;
+    border:1px dashed var(--phos-faint);border-radius:50%}
+  #figurebox .hint{position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:94%;
+    font-size:8.5px;letter-spacing:.18em;color:var(--phos-dim);text-transform:uppercase;
+    text-align:center;line-height:1.7;text-shadow:0 1px 3px rgba(0,0,0,.8)}
+  #figurebox .scanline{position:absolute;left:22%;right:22%;height:1px;background:rgba(134,224,140,.3);
+    top:20%;animation:scan 6s linear infinite;pointer-events:none;z-index:3}
+  @keyframes scan{0%{top:8%}100%{top:92%}}
+  @media (prefers-reduced-motion:reduce){
+    #figurebox .scanline{animation:none;display:none}
+    .subtab.active::after{content:"•••"}
+  }
+  #qa{width:100%;display:flex;flex-direction:column;align-items:center;gap:6px;padding-top:8px}
+  #qa .slots{display:flex;gap:8px;justify-content:center}
+  #qa .lblrow{font-size:12px;letter-spacing:.18em;color:var(--phos-dim);text-transform:uppercase;
+    text-shadow:0 1px 3px rgba(0,0,0,.8)}
+  .qslot{width:56px;height:56px;border:1px solid var(--line);border-radius:6px;background:var(--panel);
+    position:relative;display:flex;align-items:center;justify-content:center;cursor:pointer;
+    transition:box-shadow .4s}
+  .qsep{padding:10px 12px 4px;font-size:9.5px;letter-spacing:.18em;color:var(--phos-faint);
+    text-transform:uppercase;border-top:1px solid var(--line-dim);margin-top:8px}
+  .qslot svg{width:27px;height:27px;stroke:var(--phos);fill:none;stroke-width:1.4}
+  .qslot .k{position:absolute;top:2px;left:5px;font-size:9px;color:var(--phos-dim)}
+  .qslot .n{position:absolute;bottom:2px;right:5px;font-size:10px;color:var(--phos-bright)}
+  #invcol{display:flex;flex-direction:column;gap:14px;min-height:0}
+  #invlist{flex:1;min-height:0;display:flex;flex-direction:column}
+  #invlist .body{overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--phos-dim) transparent}
+  #itemcard{padding-bottom:12px}
+  #itemcard .titlerow{display:flex;align-items:baseline;justify-content:space-between;padding:10px 14px 6px;gap:12px}
+  #itemcard .titlerow h2{font-size:17px;letter-spacing:.06em;color:var(--phos-bright);text-transform:uppercase}
+  #itemcard .titlerow span{font-size:10.5px;letter-spacing:.12em;color:var(--phos-dim);white-space:nowrap}
+  #itemcard .meta{display:flex;gap:10px;padding:2px 14px 10px;border-bottom:1px solid var(--line-dim)}
+  #itemcard .meta .chip{padding:3px 10px;font-size:12px}
+  #itemcard .stats{display:grid;grid-template-columns:1fr 1fr;gap:0 26px;padding:8px 14px 2px}
+  .stat{display:grid;grid-template-columns:10px 1fr auto;align-items:center;gap:10px;
+    min-height:25px;font-size:12.5px;letter-spacing:.06em;text-transform:uppercase}
+  .stat i{width:6px;height:6px;background:var(--phos-dim);transform:rotate(45deg)}
+  .stat b{color:var(--phos-bright);font-size:13px;white-space:nowrap;text-align:right}
+  #itemcard .flavor{padding:8px 14px 0;font-size:12px;letter-spacing:.02em;color:var(--phos-dim);max-width:60ch}
+
+  /* ---------- STAT ---------- */
+  #page-stat .grid{display:grid;grid-template-columns:320px 1fr 380px;gap:16px;height:calc(100% - 52px)}
+  .vitals{display:flex;flex-direction:column;gap:13px}
+  .meter{padding:11px 14px}
+  .meter .t{display:flex;justify-content:space-between;font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;margin-bottom:8px}
+  .meter .t b{color:var(--phos-bright)}
+  .bar{height:9px;border:1px solid var(--line);border-radius:3px;background:rgba(0,0,0,.4);overflow:hidden}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--phos),var(--phos-bright))}
+  .limbs{padding:10px 14px;display:grid;grid-template-columns:1fr 1fr;gap:8px 22px}
+  .limb{display:grid;grid-template-columns:58px 1fr;gap:8px;align-items:center;font-size:9.5px;
+    letter-spacing:.1em;text-transform:uppercase;color:var(--phos-dim)}
+  .limb .bar{height:6px}
+  .special{display:grid;grid-template-columns:repeat(7,1fr);gap:7px;margin-top:13px}
+  .spec{border:1px solid var(--line);border-radius:6px;background:var(--panel);text-align:center;padding:7px 0 5px}
+  .spec .g{font-size:19px;color:var(--phos-bright)}
+  .spec .l{font-size:8px;letter-spacing:.12em;color:var(--phos-dim);text-transform:uppercase;margin-top:2px}
+  #centercol2{display:flex;align-items:center;justify-content:center;position:relative}
+  #statfig{position:relative;width:320px;height:560px;display:flex;justify-content:center;align-items:flex-end}
+  #statfig img{height:560px;filter:drop-shadow(0 0 16px rgba(134,224,140,.14)) drop-shadow(0 12px 14px rgba(0,0,0,.55))}
+  #statfigvb{height:470px}
+  /* shared 3D canvas when reparented into the STAT figure slot */
+  #glcanvas.instat{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:300px;height:560px;margin:0;z-index:1}
+  .limbchip{position:absolute;width:90px;cursor:pointer;text-align:center;font-size:9.5px;z-index:3;
+    letter-spacing:.12em;text-transform:uppercase;color:var(--phos-dim);
+    border:1px solid var(--line-dim);border-radius:5px;background:var(--panel);padding:4px 6px 5px}
+  .limbchip:hover{border-color:var(--phos);color:var(--phos-bright)}
+  .limbchip .bar{height:6px;margin-top:3px}
+  #perkdesc{padding:10px 14px;font-size:12.5px;line-height:1.55;color:var(--phos-dim);border-top:1px solid var(--line-dim)}
+  .statcol{display:flex;flex-direction:column;gap:14px;min-height:0}
+  .statcol .panel{display:flex;flex-direction:column;min-height:0}
+  .statcol .body{overflow-y:auto;min-height:0;scrollbar-width:thin;scrollbar-color:var(--phos-dim) transparent}
+
+  /* ---------- DATA ---------- */
+  #page-data .grid{display:grid;grid-template-columns:1fr 430px;gap:16px;height:calc(100% - 52px)}
+  #objectives .obj{display:flex;gap:10px;align-items:flex-start;padding:10px 14px;font-size:13px;border-bottom:1px solid var(--line-dim);cursor:pointer}
+  #objectives .obj:hover{background:rgba(126,232,122,.08)}
+  #objectives .obj.sel{background:rgba(126,232,122,.16);color:var(--phos-bright)}
+  #objectives .obj .box{width:12px;height:12px;border:1px solid var(--phos);margin-top:2px;flex:none}
+  #objectives .obj.done{color:var(--phos-dim);text-decoration:line-through}
+  #objectives .obj.done .box{background:var(--phos-dim)}
+  .datafoot{margin-top:14px;padding:10px 14px;font-size:11.5px;color:var(--phos-dim);letter-spacing:.04em}
+  #workshops .head,#workshops .row{grid-template-columns:1fr 62px 62px 62px 62px 62px 84px}
+  .statgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;height:calc(100% - 0px)}
+  .statgrid .row{grid-template-columns:1fr 90px;cursor:default}
+
+  /* ---------- MAP ---------- */
+  #page-map .maparea{position:relative;height:calc(100% - 52px);border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#0a0f0b}
+  #mapcanvas{position:absolute;inset:0;width:100%;height:100%}
+  .mapchip{position:absolute;z-index:5;border:1px solid var(--line);border-radius:6px;background:rgba(6,12,8,.85);
+    padding:6px 12px;font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+  #maploc{right:12px;top:12px;color:var(--phos-bright)}
+  #mapgrid{left:12px;top:12px;color:var(--phos-dim)}
+  #maplegend{left:12px;bottom:12px;display:flex;gap:16px;color:var(--phos-dim)}
+  #maplegend span{display:flex;align-items:center;gap:6px}
+  #maplegend i{width:8px;height:8px;display:inline-block;background:var(--phos);border-radius:50%}
+  #maplegend .q{background:var(--warn)}
+  #mapnote{right:12px;bottom:12px;color:var(--phos-faint);font-size:9.5px;max-width:38ch;text-transform:none}
+
+  /* ---------- RADIO ---------- */
+  #page-radio .grid{display:grid;grid-template-columns:1fr 560px;gap:16px;height:calc(100% - 52px)}
+  #stations .row{grid-template-columns:20px 1fr 70px;min-height:33px}
+  #scope{position:relative;display:flex;flex-direction:column}
+  #scopecanvas{flex:1;width:100%;min-height:0}
+  #freqrow{display:flex;justify-content:space-between;align-items:baseline;padding:12px 16px;border-top:1px solid var(--line-dim)}
+  #freqrow .f{font-size:24px;color:var(--phos-bright);letter-spacing:.06em}
+  #freqrow .s{font-size:10.5px;letter-spacing:.14em;color:var(--phos-dim);text-transform:uppercase}
+
+  /* ---------- EXT ---------- */
+  #page-ext .hostbox{height:calc(100% - 52px);display:flex;align-items:center;justify-content:center;
+    border:1px dashed var(--line);border-radius:8px;background:var(--panel)}
+  #page-ext .inner{text-align:center;max-width:56ch;padding:30px}
+  #page-ext h2{font-size:16px;letter-spacing:.18em;text-transform:uppercase;color:var(--phos-bright);margin-bottom:14px}
+  #page-ext p{font-size:12.5px;line-height:1.6;color:var(--phos-dim)}
+
+  /* closed Pip-Boy: UI fades out, scene sharpens; ESC reopens */
+  #reopenhint{position:absolute;left:50%;bottom:40px;transform:translateX(-50%);z-index:40;display:none;
+    border:1px solid var(--line);border-radius:6px;background:rgba(6,12,8,.85);padding:8px 18px;
+    font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--phos-bright)}
+  #stage.pipclosed #reopenhint{display:block}
+  /* opacity is instant here on purpose — the CRT bloom/collapse animations own the reveal;
+     a transition would fade the full-size UI back in for a few frames after the collapse (flash) */
+  #stage.pipclosed #sidebar,#stage.pipclosed #topstrip,#stage.pipclosed main,
+  #stage.pipclosed #keybar,#stage.pipclosed #frame,#stage.pipclosed #glow{opacity:0;pointer-events:none}
+  #scene{transition:filter .35s}
+  #stage.pipclosed #scene{filter:blur(0px) brightness(.95) saturate(1)}
+  #scenetint{transition:opacity .35s}
+  #stage.pipclosed #scenetint{opacity:0}
+  /* CRT boot: UI blooms open from a scanline; collapses back on close */
+  @keyframes crtopen{0%{transform:scaleY(.004);filter:brightness(3)}60%{transform:scaleY(1.02);filter:brightness(1.6)}100%{transform:scaleY(1);filter:brightness(1)}}
+  #stage.pipopening #sidebar,#stage.pipopening #topstrip,#stage.pipopening main,
+  #stage.pipopening #keybar,#stage.pipopening #frame,#stage.pipopening #glow{
+    animation:crtopen .45s cubic-bezier(.2,.8,.3,1) both}
+  @keyframes crtclose{0%{transform:scaleY(1);filter:brightness(1)}40%{transform:scaleY(1.01);filter:brightness(2.2)}100%{transform:scaleY(.004);filter:brightness(3)}}
+  #stage.pipclosing #sidebar,#stage.pipclosing #topstrip,#stage.pipclosing main,
+  #stage.pipclosing #keybar,#stage.pipclosing #frame,#stage.pipclosing #glow{
+    animation:crtclose .26s ease-in both}
+  #bootline{position:absolute;left:6%;right:6%;top:50%;height:2px;z-index:45;pointer-events:none;opacity:0;
+    background:linear-gradient(90deg,transparent,rgba(201,247,196,.9),transparent);
+    box-shadow:0 0 18px rgba(134,224,140,.8)}
+  #stage.pipopening #bootline{animation:bootline .45s ease-out both}
+  #stage.pipclosing #bootline{animation:bootline .26s ease-in both reverse}
+  @keyframes bootline{0%{opacity:0;transform:scaleX(.1)}25%{opacity:1;transform:scaleX(1)}100%{opacity:0}}
+  @media (prefers-reduced-motion:reduce){
+    #stage.pipopening #sidebar,#stage.pipopening #topstrip,#stage.pipopening main,
+    #stage.pipopening #keybar,#stage.pipopening #frame,#stage.pipopening #glow,
+    #stage.pipclosing #sidebar,#stage.pipclosing #topstrip,#stage.pipclosing main,
+    #stage.pipclosing #keybar,#stage.pipclosing #frame,#stage.pipclosing #glow,
+    #stage.pipopening #bootline,#stage.pipclosing #bootline{animation:none}
+  }
+  .healpulse{animation:healp .7s ease}
+  @keyframes healp{0%{filter:brightness(2.4)}100%{filter:brightness(1)}}
+  .slotpulse{box-shadow:0 0 18px rgba(134,224,140,.8), inset 0 0 10px rgba(134,224,140,.5)}
+  .key:hover{color:var(--phos-bright)}
+  /* click feedback: element pulse + phosphor ripple at the pointer */
+  .clickpulse{animation:clickp .28s ease-out}
+  @keyframes clickp{0%{filter:brightness(1.9)}100%{filter:brightness(1)}}
+  .ripple{position:absolute;z-index:60;width:12px;height:12px;margin:-6px 0 0 -6px;border-radius:50%;
+    pointer-events:none;background:radial-gradient(circle, rgba(201,247,196,.7), rgba(134,224,140,0) 70%);
+    animation:rip .4s ease-out forwards}
+  @keyframes rip{0%{transform:scale(.6);opacity:.9}100%{transform:scale(3.6);opacity:0}}
+  @media (prefers-reduced-motion:reduce){.clickpulse{animation:none}.ripple{display:none}}
+  .sub{display:none;height:calc(100% - 52px)}
+  .sub.shown{display:block}
+  .sub.cols.shown{display:grid;gap:16px}
+  .sub.cols-stat.shown{grid-template-columns:320px 1fr 380px}
+  .sub.cols-side.shown{grid-template-columns:1fr 430px}
+</style>
+
+<div id="viewport">
+<div id="stage">
+  <div id="scene"></div>
+  <div id="scenetint"></div>
+
+  <div id="topstrip">
+    <span class="os">PIP-BOY OS V2.7.1</span>
+    <span>SSS NFO 3247-98A &nbsp;·&nbsp; CONNECTION – STABLE</span>
+    <span>PROPERTY OF VAULT-TEC</span>
+  </div>
+  <div id="frame" aria-hidden="true"></div>
+
+  <nav id="sidebar">
+    <button class="tabbtn" data-page="stat">
+      <svg viewBox="0 0 24 24"><polyline points="2 12 7 12 10 5 13 19 16 12 22 12"/></svg>STAT</button>
+    <div class="side-note">INV 04.JK.E</div>
+    <button class="tabbtn active" data-page="inv">
+      <svg viewBox="0 0 24 24"><path d="M6 8 h12 v12 a2 2 0 0 1 -2 2 h-8 a2 2 0 0 1 -2 -2 Z"/><path d="M9 8 V6 a3 3 0 0 1 6 0 v2"/><path d="M6 13 h12"/></svg>INV</button>
+    <div class="side-note">DB 1A.F7.G</div>
+    <button class="tabbtn" data-page="data">
+      <svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="1.5"/><path d="M9 8h6M9 12h6M9 16h4"/></svg>DATA</button>
+    <div class="side-note">GPS 77.7F.E</div>
+    <button class="tabbtn" data-page="map">
+      <svg viewBox="0 0 24 24"><path d="M12 21 s-6.5-6-6.5-11 a6.5 6.5 0 0 1 13 0 c0 5 -6.5 11 -6.5 11 Z"/><circle cx="12" cy="10" r="2.4"/></svg>MAP</button>
+    <div class="side-note">SIG S.T60.B</div>
+    <button class="tabbtn" data-page="radio">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="11" r="2"/><path d="M8.5 14.5 a5 5 0 0 1 0-7 M15.5 7.5 a5 5 0 0 1 0 7 M6 17 a9 9 0 0 1 0-12 M18 5 a9 9 0 0 1 0 12 M12 13 v8"/></svg>RADIO</button>
+    <div class="side-note" style="margin-top:5px">EXTENSIONS · PIPBOYTABS</div>
+    <button class="tabbtn ext" data-page="ext" data-ext="CHALLENGES">CHALLENGES<span class="badge">EXT</span></button>
+    <button class="tabbtn ext" data-page="ext" data-ext="AFFINITY">AFFINITY<span class="badge">EXT</span></button>
+    <button class="tabbtn ext" data-page="ext" data-ext="MAGAZINES">MAGAZINES<span class="badge">EXT</span></button>
+    <div id="clockcard">
+      <div class="d">10.23.2287</div>
+      <div class="t">11:10 AM</div>
+      <div class="v">PIP-OS(R) V2.7.1</div>
+    </div>
+  </nav>
+
+  <main>
+    <!-- ================= INV ================= -->
+    <section class="page shown" id="page-inv">
+      <div class="subtabs" id="invtabs">
+        <button class="subtab active" data-cat="weapons">Weapons</button>
+        <button class="subtab" data-cat="apparel">Apparel</button>
+        <button class="subtab" data-cat="aid">Aid</button>
+        <button class="subtab" data-cat="misc">Misc</button>
+        <button class="subtab" data-cat="junk">Junk</button>
+        <button class="subtab" data-cat="ammo">Ammo</button>
+        <div class="chips">
+          <div class="chip"><svg viewBox="0 0 24 24"><path fill="currentColor" stroke="none" fill-rule="evenodd" d="M9.3 6 V4.9 a2.7 2.7 0 0 1 5.4 0 V6 h1.8 a3 3 0 0 1 3 3 v9 a3 3 0 0 1 -3 3 h-9 a3 3 0 0 1 -3 -3 V9 a3 3 0 0 1 3 -3 Z M10.8 6 V5 a1.2 1.2 0 0 1 2.4 0 v1 Z M6.2 11.2 h11.6 v1.3 H6.2 Z M9.2 14.4 h5.6 a1 1 0 0 1 1 1 v2.2 a1 1 0 0 1 -1 1 H9.2 a1 1 0 0 1 -1 -1 v-2.2 a1 1 0 0 1 1 -1 Z"/></svg>
+            <span class="lbl">Weight</span>&nbsp;<span class="cap">128.6</span><span class="txt-dim">/ 210</span></div>
+          <div class="chip"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.2"/><text x="13" y="17.2" text-anchor="middle" font-size="15" font-style="italic" font-weight="bold" font-family="Georgia,'Times New Roman',serif" fill="currentColor" stroke="none">C</text></svg>
+            <span class="cap">5247</span></div>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="panel" id="equip">
+          <h3>Equipment</h3>
+          <div class="rows">
+            <div class="row"><span class="slot">Head</span><span>GP-5 Gas Mask</span></div>
+            <div class="row"><span class="slot">Torso</span><span>Mercenary Jacket</span></div>
+            <div class="row"><span class="slot">Left Arm</span><span>Leather Armwrap</span></div>
+            <div class="row"><span class="slot">Right Arm</span><span>Leather Armwrap</span></div>
+            <div class="row"><span class="slot">Left Leg</span><span>Combat Pants</span></div>
+            <div class="row"><span class="slot">Right Leg</span><span>Combat Pants</span></div>
+            <div class="row"><span class="slot">Under Armor</span><span>Wasteland Undershirt</span></div>
+            <div class="row"><span class="slot">Outfit</span><span>Loner Trench Coat</span></div>
+            <div class="row"><span class="slot">Backpack</span><span>Field Backpack</span></div>
+            <div class="row"><span class="slot">Pip-Boy</span><span>Pip-Boy 3000 Mark IV</span></div>
+          </div>
+        </div>
+
+        <div id="centercol">
+          <div id="figurebox" title="Drag to rotate">
+            <div class="scanline"></div>
+            <div id="inspecttitle">INSPECT</div>
+            <div id="figshadow"></div>
+            <div id="figring"></div>
+            <div id="figcard">
+              <div class="figface front">
+                <img src="data:image/png;base64,@@FRONT@@" alt="Character preview, front">
+              </div>
+              <div class="figface back">
+                <img src="data:image/png;base64,@@BACK@@" alt="Character preview, back">
+              </div>
+            </div>
+            <canvas id="glcanvas" width="852" height="1120" aria-label="Character preview, 3D"></canvas>
+            <div class="hint">Live capture · drag to rotate · right-click to auto-spin · in-game: your equipped character</div>
+          </div>
+          <div id="qa">
+            <div class="slots">
+            <div class="qslot"><span class="k">1</span><svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="12" rx="2"/><path d="M12 10 v6 M9 13 h6"/></svg><span class="n">3</span></div>
+            <div class="qslot"><span class="k">2</span><svg viewBox="0 0 24 24"><path d="M9 4 h6 M12 4 v5 M8 21 h8 M9 9 h6 l1 12 h-8 Z"/></svg><span class="n">2</span></div>
+            <div class="qslot"><span class="k">3</span><svg viewBox="0 0 24 24"><path d="M7 17 L17 7 M14 4 l6 6 M4 14 l6 6 M16 8 l-2 -2"/></svg><span class="n">1</span></div>
+            <div class="qslot"><span class="k">4</span><svg viewBox="0 0 24 24"><path d="M10 3 h4 v5 l2 3 v10 h-8 v-10 l2 -3 Z"/></svg><span class="n">2</span></div>
+            <div class="qslot"><span class="k">5</span><svg viewBox="0 0 24 24"><path d="M12 7 a5 5 0 1 1 -.01 0 Z M12 7 v-3 M10 4 h4"/></svg><span class="n">2</span></div>
+            <div class="qslot"><span class="k">6</span><svg viewBox="0 0 24 24"><circle cx="9" cy="14" r="4"/><circle cx="15" cy="12" r="4"/><path d="M9 10 v-4 M15 8 v-3"/></svg><span class="n">4</span></div>
+            <div class="qslot"><span class="k">7</span><svg viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="9" rx="2"/><path d="M8 8 v9 M11 8 v9 M14 8 v9 M17 8 v9"/></svg><span class="n">3</span></div>
+            </div>
+            <div class="lblrow">Quick Access</div>
+          </div>
+        </div>
+
+        <div id="invcol">
+          <div class="panel" id="invlist">
+            <h3 id="invtitle">Inventory · Weapons</h3>
+            <div class="rows" style="flex:1;min-height:0;display:flex;flex-direction:column">
+              <div class="head" id="invhead"></div>
+              <div class="body" id="invbody"></div>
+            </div>
+          </div>
+          <div class="panel" id="itemcard">
+            <div class="titlerow"><h2 id="ic-name"></h2><span id="ic-sub"></span></div>
+            <div class="meta">
+              <div class="chip"><svg viewBox="0 0 24 24"><path fill="currentColor" stroke="none" fill-rule="evenodd" d="M9.3 6 V4.9 a2.7 2.7 0 0 1 5.4 0 V6 h1.8 a3 3 0 0 1 3 3 v9 a3 3 0 0 1 -3 3 h-9 a3 3 0 0 1 -3 -3 V9 a3 3 0 0 1 3 -3 Z M10.8 6 V5 a1.2 1.2 0 0 1 2.4 0 v1 Z M6.2 11.2 h11.6 v1.3 H6.2 Z M9.2 14.4 h5.6 a1 1 0 0 1 1 1 v2.2 a1 1 0 0 1 -1 1 H9.2 a1 1 0 0 1 -1 -1 v-2.2 a1 1 0 0 1 1 -1 Z"/></svg><span id="ic-wt" class="cap"></span></div>
+              <div class="chip"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.2"/><text x="13" y="17.2" text-anchor="middle" font-size="15" font-style="italic" font-weight="bold" font-family="Georgia,'Times New Roman',serif" fill="currentColor" stroke="none">C</text></svg><span id="ic-val" class="cap"></span></div>
+            </div>
+            <div id="ic-leg"></div>
+            <div class="stats" id="ic-stats"></div>
+            <p class="flavor" id="ic-flavor"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= STAT ================= -->
+    <section class="page" id="page-stat">
+      <div class="subtabs" id="stattabs">
+        <button class="subtab active" data-sub="status">Status</button>
+        <button class="subtab" data-sub="special">Special</button>
+        <button class="subtab" data-sub="perks">Perks</button>
+        <div class="chips"><div class="chip"><span class="lbl">Level</span>&nbsp;<span class="cap">1</span>
+          <div class="bar" style="width:130px;height:7px;margin-left:8px"><i style="width:12%"></i></div></div></div>
+      </div>
+
+      <div class="sub cols cols-stat shown" data-sub="status">
+        <div class="vitals">
+          <div class="panel meter"><div class="t"><span>HP</span><b>85 / 85</b></div><div class="bar"><i style="width:100%"></i></div></div>
+          <div class="panel meter"><div class="t"><span>AP</span><b>70 / 70</b></div><div class="bar"><i style="width:100%"></i></div></div>
+          <div class="panel meter"><div class="t"><span>RADS</span><b class="txt-dim">0</b></div><div class="bar"><i style="width:0%;background:var(--crit)"></i></div></div>
+          <div class="special">
+            <div class="spec"><div class="g">4</div><div class="l">STR</div></div>
+            <div class="spec"><div class="g">5</div><div class="l">PER</div></div>
+            <div class="spec"><div class="g">3</div><div class="l">END</div></div>
+            <div class="spec"><div class="g">6</div><div class="l">CHA</div></div>
+            <div class="spec"><div class="g">6</div><div class="l">INT</div></div>
+            <div class="spec"><div class="g">4</div><div class="l">AGI</div></div>
+            <div class="spec"><div class="g">5</div><div class="l">LCK</div></div>
+          </div>
+        </div>
+        <div id="centercol2">
+          <div id="statfig">
+            <img id="statfigchar" src="data:image/png;base64,@@FRONT@@" alt="Character condition scan">
+            <img id="statfigvb" src="data:image/png;base64,@@VBOY@@" alt="Vault Boy condition" style="display:none">
+            <div class="limbchip" data-limb="head" style="left:50%;top:-26px;transform:translateX(-50%)"><span>Head</span><div class="bar"><i></i></div></div>
+            <div class="limbchip" data-limb="larm" style="left:-100px;top:170px"><span>L Arm</span><div class="bar"><i></i></div></div>
+            <div class="limbchip" data-limb="rarm" style="right:-100px;top:170px"><span>R Arm</span><div class="bar"><i></i></div></div>
+            <div class="limbchip" data-limb="lleg" style="left:-84px;top:396px"><span>L Leg</span><div class="bar"><i></i></div></div>
+            <div class="limbchip" data-limb="rleg" style="right:-84px;top:396px"><span>R Leg</span><div class="bar"><i></i></div></div>
+            <div class="limbchip" data-limb="torso" style="left:50%;bottom:-36px;transform:translateX(-50%)"><span>Torso</span><div class="bar"><i></i></div></div>
+          </div>
+        </div>
+        <div class="panel" style="align-self:start">
+          <h3>Active Effects</h3>
+          <div class="rows">
+            <div class="head" style="grid-template-columns:1fr 90px"><span>Effect</span><span class="num">Source</span></div>
+            <div class="row" style="grid-template-columns:1fr 90px;cursor:default"><span>+10% XP gained</span><span class="num txt-dim">Well Rested</span></div>
+            <div class="row" style="grid-template-columns:1fr 90px;cursor:default"><span>+30 Carry Weight</span><span class="num txt-dim">Backpack</span></div>
+            <div class="row" style="grid-template-columns:1fr 90px;cursor:default"><span>Rad Resist +15</span><span class="num txt-dim">Gas Mask</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sub cols cols-side" data-sub="special">
+        <div class="panel">
+          <h3>S.P.E.C.I.A.L.</h3>
+          <div class="rows" id="speciallist"></div>
+        </div>
+        <div class="panel" style="align-self:start">
+          <h3 id="specialname">Strength</h3>
+          <p id="specialdesc" style="padding:12px 14px;font-size:13px;line-height:1.6;color:var(--phos-dim)"></p>
+        </div>
+      </div>
+
+      <div class="sub cols cols-side" data-sub="perks">
+        <div class="panel statcol">
+          <h3>Perks</h3>
+          <div class="rows body" id="perklist"></div>
+        </div>
+        <div class="panel" style="align-self:start">
+          <h3 id="perkname"></h3>
+          <p id="perkdesc2" style="padding:12px 14px;font-size:13px;line-height:1.6;color:var(--phos-dim)"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= DATA ================= -->
+    <section class="page" id="page-data">
+      <div class="subtabs" id="datatabs">
+        <button class="subtab active" data-sub="quests">Quests</button>
+        <button class="subtab" data-sub="workshops">Workshops</button>
+        <button class="subtab" data-sub="stats">Stats</button>
+      </div>
+
+      <div class="sub cols cols-side shown" data-sub="quests">
+        <div class="panel">
+          <h3>Quest Log</h3>
+          <div class="rows">
+            <div class="head" style="grid-template-columns:18px 1fr 90px"><span></span><span>Quest</span><span class="num">Status</span></div>
+            <div id="questrows"></div>
+          </div>
+        </div>
+        <div>
+          <div class="panel" id="objectives">
+            <h3 id="objtitle">Objectives</h3>
+            <div id="objrows"></div>
+          </div>
+          <div class="panel datafoot" id="questsummary" style="display:none"></div>
+        </div>
+      </div>
+
+      <div class="sub" data-sub="workshops">
+        <div class="panel" id="workshops" style="height:100%">
+          <h3>Workshops</h3>
+          <div class="rows">
+            <div class="head"><span>Settlement</span><span class="num">Pop</span><span class="num">Food</span><span class="num">Water</span><span class="num">Power</span><span class="num">Beds</span><span class="num">Happiness</span></div>
+            <div class="row sel"><span>Sanctuary Hills</span><span class="num">6</span><span class="num">8</span><span class="num">5</span><span class="num">3</span><span class="num">7</span><span class="num">72%</span></div>
+            <div class="row"><span>Red Rocket Truck Stop</span><span class="num">1</span><span class="num">2</span><span class="num">3</span><span class="num">2</span><span class="num">2</span><span class="num">80%</span></div>
+            <div class="row"><span>Tenpines Bluff</span><span class="num">2</span><span class="num">6</span><span class="num">1</span><span class="num">0</span><span class="num">2</span><span class="num warn" style="color:var(--warn)">54%</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sub" data-sub="stats">
+        <div class="statgrid">
+          <div class="panel"><h3>General</h3><div class="rows">
+            <div class="row"><span>Locations Discovered</span><span class="num txt-bright">2</span></div>
+            <div class="row"><span>Days Survived</span><span class="num txt-bright">1</span></div>
+            <div class="row"><span>Caps Found</span><span class="num txt-bright">127</span></div>
+            <div class="row"><span>Chests Looted</span><span class="num txt-bright">11</span></div>
+          </div></div>
+          <div class="panel"><h3>Combat</h3><div class="rows">
+            <div class="row"><span>People Killed</span><span class="num txt-bright">4</span></div>
+            <div class="row"><span>Creatures Killed</span><span class="num txt-bright">12</span></div>
+            <div class="row"><span>Critical Strikes</span><span class="num txt-bright">3</span></div>
+            <div class="row"><span>Sneak Attacks</span><span class="num txt-bright">1</span></div>
+          </div></div>
+          <div class="panel"><h3>Crafting</h3><div class="rows">
+            <div class="row"><span>Weapons Modified</span><span class="num txt-bright">2</span></div>
+            <div class="row"><span>Armor Modified</span><span class="num txt-bright">1</span></div>
+            <div class="row"><span>Chems Crafted</span><span class="num txt-bright">0</span></div>
+            <div class="row"><span>Food Cooked</span><span class="num txt-bright">3</span></div>
+          </div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= MAP ================= -->
+    <section class="page" id="page-map">
+      <div class="subtabs" id="maptabs">
+        <button class="subtab active" data-sub="world">World</button>
+        <button class="subtab" data-sub="local">Local</button>
+        <div class="chips"><div class="chip"><span class="lbl">Region</span>&nbsp;<span class="cap">Commonwealth</span></div></div>
+      </div>
+      <div class="maparea">
+        <canvas id="mapcanvas"></canvas>
+        <div class="mapchip" id="mapgrid">GRID C-4 · SANCTUARY HILLS</div>
+        <div class="mapchip" id="maploc">Commonwealth</div>
+        <div class="mapchip" id="maplegend">
+          <span><i></i>Player</span><span><i class="q"></i>Quest target</span><span><i style="background:var(--phos-dim)"></i>Location</span>
+        </div>
+        <div class="mapchip" id="mapnote">Mockup art — the real page renders the engine's own world/local map (same map Fullscreen Pip-Boy shows today), with this chrome and these markers drawn over it.</div>
+      </div>
+    </section>
+
+    <!-- ================= RADIO ================= -->
+    <section class="page" id="page-radio">
+      <div class="subtabs">
+        <button class="subtab active">Stations</button>
+        <div class="chips"><div class="chip"><span class="lbl">Signal</span>&nbsp;<span class="cap">STRONG</span></div></div>
+      </div>
+      <div class="grid">
+        <div class="panel" id="stations">
+          <h3>Frequencies</h3>
+          <div class="rows">
+            <div class="head" style="grid-template-columns:20px 1fr 70px"><span></span><span>Station</span><span class="num">Signal</span></div>
+            <div class="row sel"><span>♪</span><span>Diamond City Radio</span><span class="num">ON AIR</span></div>
+            <div class="row"><span></span><span>Classical Radio</span><span class="num txt-dim">98%</span></div>
+            <div class="row"><span></span><span>Radio Freedom</span><span class="num txt-dim">64%</span></div>
+            <div class="row"><span></span><span>Vault 111 Distress</span><span class="num txt-dim">12%</span></div>
+          </div>
+        </div>
+        <div class="panel" id="scope">
+          <h3>Oscilloscope</h3>
+          <canvas id="scopecanvas"></canvas>
+          <div id="freqrow"><span class="f" id="freqval">102.5 MHz</span><span class="s" id="freqdj">Diamond City Radio · Travis Miles</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= EXT ================= -->
+    <section class="page" id="page-ext">
+      <div class="subtabs"><button class="subtab active" id="ext-title">Challenges</button></div>
+      <div class="hostbox"><div class="inner">
+        <h2 id="ext-head">Extension Page Host</h2>
+        <p>Pages injected by the PipboyTabs framework (CHALLENGES – F4NV, Companion Affinity, Magazine
+        Perks, Survival Mode Overhaul) mount here. The PIP-OS chrome — sidebar entry, frame, and footer
+        keybar — is ours; the page content is drawn by the extension mod exactly as it is today.</p>
+      </div></div>
+    </section>
+  </main>
+
+  <div id="bootline"></div>
+  <div id="reopenhint">[TAB] Open Pip-Boy</div>
+  <div id="inspectlay">
+    <div id="ins-title"></div>
+    <div id="ins-leg"><span class="badge">✦ Legendary</span><span id="ins-leg-text"></span></div>
+    <div class="panel" id="ins-stats"><h3>Stats</h3><div class="rows" id="ins-stats-rows"></div></div>
+    <div class="panel" id="ins-mods"><h3>Current Mods</h3><div class="rows" id="ins-mods-rows"></div></div>
+  </div>
+  <div id="keybar"></div>
+  <div id="glow"></div>
+  <div id="scanroll"></div>
+  <div id="crt"></div>
+</div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---- stage scaling ---- */
+  var stage = document.getElementById("stage");
+  function fit(){ stage.style.transform = "scale(" + Math.min(innerWidth/1600, innerHeight/900) + ")"; }
+  addEventListener("resize", fit); fit();
+
+  /* ---- page switching + per-page keybars ---- */
+  var keysets = {
+    inv:  [["Esc","Back"],["R","Inspect"],["X","Drop"],["C","Cycle Damage"],["Q","Fav"],["Z","Sort"],["T","Perk Chart"]],
+    stat: [["Esc","Back"],["E","Stimpak (3)"],["R","RadAway (2)"],["V","Vault Boy"],["T","Perk Chart"]],
+    data: [["Esc","Back"],["R","Show on Map"],["C","Show Summary"],["T","Perk Chart"]],
+    map:  [["Esc","Back"],["M1","Place Marker"],["R","Local Map"],["T","Perk Chart"]],
+    radio:[["Esc","Back"],["Enter","Tune"],["T","Perk Chart"]],
+    ext:  [["Esc","Back"],["T","Perk Chart"]],
+    inspect:[["W","Prev"],["S","Next"],["Wheel","Zoom"],["R","Exit"]]
+  };
+  var keybar = document.getElementById("keybar");
+  var stimCount = 3, radCount = 2;
+  function setKeys(page){
+    keybar.innerHTML = "";
+    keysets[page].forEach(function(k0){
+      var k = k0.slice();
+      if (k[1].indexOf("Stimpak") === 0) k[1] = "Stimpak (" + stimCount + ")";
+      if (k[1].indexOf("RadAway") === 0) k[1] = "RadAway (" + radCount + ")";
+      if (k[1] === "Vault Boy" && statFigVB) k[1] = "Character";
+      var d = document.createElement("div"); d.className = "key";
+      var b = document.createElement("b"); b.textContent = k[0];
+      d.appendChild(b); d.appendChild(document.createTextNode(k[1]));
+      d.style.cursor = "pointer";
+      d.addEventListener("click", function(){ if (window.__act) window.__act(k[1]); });
+      keybar.appendChild(d);
+    });
+  }
+  var tabs = document.querySelectorAll(".tabbtn");
+  tabs.forEach(function(t){
+    t.addEventListener("click", function(){
+      tabs.forEach(function(o){o.classList.remove("active")});
+      t.classList.add("active");
+      if (window.__setInspect) window.__setInspect(false);
+      document.querySelectorAll(".page").forEach(function(p){p.classList.remove("shown")});
+      var page = t.dataset.page;
+      document.getElementById("page-" + page).classList.add("shown");
+      if (t.dataset.ext){
+        document.getElementById("ext-title").textContent = t.dataset.ext;
+        document.getElementById("ext-head").textContent = t.dataset.ext + " · extension page host";
+      }
+      setKeys(page);
+      if (page === "map") drawMap(mapMode);
+      syncCanvas();
+    });
+  });
+  setKeys("inv");
+
+  /* ---- generic sub-tab switching (STAT / DATA) ---- */
+  ["stattabs","datatabs"].forEach(function(id){
+    var wrap = document.getElementById(id);
+    var page = wrap.parentElement;
+    wrap.querySelectorAll(".subtab").forEach(function(st){
+      st.addEventListener("click", function(){
+        wrap.querySelectorAll(".subtab").forEach(function(o){o.classList.remove("active")});
+        st.classList.add("active");
+        page.querySelectorAll(".sub").forEach(function(s){
+          s.classList.toggle("shown", s.dataset.sub === st.dataset.sub);
+        });
+      });
+    });
+  });
+
+  /* ---- map sub-tabs ---- */
+  var mapMode = "world";
+  var mapQuestLabel = "OUT OF TIME", customMarker = null, radioOn = true;
+  document.querySelectorAll("#maptabs .subtab").forEach(function(st){
+    st.addEventListener("click", function(){
+      document.querySelectorAll("#maptabs .subtab").forEach(function(o){o.classList.remove("active")});
+      st.classList.add("active");
+      mapMode = st.dataset.sub;
+      document.getElementById("mapgrid").textContent = mapMode === "world" ? "GRID C-4 · SANCTUARY HILLS" : "LOCAL · SANCTUARY HILLS";
+      drawMap(mapMode);
+    });
+  });
+
+  /* ---- INV data ---- */
+  var INV = {
+    weapons:{
+      title:"Weapons",
+      cols:[["Name",""],["Ammo","110px","l"],["WT","52px"],["VAL","52px"]],
+      items:[
+        {c:["Automatic Combat Rifle ★","5.56 (225)","11.1","214"],sub:"5.56×45MM",stats:[["Damage",65],["Fire Rate",75],["Range",119],["Accuracy",71]],flavor:"Fully automatic combat rifle. Effective at medium range.",mods:["Automatic Piston Receiver","Short Light Barrel","Adjustable Stock","Quick Eject Mag","Reflex Sight","Compensator"]},
+        {c:["Short Double-Barrel Shotgun","Shell (42)","9.6","156"],sub:"12 GAUGE",stats:[["Damage",90],["Fire Rate",4],["Range",37],["Accuracy",48]],flavor:"Break-action shotgun. Devastating up close, useless past it."},
+        {c:["Fragmentation Grenade (5)","–","0.5","50"],sub:"THROWN",stats:[["Damage",151],["Range",93],["AOE","Large"],["Fuse","3s"]],flavor:"Standard-issue fragmentation grenade."},
+        {c:["10mm Pistol","10mm (58)","4.0","78"],sub:"10MM",stats:[["Damage",18],["Fire Rate",46],["Range",83],["Accuracy",66]],flavor:"Reliable sidearm chambered in 10mm."},
+        {c:["Instigating .308 Hunting Rifle",".308 (78)","8.6","485"],sub:".308 · LEGENDARY",leg:"Does double damage if the target is at full health.",stats:[["Damage",37],["Fire Rate",3],["Range",187],["Accuracy",84]],flavor:"Bolt-action rifle with improved sighted accuracy.",mods:["Calibrated Receiver","Long Barrel","Full Stock","Standard Mag","Marksman's Scope","Standard Muzzle"]},
+        {c:["Molotov Cocktail (3)","–","0.5","20"],sub:"THROWN",stats:[["Damage",51],["Range",93],["AOE","Fire"],["Fuse","Impact"]],flavor:"Improvised incendiary. Burns whatever it lands on."},
+        {c:["Laser Musket","Fusion Cell (32)","12.6","213"],sub:"FUSION CELL",stats:[["Damage",45],["Fire Rate",2],["Range",107],["Accuracy",72]],flavor:"Hand-cranked laser rifle of the Commonwealth Minutemen."},
+        {c:["Pipe Bolt-Action Rifle",".308 (78)","6.2","110"],sub:".308",stats:[["Damage",34],["Fire Rate",3],["Range",110],["Accuracy",70]],flavor:"Crude but hard-hitting pipe weapon."},
+        {c:["Switchblade","–","0.5","36"],sub:"BLADE",stats:[["Damage",12],["Speed","Fast"],["Range","Melee"],["Weight","Light"]],flavor:"A folding knife. Quiet and quick."},
+        {c:["Fat Man Mini Nuke (2)","Mini Nuke (2)","30.7","512"],sub:"MINI NUKE",stats:[["Damage",468],["Fire Rate",1],["Range",117],["Accuracy",60]],flavor:"Portable tactical nuclear catapult."},
+        {c:["Cryo Mine (2)","–","1.0","75"],sub:"PLACED",stats:[["Damage",30],["Effect","Freeze"],["Trigger","Proximity"],["AOE","Small"]],flavor:"Proximity mine that flash-freezes targets."},
+        {c:["Plasma Pistol","Plasma (98)","3.3","122"],sub:"PLASMA",stats:[["Damage",24],["Fire Rate",31],["Range",83],["Accuracy",68]],flavor:"Superheated plasma projector. Turns targets to goo."}
+      ]},
+    apparel:{
+      title:"Apparel",
+      cols:[["Name",""],["Slot","96px","l"],["WT","52px"],["VAL","52px"]],
+      items:[
+        {c:["GP-5 Gas Mask ●","Head","1.2","45"],sub:"EQUIPPED",stats:[["DMG Resist",2],["Energy Resist",0],["Rad Resist",15],["Effect","—"]],flavor:"Pre-war civil defense gas mask. Filters most airborne contaminants."},
+        {c:["Mercenary Jacket ●","Torso","5.0","110"],sub:"EQUIPPED",stats:[["DMG Resist",12],["Energy Resist",8],["Rad Resist",0],["Effect","—"]],flavor:"Reinforced jacket favored by Commonwealth hired guns."},
+        {c:["Leather Armwrap ● (2)","Arms","1.5","28"],sub:"EQUIPPED",stats:[["DMG Resist",5],["Energy Resist",2],["Rad Resist",0],["Effect","—"]],flavor:"Layered leather wraps. Better than nothing."},
+        {c:["Combat Pants ● (2)","Legs","2.4","60"],sub:"EQUIPPED",stats:[["DMG Resist",7],["Energy Resist",3],["Rad Resist",0],["Effect","—"]],flavor:"Military-cut trousers with padded knees."},
+        {c:["Loner Trench Coat ●","Outfit","3.8","140"],sub:"EQUIPPED",stats:[["DMG Resist",10],["Energy Resist",6],["Rad Resist",0],["Effect","+1 CHA"]],flavor:"A long coat that has seen the whole Commonwealth."},
+        {c:["Field Backpack ●","Back","2.0","95"],sub:"EQUIPPED",stats:[["DMG Resist",0],["Energy Resist",0],["Rad Resist",0],["Effect","+30 Carry"]],flavor:"Canvas pack with external frame."},
+        {c:["Vault 111 Jumpsuit","Under","1.0","20"],sub:"STORED",stats:[["DMG Resist",0],["Energy Resist",5],["Rad Resist",10],["Effect","—"]],flavor:"Standard Vault-Tec issue. Still fits."},
+        {c:["Faded Fedora","Head","0.5","12"],sub:"STORED",stats:[["DMG Resist",1],["Energy Resist",1],["Rad Resist",0],["Effect","—"]],flavor:"A hat with stories it won't tell."}
+      ]},
+    aid:{
+      title:"Aid",
+      cols:[["Name",""],["QTY","52px"],["WT","52px"],["VAL","52px"]],
+      items:[
+        {c:["Stimpak","3","0.0","48"],sub:"MEDICINE",stats:[["Effect","+30% HP"],["Heals Limbs","Yes"],["Addiction","None"],["Duration","Instant"]],flavor:"Auto-injecting regenerative serum."},
+        {c:["RadAway","2","0.0","80"],sub:"MEDICINE",stats:[["Effect","-300 Rads"],["Duration","10s"],["Addiction","None"],["Side Effect","—"]],flavor:"Intravenous radiation chelate."},
+        {c:["Rad-X","4","0.0","40"],sub:"CHEM",stats:[["Effect","+100 Rad Res"],["Duration","5m"],["Addiction","None"],["Side Effect","—"]],flavor:"Prophylactic anti-radiation drug."},
+        {c:["Med-X","3","0.0","50"],sub:"CHEM",stats:[["Effect","+25% DR"],["Duration","8m"],["Addiction","Risk"],["Side Effect","—"]],flavor:"Military-grade painkiller."},
+        {c:["Purified Water","6","0.5","20"],sub:"DRINK",stats:[["Effect","+40 HP"],["Rads","0"],["Thirst","Quenches"],["Duration","Over time"]],flavor:"Clean water. Rarer than it should be."},
+        {c:["Squirrel Stew","1","0.5","23"],sub:"FOOD",stats:[["Effect","+24 HP"],["Rads","+2"],["Hunger","Satisfies"],["Bonus","+2% XP 2h"]],flavor:"Hearty stew. Don't ask what's in it."},
+        {c:["Bourbon","2","0.5","30"],sub:"ALCOHOL",stats:[["Effect","+1 STR, +1 END"],["Duration","8m"],["Addiction","Risk"],["Side Effect","-1 INT"]],flavor:"Pre-war spirits, aged 210 years."},
+        {c:["Nuka-Cola","2","1.0","20"],sub:"DRINK",stats:[["Effect","+10 HP, +10 AP"],["Rads","+5"],["Thirst","Quenches"],["Bonus","—"]],flavor:"The refreshing taste of the atom."}
+      ]},
+    misc:{
+      title:"Misc",
+      cols:[["Name",""],["QTY","52px"],["WT","52px"],["VAL","52px"]],
+      items:[
+        {c:["Bobby Pin","24","0.0","1"],sub:"TOOL",stats:[["Use","Lockpicking"]],flavor:"Slightly bent, endlessly useful."},
+        {c:["Pre-War Money","61","0.0","8"],sub:"CURRENCY",stats:[["Use","Barter / cloth"]],flavor:"Legal tender of a dead nation."},
+        {c:["'Hi Honey!' Holotape","1","0.0","0"],sub:"HOLOTAPE",stats:[["Use","Play in Pip-Boy"]],flavor:"A message from before."},
+        {c:["Silver Locket","1","0.1","25"],sub:"VALUABLE",stats:[["Use","Barter"]],flavor:"Tarnished, engraved with initials."},
+        {c:["Overdue Book","2","0.5","2"],sub:"QUEST",stats:[["Use","Return for tokens"]],flavor:"The Boston Public Library would like a word."},
+        {c:["Deck of Cards","1","0.1","3"],sub:"TRINKET",stats:[["Use","—"]],flavor:"Fifty-one cards. Close enough."}
+      ]},
+    junk:{
+      title:"Junk",
+      cols:[["Name",""],["QTY","52px"],["WT","52px"],["VAL","52px"]],
+      items:[
+        {c:["Duct Tape","4","0.1","10"],sub:"COMPONENTS",stats:[["Adhesive",1],["Cloth",1]],flavor:"Breaks down into adhesive — always short on adhesive."},
+        {c:["Desk Fan","2","2.5","4"],sub:"COMPONENTS",stats:[["Screw",2],["Steel",2],["Gear",1]],flavor:"Scrap for screws and gears."},
+        {c:["Aluminum Can","7","0.1","1"],sub:"COMPONENTS",stats:[["Aluminum",1]],flavor:"Lightweight alloy stock."},
+        {c:["Wonderglue","2","0.5","15"],sub:"COMPONENTS",stats:[["Adhesive",2]],flavor:"Industrial adhesive, still tacky."},
+        {c:["Circuit Board","1","0.5","10"],sub:"COMPONENTS",stats:[["Circuitry",1],["Copper",2]],flavor:"Salvaged electronics."},
+        {c:["Broken Camera","1","1.0","12"],sub:"COMPONENTS",stats:[["Crystal",1],["Gears",1],["Spring",1]],flavor:"The lens survived the war. The rest didn't."}
+      ]},
+    ammo:{
+      title:"Ammo",
+      cols:[["Name",""],["QTY","64px"],["WT","52px"],["VAL","52px"]],
+      items:[
+        {c:["5.56mm Round","225","0.0","2"],sub:"RIFLE CALIBER",stats:[["Used By","Combat Rifle"]],flavor:"Standard intermediate rifle cartridge."},
+        {c:[".308 Round","78","0.0","3"],sub:"RIFLE CALIBER",stats:[["Used By","Hunting / Pipe Rifle"]],flavor:"Full-power rifle cartridge."},
+        {c:["10mm Round","58","0.0","1"],sub:"PISTOL CALIBER",stats:[["Used By","10mm Pistol"]],flavor:"Common pistol ammunition."},
+        {c:["Shotgun Shell","42","0.0","2"],sub:"SHELL",stats:[["Used By","Double-Barrel"]],flavor:"12-gauge buckshot."},
+        {c:["Fusion Cell","32","0.0","3"],sub:"ENERGY",stats:[["Used By","Laser Musket"]],flavor:"Charged energy cell."},
+        {c:["Plasma Cartridge","98","0.0","4"],sub:"ENERGY",stats:[["Used By","Plasma Pistol"]],flavor:"Ionized plasma charge."},
+        {c:["Mini Nuke","2","6.0","100"],sub:"HEAVY",stats:[["Used By","Fat Man"]],flavor:"Compact nuclear warhead."}
+      ]}
+  };
+
+  var invhead = document.getElementById("invhead"),
+      invbody = document.getElementById("invbody"),
+      invtitle = document.getElementById("invtitle");
+  var curCatKey = "weapons", curIdx = 0, dmgMode = 0, sortLabel = "";
+  function gridCols(cat){
+    return cat.cols.map(function(c){ return c[1] || "1fr"; }).join(" ");
+  }
+  function showCard(cat, it){
+    document.getElementById("ic-name").textContent = it.c[0].replace(" ★","").replace(" ●","");
+    document.getElementById("ic-sub").textContent = it.sub;
+    document.getElementById("ic-wt").textContent = it.c[2];
+    document.getElementById("ic-val").textContent = it.c[3];
+    var st = document.getElementById("ic-stats"); st.innerHTML = "";
+    var pairs = it.stats.map(function(p0){ return p0.slice(); });
+    if (curCatKey === "weapons"){
+      pairs.forEach(function(p){
+        if (p[0] === "Damage"){
+          if (dmgMode === 1){ p[0] = "Damage · Energy"; p[1] = Math.max(1, Math.round(p[1]*0.35)); }
+          else p[0] = "Damage · Ballistic";
+        }
+      });
+    }
+    pairs.forEach(function(p){
+      var d = document.createElement("div"); d.className = "stat";
+      var i = document.createElement("i");
+      var s = document.createElement("span"); s.className = "txt-dim"; s.textContent = p[0];
+      var b = document.createElement("b"); b.textContent = p[1];
+      d.appendChild(i); d.appendChild(s); d.appendChild(b);
+      st.appendChild(d);
+    });
+    document.getElementById("ic-flavor").textContent = it.flavor;
+    var icl = document.getElementById("ic-leg");
+    icl.style.display = it.leg ? "block" : "none";
+    icl.textContent = it.leg ? "✦ " + it.leg : "";
+  }
+  function renderInv(catKey, selIdx){
+    var cat = INV[catKey];
+    curCatKey = catKey;
+    curIdx = Math.min(selIdx || 0, Math.max(0, cat.items.length - 1));
+    invtitle.textContent = "Inventory · " + cat.title + (sortLabel ? " · " + sortLabel : "");
+    invhead.innerHTML = ""; invbody.innerHTML = "";
+    invhead.style.gridTemplateColumns = gridCols(cat);
+    cat.cols.forEach(function(c, ci){
+      var s = document.createElement("span");
+      var align = c[2] || (ci > 0 ? "r" : "l");
+      if (align === "r") s.className = "num";
+      s.textContent = c[0];
+      invhead.appendChild(s);
+    });
+    cat.items.forEach(function(it, i){
+      var r = document.createElement("div");
+      r.className = "row" + (i === curIdx ? " sel" : "");
+      r.style.gridTemplateColumns = gridCols(cat);
+      it.c.forEach(function(v, ci){
+        var s = document.createElement("span");
+        var align = cat.cols[ci][2] || (ci > 0 ? "r" : "l");
+        s.className = (align === "r" ? "num" : "") + (ci === 1 ? " txt-dim" : "");
+        if (ci === 0 && it.leg){
+          var star = document.createElement("em");
+          star.className = "lgd";
+          star.style.fontStyle = "normal";
+          star.textContent = "✦ ";
+          s.appendChild(star);
+          s.appendChild(document.createTextNode(v));
+        } else s.textContent = v;
+        r.appendChild(s);
+      });
+      r.addEventListener("click", function(){
+        invbody.querySelectorAll(".row").forEach(function(o){o.classList.remove("sel")});
+        r.classList.add("sel");
+        curIdx = i;
+        showCard(cat, it);
+      });
+      invbody.appendChild(r);
+    });
+    if (cat.items.length) showCard(cat, cat.items[curIdx]);
+    else {
+      document.getElementById("ic-name").textContent = "—";
+      document.getElementById("ic-sub").textContent = "";
+      document.getElementById("ic-wt").textContent = "0";
+      document.getElementById("ic-val").textContent = "0";
+      document.getElementById("ic-stats").innerHTML = "";
+      document.getElementById("ic-flavor").textContent = "Nothing in this category.";
+    }
+  }
+  document.querySelectorAll("#invtabs .subtab").forEach(function(st){
+    st.addEventListener("click", function(){
+      document.querySelectorAll("#invtabs .subtab").forEach(function(o){o.classList.remove("active")});
+      st.classList.add("active");
+      renderInv(st.dataset.cat);
+    });
+  });
+  renderInv("weapons");
+
+  /* ---- SPECIAL ---- */
+  var SPECIAL = [
+    ["Strength",4,"Raw physical power. Affects melee damage and how much you can carry."],
+    ["Perception",5,"Environmental awareness and sixth sense. Affects weapon accuracy in V.A.T.S."],
+    ["Endurance",3,"Overall physical fitness. Affects total health and sprint drain."],
+    ["Charisma",6,"Ability to charm and convince. Affects speech persuasion and barter prices."],
+    ["Intelligence",6,"Overall mental acuity. Affects experience points earned."],
+    ["Agility",4,"Finesse and reflexes. Affects Action Points and sneaking."],
+    ["Luck",5,"General good fortune. Affects critical hit recharge rate."]
+  ];
+  var slist = document.getElementById("speciallist");
+  var shead = document.createElement("div"); shead.className = "head";
+  shead.style.gridTemplateColumns = "1fr 60px";
+  shead.innerHTML = "<span>Attribute</span><span class='num'>Value</span>";
+  slist.appendChild(shead);
+  SPECIAL.forEach(function(sp, i){
+    var r = document.createElement("div"); r.className = "row" + (i===0 ? " sel" : "");
+    r.style.gridTemplateColumns = "1fr 60px";
+    r.innerHTML = "<span>" + sp[0] + "</span><span class='num'>" + sp[1] + "</span>";
+    r.addEventListener("click", function(){
+      slist.querySelectorAll(".row").forEach(function(o){o.classList.remove("sel")});
+      r.classList.add("sel");
+      document.getElementById("specialname").textContent = sp[0];
+      document.getElementById("specialdesc").textContent = sp[2];
+    });
+    slist.appendChild(r);
+  });
+  document.getElementById("specialname").textContent = SPECIAL[0][0];
+  document.getElementById("specialdesc").textContent = SPECIAL[0][2];
+
+  /* ---- perks ---- */
+  var PERKS = [
+    ["Gun Nut","1","Access to base-level and Rank 1 gun mods at weapon workbenches."],
+    ["Armorer","1","Access to base-level and Rank 1 armor mods at armor workbenches."],
+    ["Lone Wanderer","1","When adventuring without a companion, take 15% less damage and carry 50 more."],
+    ["Well Rested","+10% XP","You gained a bonus to XP from sleeping in a proper bed."]
+  ];
+  var plist = document.getElementById("perklist");
+  var phead = document.createElement("div"); phead.className = "head";
+  phead.style.gridTemplateColumns = "1fr 90px";
+  phead.innerHTML = "<span>Perk / Effect</span><span class='num'>Rank</span>";
+  plist.appendChild(phead);
+  PERKS.forEach(function(pk, i){
+    var r = document.createElement("div"); r.className = "row" + (i===0 ? " sel" : "");
+    r.style.gridTemplateColumns = "1fr 90px";
+    r.innerHTML = "<span>" + pk[0] + "</span><span class='num'>" + pk[1] + "</span>";
+    r.addEventListener("click", function(){
+      plist.querySelectorAll(".row").forEach(function(o){o.classList.remove("sel")});
+      r.classList.add("sel");
+      document.getElementById("perkname").textContent = pk[0];
+      document.getElementById("perkdesc2").textContent = pk[2];
+    });
+    plist.appendChild(r);
+  });
+  document.getElementById("perkname").textContent = PERKS[0][0];
+  document.getElementById("perkdesc2").textContent = PERKS[0][2];
+
+  /* ---- character preview: WebGL turntable when a GLB is embedded, flip card otherwise ---- */
+  var MODEL_B64 = "@@GLB@@";
+  var INSPECT_B64 = "@@GLB2@@";
+  var viewerAPI = null;
+  var figcard = document.getElementById("figcard"), box = document.getElementById("figurebox");
+  var glcanvas = document.getElementById("glcanvas");
+  var yaw = 0, vyaw = 0, pitch = 0, dragging = false, lastX = 0, lastY = 0, interacted = false;
+  var zoom = 1, autoSpin = false, rimTint = null;
+  var mode = "card";
+
+  document.querySelectorAll("#figcard img").forEach(function(im){ im.draggable = false; });
+  function setYaw(){ if (mode === "card") figcard.style.transform = "rotateY(" + yaw + "deg)"; }
+  function startDrag(e){
+    if (e.button !== 0) return;              /* right-click is the auto-spin toggle, not a drag */
+    e.preventDefault();
+    dragging = true; interacted = true; lastX = e.clientX; lastY = e.clientY; vyaw = 0;
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch(_){}
+  }
+  box.addEventListener("pointerdown", startDrag);
+  glcanvas.addEventListener("pointerdown", startDrag);
+  function toggleSpin(e){ e.preventDefault(); e.stopPropagation(); autoSpin = !autoSpin; }
+  box.addEventListener("contextmenu", toggleSpin);
+  glcanvas.addEventListener("contextmenu", toggleSpin);
+  addEventListener("pointermove", function(e){
+    if(!dragging) return;
+    var dx = e.clientX - lastX, dy = e.clientY - lastY;
+    yaw += dx * 0.55; vyaw = dx * 0.55;
+    pitch = Math.max(-18, Math.min(18, pitch + dy * 0.12));
+    lastX = e.clientX; lastY = e.clientY;
+    setYaw();
+  });
+  addEventListener("pointerup", function(){ dragging = false; });
+
+  /* ---- minimal GLB parser + WebGL renderer ---- */
+  function b64bytes(s){
+    var bin = atob(s), a = new Uint8Array(bin.length);
+    for (var i=0;i<bin.length;i++) a[i] = bin.charCodeAt(i);
+    return a;
+  }
+  function parseGLB(bytes){
+    var dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (dv.getUint32(0, true) !== 0x46546C67) throw new Error("not glb");
+    var total = dv.getUint32(8, true), off = 12, json = null, bin = null;
+    while (off < total){
+      var clen = dv.getUint32(off, true), ctype = dv.getUint32(off + 4, true);
+      var chunk = bytes.subarray(off + 8, off + 8 + clen);
+      if (ctype === 0x4E4F534A) json = JSON.parse(new TextDecoder().decode(chunk));
+      else if (ctype === 0x004E4942) bin = chunk;
+      off += 8 + clen;
+    }
+    return { json: json, bin: bin };
+  }
+  function accessorArray(g, bin, idx){
+    var acc = g.accessors[idx], bv = g.bufferViews[acc.bufferView];
+    var byteOff = (bv.byteOffset||0) + (acc.byteOffset||0);
+    var compCount = {SCALAR:1, VEC2:2, VEC3:3, VEC4:4, MAT2:4, MAT3:9, MAT4:16}[acc.type];
+    var n = acc.count * compCount;
+    var base = bin.byteOffset + byteOff;
+    if (acc.componentType === 5126) return new Float32Array(bin.buffer, base, n);
+    if (acc.componentType === 5123) return new Uint16Array(bin.buffer, base, n);
+    if (acc.componentType === 5125) return new Uint32Array(bin.buffer, base, n);
+    if (acc.componentType === 5121) return new Uint8Array(bin.buffer, base, n);
+    throw new Error("componentType " + acc.componentType);
+  }
+  /* mat4 column-major helpers */
+  function mIdent(){ return [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; }
+  function mMul(a,b){
+    var o = new Array(16);
+    for (var c=0;c<4;c++) for (var r=0;r<4;r++){
+      o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    }
+    return o;
+  }
+  function mTrans(x,y,z){ var m = mIdent(); m[12]=x; m[13]=y; m[14]=z; return m; }
+  function mRotY(a){ var c=Math.cos(a), s=Math.sin(a); return [c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]; }
+  function mRotX(a){ var c=Math.cos(a), s=Math.sin(a); return [1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]; }
+  function mPersp(fovy, aspect, near, far){
+    var f = 1/Math.tan(fovy/2), nf = 1/(near-far);
+    return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0];
+  }
+  function nodeMatrix(nd){
+    if (nd.matrix) return nd.matrix.slice();
+    var m = mIdent();
+    if (nd.translation) m = mMul(m, mTrans(nd.translation[0], nd.translation[1], nd.translation[2]));
+    if (nd.rotation){
+      var q = nd.rotation, x=q[0],y=q[1],z=q[2],w=q[3];
+      m = mMul(m, [1-2*(y*y+z*z),2*(x*y+z*w),2*(x*z-y*w),0,
+                   2*(x*y-z*w),1-2*(x*x+z*z),2*(y*z+x*w),0,
+                   2*(x*z+y*w),2*(y*z-x*w),1-2*(x*x+y*y),0, 0,0,0,1]);
+    }
+    if (nd.scale){ var s = nd.scale; m = mMul(m, [s[0],0,0,0, 0,s[1],0,0, 0,0,s[2],0, 0,0,0,1]); }
+    return m;
+  }
+  function initViewer(){
+    var hasChar = MODEL_B64 && MODEL_B64.indexOf("@@") !== 0;
+    var hasItem = INSPECT_B64 && INSPECT_B64.indexOf("@@") !== 0;
+    if (!hasChar && !hasItem) return;
+    var gl = glcanvas.getContext("webgl", {alpha:true, antialias:true, premultipliedAlpha:false});
+    if (!gl) return;
+    var maxVec = gl.getParameter(gl.MAX_VERTEX_UNIFORM_VECTORS);
+
+    var fsrc = "precision mediump float;varying vec3 vN;varying vec2 vT;varying vec3 vW;" +
+      "uniform sampler2D uTex;uniform vec3 uEye;uniform vec2 uLit;uniform vec3 uRimC;void main(){vec3 N=normalize(vN);" +
+      "vec3 L=normalize(vec3(0.35,0.8,0.6));float d=max(dot(N,L),0.0);" +
+      "vec4 c=texture2D(uTex,vT);vec3 V=normalize(uEye-vW);" +
+      "float rim=pow(1.0-max(dot(N,V),0.0),2.5);" +
+      "vec3 col=c.rgb*(uLit.x+(1.0-uLit.x)*d)+uRimC*rim*uLit.y;" +
+      "gl_FragColor=vec4(col,c.a);}";
+    function vsrcOf(bones){
+      var skin = bones > 0;
+      return "attribute vec3 aP;attribute vec3 aN;attribute vec2 aT;" +
+        (skin ? "attribute vec4 aJ;attribute vec4 aW;uniform mat4 uSkin[" + bones + "];" : "") +
+        "uniform mat4 uVP;uniform mat4 uM;varying vec3 vN;varying vec2 vT;varying vec3 vW;" +
+        "void main(){" +
+        (skin ? "mat4 sm=aW.x*uSkin[int(aJ.x)]+aW.y*uSkin[int(aJ.y)]+aW.z*uSkin[int(aJ.z)]+aW.w*uSkin[int(aJ.w)];mat4 wm=uM*sm;"
+              : "mat4 wm=uM;") +
+        "vec4 wp=wm*vec4(aP,1.0);gl_Position=uVP*wp;vW=wp.xyz;" +
+        "vN=mat3(wm[0].xyz,wm[1].xyz,wm[2].xyz)*aN;vT=aT;}";
+    }
+    function progInfo(bones){
+      function sh(type, src){
+        var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+        return s;
+      }
+      var p = gl.createProgram();
+      gl.attachShader(p, sh(gl.VERTEX_SHADER, vsrcOf(bones)));
+      gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fsrc));
+      gl.linkProgram(p);
+      return { p:p,
+        aP:gl.getAttribLocation(p,"aP"), aN:gl.getAttribLocation(p,"aN"), aT:gl.getAttribLocation(p,"aT"),
+        aJ:gl.getAttribLocation(p,"aJ"), aW:gl.getAttribLocation(p,"aW"),
+        uVP:gl.getUniformLocation(p,"uVP"), uM:gl.getUniformLocation(p,"uM"),
+        uSkin:gl.getUniformLocation(p,"uSkin[0]") || gl.getUniformLocation(p,"uSkin"),
+        uTex:gl.getUniformLocation(p,"uTex"), uEye:gl.getUniformLocation(p,"uEye"),
+        uLit:gl.getUniformLocation(p,"uLit"), uRimC:gl.getUniformLocation(p,"uRimC") };
+    }
+    var progStatic = progInfo(0);
+    var skinProgs = {};
+    function getSkinProg(n){
+      if (n*4 + 16 >= maxVec) return null;
+      if (!skinProgs[n]) skinProgs[n] = progInfo(n);
+      return skinProgs[n];
+    }
+
+    function createScene(b64){
+      var glb;
+      try { glb = parseGLB(b64bytes(b64)); } catch(e){ return null; }
+      var g = glb.json, bin = glb.bin;
+      if (!g || !bin) return null;
+
+      var nodes = g.nodes.map(function(nd){
+        return { nd:nd, matrix:nd.matrix || null,
+          t:(nd.translation||[0,0,0]).slice(), r:(nd.rotation||[0,0,0,1]).slice(), s:(nd.scale||[1,1,1]).slice(),
+          world:mIdent() };
+      });
+      function composeTRS(n){
+        if (n.matrix) return n.matrix.slice();
+        var m = mTrans(n.t[0],n.t[1],n.t[2]);
+        var q=n.r, x=q[0],y=q[1],z=q[2],w=q[3];
+        m = mMul(m, [1-2*(y*y+z*z),2*(x*y+z*w),2*(x*z-y*w),0,
+                     2*(x*y-z*w),1-2*(x*x+z*z),2*(y*z+x*w),0,
+                     2*(x*z+y*w),2*(y*z-x*w),1-2*(x*x+y*y),0, 0,0,0,1]);
+        var s=n.s;
+        return mMul(m, [s[0],0,0,0, 0,s[1],0,0, 0,0,s[2],0, 0,0,0,1]);
+      }
+      var scene = g.scenes[g.scene||0];
+      function computeWorld(){
+        function rec(i, pm){
+          var n = nodes[i];
+          n.world = mMul(pm, composeTRS(n));
+          (n.nd.children||[]).forEach(function(c){ rec(c, n.world); });
+        }
+        scene.nodes.forEach(function(r){ rec(r, mIdent()); });
+      }
+      computeWorld();
+
+      var skins = (g.skins||[]).map(function(s){
+        var ibmFlat = accessorArray(g, bin, s.inverseBindMatrices);
+        var ibms = [];
+        for (var j=0;j<s.joints.length;j++) ibms.push(Array.prototype.slice.call(ibmFlat, j*16, j*16+16));
+        return { joints:s.joints, ibms:ibms, mats:new Float32Array(s.joints.length*16) };
+      });
+      var progSkin = skins.length ? getSkinProg(skins[0].joints.length) : null;
+
+      var anim = null;
+      if (g.animations && g.animations.length){
+        var a0 = g.animations[0], dur = 0;
+        var chans = a0.channels.map(function(ch){
+          var sp = a0.samplers[ch.sampler];
+          var times = accessorArray(g, bin, sp.input), vals = accessorArray(g, bin, sp.output);
+          dur = Math.max(dur, times[times.length-1]);
+          return { node:ch.target.node, path:ch.target.path, times:times, vals:vals, k:0 };
+        });
+        if (dur > 0) anim = { chans:chans, dur:dur };
+      }
+      function sampleAnim(t){
+        anim.chans.forEach(function(c){
+          var times = c.times, n = times.length;
+          if (c.k >= n-1 || times[c.k] > t) c.k = 0;
+          while (c.k < n-2 && times[c.k+1] < t) c.k++;
+          var i0 = c.k, i1 = Math.min(i0+1, n-1);
+          var f = (times[i1] === times[i0]) ? 0 : (t - times[i0]) / (times[i1] - times[i0]);
+          f = Math.max(0, Math.min(1, f));
+          var tgt = nodes[c.node];
+          if (c.path === "rotation"){
+            var d = c.vals[i0*4]*c.vals[i1*4]+c.vals[i0*4+1]*c.vals[i1*4+1]+c.vals[i0*4+2]*c.vals[i1*4+2]+c.vals[i0*4+3]*c.vals[i1*4+3];
+            var sg = d < 0 ? -1 : 1, out=[0,0,0,0], len=0;
+            for (var j=0;j<4;j++){ var v0=c.vals[i0*4+j]; out[j]=v0+f*(sg*c.vals[i1*4+j]-v0); len+=out[j]*out[j]; }
+            len = Math.sqrt(len) || 1;
+            tgt.r = [out[0]/len,out[1]/len,out[2]/len,out[3]/len]; tgt.matrix = null;
+          } else if (c.path === "translation" || c.path === "scale"){
+            var v=[c.vals[i0*3]+f*(c.vals[i1*3]-c.vals[i0*3]),
+                   c.vals[i0*3+1]+f*(c.vals[i1*3+1]-c.vals[i0*3+1]),
+                   c.vals[i0*3+2]+f*(c.vals[i1*3+2]-c.vals[i0*3+2])];
+            if (c.path === "translation") tgt.t = v; else tgt.s = v;
+            tgt.matrix = null;
+          }
+        });
+      }
+
+      var prims = [], lo = [1e9,1e9,1e9], hi = [-1e9,-1e9,-1e9];
+      function vbo(arr){ var b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,arr,gl.STATIC_DRAW); return b; }
+      g.nodes.forEach(function(nd, ni){
+        if (nd.mesh === undefined) return;
+        var skinIdx = (nd.skin !== undefined && progSkin) ? nd.skin : -1;
+        var m = (skinIdx >= 0) ? mIdent() : nodes[ni].world;
+        g.meshes[nd.mesh].primitives.forEach(function(p){
+          var pos = accessorArray(g, bin, p.attributes.POSITION);
+          var nrm = p.attributes.NORMAL !== undefined ? accessorArray(g, bin, p.attributes.NORMAL) : null;
+          var uv  = p.attributes.TEXCOORD_0 !== undefined ? accessorArray(g, bin, p.attributes.TEXCOORD_0) : new Float32Array(pos.length/3*2);
+          var idx = p.indices !== undefined ? accessorArray(g, bin, p.indices) : null;
+          if (!nrm){
+            nrm = new Float32Array(pos.length);
+            for (var i=0;i<pos.length;i+=3){ nrm[i]=0; nrm[i+1]=1; nrm[i+2]=0; }
+          }
+          for (var v=0; v<pos.length; v+=3){
+            var x=pos[v],y=pos[v+1],z=pos[v+2];
+            var wx=m[0]*x+m[4]*y+m[8]*z+m[12], wy=m[1]*x+m[5]*y+m[9]*z+m[13], wz=m[2]*x+m[6]*y+m[10]*z+m[14];
+            if(wx<lo[0])lo[0]=wx; if(wy<lo[1])lo[1]=wy; if(wz<lo[2])lo[2]=wz;
+            if(wx>hi[0])hi[0]=wx; if(wy>hi[1])hi[1]=wy; if(wz>hi[2])hi[2]=wz;
+          }
+          var prim = { m:m, posArr:pos, skin:skinIdx, vp:vbo(pos), vn:vbo(new Float32Array(nrm)), vt:vbo(new Float32Array(uv)), n:pos.length/3, tex:null };
+          if (skinIdx >= 0 && p.attributes.JOINTS_0 !== undefined && p.attributes.WEIGHTS_0 !== undefined){
+            var jArr = accessorArray(g, bin, p.attributes.JOINTS_0);
+            var wArr = accessorArray(g, bin, p.attributes.WEIGHTS_0);
+            prim.vj = vbo(jArr);
+            prim.jtype = (jArr.BYTES_PER_ELEMENT === 1) ? gl.UNSIGNED_BYTE : gl.UNSIGNED_SHORT;
+            prim.vw = vbo(wArr);
+            prim.wtype = (wArr.BYTES_PER_ELEMENT === 4) ? gl.FLOAT :
+                         (wArr.BYTES_PER_ELEMENT === 1) ? gl.UNSIGNED_BYTE : gl.UNSIGNED_SHORT;
+          } else prim.skin = -1;
+          if (idx){
+            prim.ib = gl.createBuffer();
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, prim.ib);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+            prim.n = idx.length;
+            prim.itype = (idx.BYTES_PER_ELEMENT === 4) ? gl.UNSIGNED_INT :
+                         (idx.BYTES_PER_ELEMENT === 1) ? gl.UNSIGNED_BYTE : gl.UNSIGNED_SHORT;
+            if (prim.itype === gl.UNSIGNED_INT) gl.getExtension("OES_element_index_uint");
+          }
+          var white = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, white);
+          gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([190,195,185,255]));
+          prim.tex = white;
+          var mat = p.material !== undefined ? g.materials[p.material] : null;
+          var bct = mat && mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorTexture;
+          if (bct){
+            var img = g.images[g.textures[bct.index].source];
+            var ibv = g.bufferViews[img.bufferView];
+            var blob = new Blob([bin.subarray(ibv.byteOffset||0, (ibv.byteOffset||0)+ibv.byteLength)], {type: img.mimeType});
+            createImageBitmap(blob).then(function(bmp){
+              var t = gl.createTexture();
+              gl.bindTexture(gl.TEXTURE_2D, t);
+              gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+              gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,bmp);
+              gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+              gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+              gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+              prim.tex = t;
+            }).catch(function(err){ console.warn("texture decode failed:", err && err.message); });
+          }
+          prims.push(prim);
+        });
+      });
+      if (!prims.length) return null;
+
+      var cx=(lo[0]+hi[0])/2, cy=(lo[1]+hi[1])/2, cz=(lo[2]+hi[2])/2;
+      var height = hi[1]-lo[1], wx2 = hi[0]-lo[0], wz2 = hi[2]-lo[2];
+      var humanoid = height > 1.4*Math.max(wx2, wz2);
+      if (humanoid){
+        /* pivot on the body axis: head-slab and feet-slab centroids give the spine */
+        var topY = hi[1] - 0.12*height, botY = lo[1] + 0.06*height;
+        var ts=[0,0,0], tn=0, bs=[0,0,0], bn=0;
+        prims.forEach(function(p){
+          var m = p.m, a = p.posArr;
+          for (var v=0; v<a.length; v+=3){
+            var x=a[v],y=a[v+1],z=a[v+2];
+            var wxx=m[0]*x+m[4]*y+m[8]*z+m[12], wyy=m[1]*x+m[5]*y+m[9]*z+m[13], wzz=m[2]*x+m[6]*y+m[10]*z+m[14];
+            if (wyy > topY){ ts[0]+=wxx; ts[2]+=wzz; tn++; }
+            else if (wyy < botY){ bs[0]+=wxx; bs[2]+=wzz; bn++; }
+          }
+          p.posArr = null;
+        });
+        if (tn && bn){
+          cx = (ts[0]/tn + bs[0]/bn) / 2;
+          cz = (ts[2]/tn + bs[2]/bn) / 2;
+        }
+      } else prims.forEach(function(p){ p.posArr = null; });
+      var radius = 0.5*Math.sqrt(wx2*wx2 + height*height + wz2*wz2);
+      var dist = radius / Math.tan(0.26) * 1.06;
+      var eye = [cx, cy + height*0.02, cz + dist];
+      /* thin objects are all grazing angles — tame the rim so they read as solid metal */
+      var lit = humanoid ? [0.60, 1.0] : [0.38, 0.30];
+
+      function render(now, yawDeg, pitchDeg){
+        if (anim && progSkin && !reduced){
+          sampleAnim(((now||0)/1000) % anim.dur);
+          computeWorld();
+        }
+        skins.forEach(function(sk){
+          for (var j=0;j<sk.joints.length;j++)
+            sk.mats.set(mMul(nodes[sk.joints[j]].world, sk.ibms[j]), j*16);
+        });
+        gl.viewport(0,0,glcanvas.width,glcanvas.height);
+        gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+        var d2 = dist * zoom, eyeV = [eye[0], eye[1], eye[2] - dist + d2];
+        var proj = mPersp(0.52, glcanvas.width/glcanvas.height, d2*0.05, d2*4);
+        var view = mTrans(-eyeV[0], -eyeV[1], -eyeV[2]);
+        var VP = new Float32Array(mMul(proj, view));
+        var spin = mMul(mMul(mTrans(cx,cy,cz), mMul(mRotY(yawDeg*Math.PI/180), mRotX(pitchDeg*Math.PI/180))), mTrans(-cx,-cy,-cz));
+        prims.forEach(function(p){
+          var pi = (p.skin >= 0) ? progSkin : progStatic;
+          gl.useProgram(pi.p);
+          var M = mMul(spin, p.m);
+          gl.uniformMatrix4fv(pi.uVP, false, VP);
+          gl.uniformMatrix4fv(pi.uM, false, new Float32Array(M));
+          gl.uniform3fv(pi.uEye, eyeV);
+          gl.uniform2f(pi.uLit, lit[0], rimTint ? 0.9 : lit[1]);
+          var rc = rimTint || [0.10, 0.20, 0.11];
+          gl.uniform3f(pi.uRimC, rc[0], rc[1], rc[2]);
+          if (p.skin >= 0) gl.uniformMatrix4fv(pi.uSkin, false, skins[p.skin].mats);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, p.tex);
+          gl.uniform1i(pi.uTex, 0);
+          gl.bindBuffer(gl.ARRAY_BUFFER, p.vp); gl.enableVertexAttribArray(pi.aP); gl.vertexAttribPointer(pi.aP,3,gl.FLOAT,false,0,0);
+          gl.bindBuffer(gl.ARRAY_BUFFER, p.vn); gl.enableVertexAttribArray(pi.aN); gl.vertexAttribPointer(pi.aN,3,gl.FLOAT,false,0,0);
+          gl.bindBuffer(gl.ARRAY_BUFFER, p.vt); gl.enableVertexAttribArray(pi.aT); gl.vertexAttribPointer(pi.aT,2,gl.FLOAT,false,0,0);
+          if (p.skin >= 0){
+            gl.bindBuffer(gl.ARRAY_BUFFER, p.vj); gl.enableVertexAttribArray(pi.aJ); gl.vertexAttribPointer(pi.aJ,4,p.jtype,false,0,0);
+            gl.bindBuffer(gl.ARRAY_BUFFER, p.vw); gl.enableVertexAttribArray(pi.aW); gl.vertexAttribPointer(pi.aW,4,p.wtype,p.wtype!==gl.FLOAT,0,0);
+          }
+          if (p.ib){ gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.ib); gl.drawElements(gl.TRIANGLES, p.n, p.itype, 0); }
+          else gl.drawArrays(gl.TRIANGLES, 0, p.n);
+        });
+      }
+      return { render: render };
+    }
+
+    var sceneChar = hasChar ? createScene(MODEL_B64) : null;
+    var sceneItem = hasItem ? createScene(INSPECT_B64) : null;
+    var active = sceneChar || sceneItem;
+    if (!active) return;
+
+    mode = "gl";
+    figcard.style.display = "none";
+    glcanvas.style.display = "block";
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(0,0,0,0);
+    function revertToCard(){
+      mode = "card";
+      glcanvas.style.display = "none";
+      figcard.style.display = "";
+      setYaw();
+    }
+    glcanvas.addEventListener("webglcontextlost", revertToCard);
+
+    viewerAPI = {
+      hasItem: !!sceneItem,
+      setScene: function(which){
+        active = (which === "item" && sceneItem) ? sceneItem : (sceneChar || sceneItem);
+        yaw = 0; vyaw = 0; pitch = 0; interacted = false; zoom = 1; autoSpin = false;
+      }
+    };
+    window.__pipos = { scenes: { character: !!sceneChar, item: !!sceneItem } };
+
+    function frame(now){
+      if (!dragging){
+        yaw += vyaw; vyaw *= 0.93;                     /* inertia */
+        if (autoSpin && !reduced) yaw += 0.25;         /* auto-spin only when toggled on (right-click) */
+        pitch *= 0.97;
+      }
+      active.render(now, yaw, pitch);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+  initViewer();
+
+  /* ---- fullscreen weapon inspect: blur menu, fly weapon to center, reveal stats ---- */
+  var inspecting = false, inspectBusy = false;
+  var inspectLay = document.getElementById("inspectlay");
+  var insTitle = document.getElementById("ins-title");
+  var insStats = document.getElementById("ins-stats-rows");
+  var insMods = document.getElementById("ins-mods-rows");
+  var DEFAULT_MODS = ["Standard Receiver","Standard Barrel","Standard Grip","Standard Sights"];
+
+  function inspectItem(){ return INV[curCatKey].items[curIdx]; }
+  function fillInspectPanels(it){
+    insTitle.textContent = it.c[0].replace(" ★","");
+    var legEl = document.getElementById("ins-leg");
+    legEl.style.display = it.leg ? "block" : "none";
+    document.getElementById("ins-leg-text").textContent = it.leg || "";
+    rimTint = it.leg ? [0.55,0.42,0.12] : null;   /* gold rim for legendaries */
+    glcanvas.classList.toggle("lgdglow", !!it.leg);
+    insStats.innerHTML = "";
+    var pairs = it.stats.concat([["Ammo", it.c[1]], ["Weight", it.c[2]], ["Value", it.c[3]]]);
+    pairs.forEach(function(p){
+      var r = document.createElement("div"); r.className = "row";
+      var a = document.createElement("span"); a.className = "txt-dim"; a.textContent = p[0];
+      var b = document.createElement("span"); b.className = "num txt-bright"; b.textContent = p[1];
+      r.appendChild(a); r.appendChild(b);
+      insStats.appendChild(r);
+    });
+    insMods.innerHTML = "";
+    (it.mods || DEFAULT_MODS).forEach(function(m2){
+      var r = document.createElement("div"); r.className = "row";
+      var a = document.createElement("span"); a.textContent = m2;
+      r.appendChild(a);
+      insMods.appendChild(r);
+    });
+  }
+
+  var canvasHome = { parent: null, next: null };
+  function canvasDelta(){
+    var s = stage.getBoundingClientRect().width / 1600;
+    var fb = box.getBoundingClientRect(), st = stage.getBoundingClientRect();
+    var fx = (fb.left + fb.width/2 - st.left) / s, fy = (fb.top + fb.height/2 - st.top) / s;
+    return { dx: fx - 800, dy: fy - 440 };            /* overlay canvas center = (800, 440) */
+  }
+  function setInspect(on){
+    if (on === inspecting || inspectBusy) return;
+    if (on && !(mode === "gl" && viewerAPI && viewerAPI.hasItem)) return;
+    if (on && !document.getElementById("page-inv").classList.contains("shown")) return;
+    if (on && curCatKey !== "weapons") return;
+    inspecting = on; inspectBusy = true;
+    if (on){
+      fillInspectPanels(inspectItem());
+      viewerAPI.setScene("item");
+      canvasHome.parent = glcanvas.parentElement;
+      canvasHome.next = glcanvas.nextElementSibling;
+      inspectLay.classList.add("on");
+      inspectLay.appendChild(glcanvas);
+      glcanvas.width = 2480; glcanvas.height = 1320;
+      glcanvas.style.cssText = "display:block;position:absolute;left:180px;top:110px;width:1240px;height:660px;margin:0";
+      var d0 = canvasDelta();
+      glcanvas.style.transform = "translate(" + d0.dx + "px," + d0.dy + "px) scale(0.04)";
+      void glcanvas.offsetWidth;                      /* commit the start state before transitioning */
+      glcanvas.classList.add("flying");
+      glcanvas.style.transform = "translate(0px,0px) scale(1)";
+      setTimeout(function(){
+        glcanvas.classList.remove("flying");
+        inspectLay.classList.add("focused");
+        inspectBusy = false;
+      }, 470);
+      setKeys("inspect");
+    } else {
+      inspectLay.classList.remove("focused");
+      rimTint = null;
+      glcanvas.classList.remove("lgdglow");
+      var d1 = canvasDelta();
+      glcanvas.classList.add("flying");
+      glcanvas.style.transform = "translate(" + d1.dx + "px," + d1.dy + "px) scale(0.04)";
+      setTimeout(function(){
+        glcanvas.classList.remove("flying");
+        glcanvas.style.cssText = "display:block";
+        glcanvas.width = 852; glcanvas.height = 1120;
+        canvasHome.parent.insertBefore(glcanvas, canvasHome.next);
+        inspectLay.classList.remove("on");
+        viewerAPI.setScene("char");
+        setKeys("inv");
+        inspectBusy = false;
+      }, 470);
+    }
+  }
+  window.__setInspect = setInspect;
+  window.__toggleInspect = function(){ setInspect(!inspecting); };
+  function cycleInspect(delta){
+    var rowsEls = invbody.querySelectorAll(".row");
+    if (!rowsEls.length) return;
+    var next = (curIdx + delta + rowsEls.length) % rowsEls.length;
+    rowsEls[next].click();                            /* updates selection, item card, curIdx */
+    fillInspectPanels(inspectItem());
+  }
+  addEventListener("wheel", function(e){
+    if (!inspecting) return;
+    e.preventDefault();
+    zoom = Math.max(0.45, Math.min(1.8, zoom * (e.deltaY > 0 ? 1.09 : 0.92)));
+  }, {passive:false});
+
+  /* ================= quest log: active / MISC / completed, selectable objectives ================= */
+  var QUESTS = [
+    { name:"Out of Time", status:"ACTIVE",
+      desc:"The bombs fell, the Vault froze you, and 210 years later your son is missing. Find Shaun.",
+      objectives:[{t:"Exit Vault 111",done:true},{t:"Go home to Sanctuary Hills",done:true},{t:"Talk to Codsworth",done:false}] },
+    { name:"Sanctuary", status:"ACTIVE",
+      desc:"Sturges and the settlers need Sanctuary Hills made livable again.",
+      objectives:[{t:"Build beds for the settlers",done:false},{t:"Provide clean water",done:false},{t:"Plant crops",done:false}] },
+    { name:"Miscellaneous", status:"",
+      desc:"Assorted objectives collected across the Commonwealth. Each one can be tracked on its own.",
+      objectives:[
+        {t:"Return the overdue library books",done:false},
+        {t:"Investigate the Vault 111 distress signal",done:false},
+        {t:"Collect 10 adhesive for Sturges",done:false},
+        {t:"Listen to Radio Freedom",done:false},
+        {t:"Clear the Red Rocket workshop",done:false},
+        {t:"Bring a desk fan to Abernathy Farm",done:false}] },
+    { name:"War Never Changes", status:"DONE",
+      desc:"You witnessed the end of the world and reached Vault 111 in time. Barely.",
+      objectives:[{t:"Reach Vault 111",done:true},{t:"Enter the Vault",done:true}] },
+    { name:"Prologue", status:"DONE",
+      desc:"Life before the war: one ordinary morning in Sanctuary Hills.",
+      objectives:[{t:"Answer the door",done:true},{t:"Register with Vault-Tec",done:true}] }
+  ];
+  var qSel = 0, oSel = 0;
+  var questrows = document.getElementById("questrows");
+  var objrows = document.getElementById("objrows");
+  var objtitle = document.getElementById("objtitle");
+  var questsummary = document.getElementById("questsummary");
+  function renderQuests(){
+    questrows.innerHTML = "";
+    function addRow(q, i){
+      var r = document.createElement("div");
+      r.className = "row" + (i === qSel ? " sel" : "");
+      r.style.gridTemplateColumns = "18px 1fr 90px";
+      var a = document.createElement("span"); a.textContent = (i === qSel) ? "▸" : "";
+      var b = document.createElement("span"); b.textContent = q.name;
+      var c = document.createElement("span");
+      c.className = "num" + (q.status === "DONE" ? " txt-dim" : "");
+      c.textContent = q.status;
+      r.appendChild(a); r.appendChild(b); r.appendChild(c);
+      r.addEventListener("click", function(){ qSel = i; oSel = 0; renderQuests(); });
+      questrows.appendChild(r);
+    }
+    QUESTS.forEach(function(q, i){ if (q.status !== "DONE") addRow(q, i); });
+    if (QUESTS.some(function(q){ return q.status === "DONE"; })){
+      var sep = document.createElement("div");
+      sep.className = "qsep";
+      sep.textContent = "Completed";
+      questrows.appendChild(sep);
+      QUESTS.forEach(function(q, i){ if (q.status === "DONE") addRow(q, i); });
+    }
+    var q = QUESTS[qSel];
+    objtitle.textContent = "Objectives · " + q.name;
+    objrows.innerHTML = "";
+    q.objectives.forEach(function(o, j){
+      var d = document.createElement("div");
+      d.className = "obj" + (o.done ? " done" : "") + (j === oSel ? " sel" : "");
+      var box = document.createElement("span"); box.className = "box";
+      var tx = document.createElement("span"); tx.textContent = o.t;
+      d.appendChild(box); d.appendChild(tx);
+      d.addEventListener("click", function(){ oSel = j; renderQuests(); });
+      objrows.appendChild(d);
+    });
+    questsummary.textContent = q.desc;
+  }
+  renderQuests();
+
+  /* ================= radio wiring ================= */
+  var STATIONS = [
+    { f:"102.5 MHz", dj:"Diamond City Radio · Travis Miles", sig:"100%" },
+    { f:"98.7 MHz",  dj:"Classical Radio · automated broadcast", sig:"98%" },
+    { f:"94.3 MHz",  dj:"Radio Freedom · Minutemen broadcast", sig:"64%" },
+    { f:"87.1 MHz",  dj:"Vault 111 Distress · repeating beacon", sig:"12%" }
+  ];
+  var stationRows = Array.prototype.slice.call(document.querySelectorAll("#stations .row"));
+  var stSel = 0, stTuned = 0;
+  function renderStations(){
+    stationRows.forEach(function(r, i){
+      r.classList.toggle("sel", i === stSel);
+      var cells = r.querySelectorAll("span");
+      cells[0].textContent = (radioOn && i === stTuned) ? "♪" : "";
+      cells[2].textContent = (radioOn && i === stTuned) ? "ON AIR" : STATIONS[i].sig;
+      cells[2].className = "num" + ((radioOn && i === stTuned) ? "" : " txt-dim");
+    });
+    document.getElementById("freqval").textContent = radioOn ? STATIONS[stTuned].f : "— MHz";
+    document.getElementById("freqdj").textContent = radioOn ? STATIONS[stTuned].dj : "Receiver off · press Enter to tune";
+  }
+  stationRows.forEach(function(r, i){
+    r.addEventListener("click", function(){ stSel = i; renderStations(); });
+  });
+  function tuneRadio(){
+    if (radioOn && stSel === stTuned) radioOn = false;
+    else { stTuned = stSel; radioOn = true; }
+    renderStations();
+  }
+  renderStations();
+
+  /* ================= page actions ================= */
+  var pipClosed = false, pipAnim = false;
+  function currentPage(){
+    var p = document.querySelector(".page.shown");
+    return p ? p.id.slice(5) : "inv";
+  }
+  function closePip(close){
+    if (pipClosed === close || pipAnim) return;
+    pipAnim = true;
+    if (close){
+      stage.classList.add("pipclosing");
+      setTimeout(function(){
+        stage.classList.remove("pipclosing");
+        pipClosed = true;
+        stage.classList.add("pipclosed");
+        pipAnim = false;
+      }, reduced ? 0 : 270);
+    } else {
+      pipClosed = false;
+      stage.classList.remove("pipclosed");
+      stage.classList.add("pipopening");
+      setTimeout(function(){ stage.classList.remove("pipopening"); pipAnim = false; }, reduced ? 0 : 470);
+    }
+  }
+  /* boot closed, then power on once — shows the scene, then the CRT bloom */
+  stage.classList.add("pipclosed"); pipClosed = true;
+  setTimeout(function(){ closePip(false); }, 600);
+  function dropItem(){
+    var items = INV[curCatKey].items;
+    if (!items.length) return;
+    items.splice(curIdx, 1);
+    renderInv(curCatKey, curIdx);
+  }
+  function favItem(){
+    var items = INV[curCatKey].items;
+    if (!items.length) return;
+    var it = items[curIdx];
+    it.c[0] = (it.c[0].indexOf(" ★") >= 0) ? it.c[0].replace(" ★","") : it.c[0] + " ★";
+    renderInv(curCatKey, curIdx);
+  }
+  var SORTS = [["name",""],["wt","by weight"],["val","by value"]];
+  var sortIdx = 0;
+  function sortItems(){
+    sortIdx = (sortIdx + 1) % SORTS.length;
+    var mode = SORTS[sortIdx][0];
+    sortLabel = SORTS[sortIdx][1];
+    INV[curCatKey].items.sort(function(a, b){
+      if (mode === "name") return a.c[0].localeCompare(b.c[0]);
+      if (mode === "wt") return parseFloat(b.c[2]) - parseFloat(a.c[2]);
+      return parseFloat(b.c[3]) - parseFloat(a.c[3]);
+    });
+    renderInv(curCatKey, 0);
+  }
+  function cycleDmg(){
+    dmgMode = (dmgMode + 1) % 2;
+    renderInv(curCatKey, curIdx);
+  }
+  function gotoPerks(){
+    if (window.__setInspect) window.__setInspect(false);
+    document.querySelector('.tabbtn[data-page="stat"]').click();
+    document.querySelector('#stattabs .subtab[data-sub="perks"]').click();
+  }
+  function pulse(el){
+    if (!el) return;
+    el.classList.remove("healpulse");
+    void el.offsetWidth;
+    el.classList.add("healpulse");
+  }
+  function useStim(){
+    if (stimCount <= 0) return;
+    stimCount--;
+    pulse(document.querySelector("#page-stat .meter .bar i"));
+    if (currentPage() === "stat") setKeys("stat");
+  }
+  /* limb condition chips: live bars around the figure; click = targeted stimpak */
+  var LIMBS = { head:85, larm:100, rarm:95, torso:100, lleg:100, rleg:62 };
+  function renderLimbs(){
+    document.querySelectorAll(".limbchip").forEach(function(ch){
+      var v = LIMBS[ch.dataset.limb];
+      var bar = ch.querySelector(".bar i");
+      bar.style.width = v + "%";
+      bar.style.background = v < 35 ? "var(--crit)" : v < 70 ? "var(--warn)" :
+        "linear-gradient(90deg,var(--phos),var(--phos-bright))";
+    });
+  }
+  document.querySelectorAll(".limbchip").forEach(function(ch){
+    ch.addEventListener("click", function(){
+      var l = ch.dataset.limb;
+      if (stimCount <= 0 || LIMBS[l] >= 100) return;
+      stimCount--;
+      LIMBS[l] = 100;
+      renderLimbs();
+      pulse(ch.querySelector(".bar i"));
+      if (currentPage() === "stat") setKeys("stat");
+    });
+  });
+  renderLimbs();
+
+  /* ---- shared 3D canvas: reparent between INV figure slot and STAT figure slot ---- */
+  var statfigEl = document.getElementById("statfig");
+  var statfigChar = document.getElementById("statfigchar");
+  var figHint = box.querySelector(".hint");
+  function placeCanvasInv(){
+    if (glcanvas.parentElement !== box) box.insertBefore(glcanvas, figHint);
+    glcanvas.classList.remove("instat");
+    glcanvas.width = 852; glcanvas.height = 1120;
+    glcanvas.style.cssText = "display:block";
+  }
+  function placeCanvasStat(){
+    if (glcanvas.parentElement !== statfigEl) statfigEl.insertBefore(glcanvas, statfigEl.firstChild);
+    statfigChar.style.display = "none";
+    glcanvas.classList.add("instat");
+    glcanvas.width = 600; glcanvas.height = 1120;
+    glcanvas.style.cssText = "display:block";
+  }
+  function syncCanvas(){
+    if (!viewerAPI || inspecting || inspectBusy) return;  /* inspect owns the canvas while active */
+    var page = currentPage();
+    if (page === "inv"){ placeCanvasInv(); viewerAPI.setScene("char"); }
+    else if (page === "stat" && !statFigVB){ placeCanvasStat(); viewerAPI.setScene("char"); }
+    else { glcanvas.style.display = "none"; }
+  }
+  window.__syncCanvas = syncCanvas;
+
+  var statFigVB = false;
+  function toggleStatFig(){
+    statFigVB = !statFigVB;
+    document.getElementById("statfigvb").style.display = statFigVB ? "block" : "none";
+    if (viewerAPI){
+      if (statFigVB) glcanvas.style.display = "none";   /* Vault Boy shown: hide the 3D capture */
+      else syncCanvas();                                /* back to the live 3D character */
+    } else {
+      statfigChar.style.display = statFigVB ? "none" : "block";  /* no-WebGL static fallback */
+    }
+    if (currentPage() === "stat") setKeys("stat");
+  }
+  function useRad(){
+    if (radCount <= 0) return;
+    radCount--;
+    var bars = document.querySelectorAll("#page-stat .meter .bar i");
+    pulse(bars[2] || bars[0]);
+    if (currentPage() === "stat") setKeys("stat");
+  }
+  function useSlot(n){
+    var slots = document.querySelectorAll("#qa .qslot");
+    var slot = slots[n - 1];
+    if (!slot) return;
+    var cnt = slot.querySelector(".n");
+    var v = parseInt(cnt.textContent, 10);
+    if (v > 0) cnt.textContent = v - 1;
+    slot.classList.remove("slotpulse");
+    void slot.offsetWidth;
+    slot.classList.add("slotpulse");
+    setTimeout(function(){ slot.classList.remove("slotpulse"); }, 450);
+  }
+  document.querySelectorAll("#qa .qslot").forEach(function(s, i){
+    s.addEventListener("click", function(){ useSlot(i + 1); });
+  });
+  function showOnMap(){
+    var q = QUESTS[qSel];
+    mapQuestLabel = (q.objectives[oSel] ? q.objectives[oSel].t : q.name);
+    document.querySelector('.tabbtn[data-page="map"]').click();
+    var worldTab = document.querySelector('#maptabs .subtab[data-sub="world"]');
+    if (mapMode !== "world") worldTab.click(); else drawMap("world");
+  }
+  function toggleSummary(){
+    questsummary.style.display = (questsummary.style.display === "none") ? "block" : "none";
+  }
+  function toggleLocal(){
+    var next = (mapMode === "world") ? "local" : "world";
+    document.querySelector('#maptabs .subtab[data-sub="' + next + '"]').click();
+  }
+  document.getElementById("mapcanvas").addEventListener("click", function(e){
+    if (mapMode !== "world") return;
+    var rect = e.currentTarget.getBoundingClientRect();
+    customMarker = { x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height };
+    drawMap("world");
+  });
+
+  /* every keybar chip routes here — no dead buttons */
+  window.__act = function(label){
+    if (label === "Back") closePip(true);
+    else if (label === "Inspect") setInspect(true);
+    else if (label === "Exit") setInspect(false);
+    else if (label === "Drop") dropItem();
+    else if (label === "Cycle Damage") cycleDmg();
+    else if (label === "Fav") favItem();
+    else if (label === "Sort") sortItems();
+    else if (label === "Perk Chart") gotoPerks();
+    else if (label.indexOf("Stimpak") === 0) useStim();
+    else if (label.indexOf("RadAway") === 0) useRad();
+    else if (label === "Vault Boy" || label === "Character") toggleStatFig();
+    else if (label === "Show on Map") showOnMap();
+    else if (label === "Show Summary") toggleSummary();
+    else if (label === "Place Marker"){ customMarker = { x:0.5, y:0.5 }; drawMap("world"); }
+    else if (label === "Local Map") toggleLocal();
+    else if (label === "Tune") tuneRadio();
+    else if (label === "Prev") cycleInspect(-1);
+    else if (label === "Next") cycleInspect(1);
+    else if (label === "Zoom") zoom = Math.max(0.45, zoom * 0.9);
+  };
+
+  /* unified hotkey dispatcher — every advertised key works on its page */
+  addEventListener("keydown", function(e){
+    var k = e.key;
+    if (pipClosed){
+      if (k === "Escape" || k === "Tab"){ e.preventDefault(); closePip(false); }
+      return;
+    }
+    if (inspecting || inspectBusy){
+      if (k === "Tab") e.preventDefault();
+      if (k === "r" || k === "R" || k === "Escape" || k === "Tab") setInspect(false);
+      else if (!inspectBusy && (k === "w" || k === "W")) cycleInspect(-1);
+      else if (!inspectBusy && (k === "s" || k === "S")) cycleInspect(1);
+      return;
+    }
+    var page = currentPage();
+    if (page === "inv" && k >= "1" && k <= "7"){ useSlot(+k); return; }
+    if (k === "Escape"){ closePip(true); return; }
+    if (k === "Tab"){ e.preventDefault(); closePip(true); return; }
+    if (k === "t" || k === "T"){ gotoPerks(); return; }
+    if (page === "inv"){
+      if (k === "r" || k === "R") setInspect(true);
+      else if (k === "x" || k === "X") dropItem();
+      else if (k === "c" || k === "C") cycleDmg();
+      else if (k === "q" || k === "Q") favItem();
+      else if (k === "z" || k === "Z") sortItems();
+    } else if (page === "stat"){
+      if (k === "e" || k === "E") useStim();
+      else if (k === "r" || k === "R") useRad();
+      else if (k === "v" || k === "V") toggleStatFig();
+    } else if (page === "data"){
+      if (k === "r" || k === "R") showOnMap();
+      else if (k === "c" || k === "C") toggleSummary();
+    } else if (page === "map"){
+      if (k === "r" || k === "R") toggleLocal();
+    } else if (page === "radio"){
+      if (k === "Enter") tuneRadio();
+    }
+  });
+  document.getElementById("reopenhint").addEventListener("click", function(){ closePip(false); });
+
+  /* click feedback on every interactive element (capture phase — fires before re-renders) */
+  addEventListener("click", function(e){
+    var el = e.target.closest && e.target.closest(".tabbtn, .subtab, .key, .row, .obj, .qslot, #reopenhint");
+    if (!el) return;
+    el.classList.remove("clickpulse");
+    void el.offsetWidth;
+    el.classList.add("clickpulse");
+    var st = stage.getBoundingClientRect(), s = st.width / 1600;
+    var d = document.createElement("div");
+    d.className = "ripple";
+    d.style.left = ((e.clientX - st.left) / s) + "px";
+    d.style.top = ((e.clientY - st.top) / s) + "px";
+    stage.appendChild(d);
+    setTimeout(function(){ d.remove(); }, 450);
+  }, true);
+
+  /* ---- map ---- */
+  function drawMap(mode){
+    var cv = document.getElementById("mapcanvas");
+    var w = cv.clientWidth, h = cv.clientHeight;
+    if (!w || !h) return;
+    cv.width = w * 2; cv.height = h * 2;
+    var g = cv.getContext("2d"); g.setTransform(2,0,0,2,0,0);
+    g.fillStyle = "#0a0f0b"; g.fillRect(0,0,w,h);
+    function grid(step){
+      g.strokeStyle = "rgba(134,224,140,.10)"; g.lineWidth = 1;
+      for (var x=0;x<w;x+=step){ g.beginPath(); g.moveTo(x,0); g.lineTo(x,h); g.stroke(); }
+      for (var y=0;y<h;y+=step){ g.beginPath(); g.moveTo(0,y); g.lineTo(w,y); g.stroke(); }
+    }
+    function tri(x,y,c){ g.fillStyle=c; g.beginPath(); g.moveTo(x,y-8); g.lineTo(x+7,y+6); g.lineTo(x-7,y+6); g.closePath(); g.fill(); }
+    if (mode === "world"){
+      function blob(cx,cy,r,fill){
+        g.beginPath();
+        for (var a=0;a<=Math.PI*2+0.01;a+=0.22){
+          var rr = r * (1 + 0.28*Math.sin(a*3 + cx) + 0.14*Math.sin(a*7 + cy));
+          var x = cx + rr*Math.cos(a), y = cy + rr*Math.sin(a)*0.72;
+          a===0 ? g.moveTo(x,y) : g.lineTo(x,y);
+        }
+        g.closePath(); g.fillStyle = fill; g.fill();
+        g.strokeStyle = "rgba(134,224,140,.25)"; g.lineWidth = 1; g.stroke();
+      }
+      blob(w*0.42,h*0.30,150,"#111a13");
+      blob(w*0.70,h*0.62,120,"#101812");
+      blob(w*0.22,h*0.72,90,"#101812");
+      blob(w*0.85,h*0.30,70,"#101812");
+      grid(Math.round(w/12));
+      g.strokeStyle = "rgba(180,220,185,.30)"; g.lineWidth = 1.6;
+      g.beginPath(); g.moveTo(w*0.38,h*0.34); g.bezierCurveTo(w*0.5,h*0.45,w*0.55,h*0.6,w*0.72,h*0.66);
+      g.bezierCurveTo(w*0.82,h*0.7,w*0.9,h*0.62,w*0.98,h*0.64); g.stroke();
+      g.beginPath(); g.moveTo(w*0.4,h*0.36); g.bezierCurveTo(w*0.3,h*0.55,w*0.28,h*0.66,w*0.2,h*0.74); g.stroke();
+      tri(w*0.41,h*0.33,"#c9f7c4");
+      g.strokeStyle="rgba(201,247,196,.5)"; g.beginPath(); g.arc(w*0.41,h*0.33,14,0,7); g.stroke();
+      g.fillStyle = "#e2b95c"; g.beginPath(); g.arc(w*0.33,h*0.28,6,0,7); g.fill();
+      g.strokeStyle = "#e2b95c"; g.lineWidth=2;
+      for (var a=0;a<Math.PI*2;a+=Math.PI/4){
+        g.beginPath(); g.moveTo(w*0.33+8*Math.cos(a),h*0.28+8*Math.sin(a));
+        g.lineTo(w*0.33+11*Math.cos(a),h*0.28+11*Math.sin(a)); g.stroke();
+      }
+      g.fillStyle = "rgba(134,224,140,.7)";
+      [[0.55,0.52],[0.71,0.63],[0.23,0.71],[0.86,0.31]].forEach(function(p){
+        g.beginPath(); g.arc(w*p[0],h*p[1],3.4,0,7); g.fill();
+      });
+      g.fillStyle = "rgba(201,247,196,.85)"; g.font = "11px 'Arimo Stalker', Bahnschrift, Arial";
+      g.fillText("SANCTUARY HILLS", w*0.41+12, h*0.33-8);
+      g.fillStyle = "rgba(226,185,92,.9)";
+      g.fillText(mapQuestLabel.toUpperCase(), w*0.33-24, h*0.28-16);
+      if (customMarker){
+        var mx = w*customMarker.x, my = h*customMarker.y;
+        g.fillStyle = "#c9f7c4";
+        g.beginPath(); g.moveTo(mx,my-8); g.lineTo(mx+6,my); g.lineTo(mx,my+8); g.lineTo(mx-6,my); g.closePath(); g.fill();
+        g.fillText("CUSTOM MARKER", mx+10, my-6);
+      }
+    } else {
+      grid(26);
+      g.strokeStyle = "rgba(134,224,140,.5)"; g.lineWidth = 1.4;
+      /* house footprints */
+      [[0.30,0.25,0.16,0.20],[0.52,0.22,0.14,0.16],[0.70,0.30,0.12,0.18],[0.36,0.58,0.18,0.16],[0.60,0.60,0.13,0.14]].forEach(function(r){
+        g.strokeRect(w*r[0], h*r[1], w*r[2], h*r[3]);
+        g.fillStyle = "rgba(134,224,140,.05)";
+        g.fillRect(w*r[0], h*r[1], w*r[2], h*r[3]);
+      });
+      g.strokeStyle = "rgba(180,220,185,.35)"; g.lineWidth = 4;
+      g.beginPath(); g.moveTo(w*0.1,h*0.47); g.lineTo(w*0.9,h*0.44); g.stroke();
+      tri(w*0.44,h*0.47,"#c9f7c4");
+      g.fillStyle = "rgba(201,247,196,.85)"; g.font = "11px 'Arimo Stalker', Bahnschrift, Arial";
+      g.fillText("YOUR HOUSE", w*0.30+6, h*0.25-6);
+      g.fillStyle = "rgba(134,224,140,.7)";
+      g.beginPath(); g.arc(w*0.53,h*0.28,3.4,0,7); g.fill();
+      g.fillText("WORKSHOP", w*0.53+8, h*0.28+4);
+    }
+  }
+
+  /* ---- oscilloscope ---- */
+  var sc = document.getElementById("scopecanvas");
+  function drawScope(t){
+    var w = sc.clientWidth, h = sc.clientHeight;
+    if (w && h){
+      if (sc.width !== w*2){ sc.width = w*2; sc.height = h*2; }
+      var g = sc.getContext("2d");
+      g.setTransform(2,0,0,2,0,0);
+      g.fillStyle = "#0a120c"; g.fillRect(0,0,w,h);
+      g.strokeStyle = "rgba(134,224,140,.08)";
+      for (var x=0;x<w;x+=24){ g.beginPath(); g.moveTo(x,0); g.lineTo(x,h); g.stroke(); }
+      for (var y=0;y<h;y+=24){ g.beginPath(); g.moveTo(0,y); g.lineTo(w,y); g.stroke(); }
+      g.strokeStyle = "#86e08c"; g.lineWidth = 1.6;
+      g.shadowColor = "rgba(134,224,140,.8)"; g.shadowBlur = 6;
+      g.beginPath();
+      if (radioOn){
+        for (var px=0;px<=w;px+=2){
+          var ph = t/300 + px/34;
+          var v = Math.sin(ph)*0.5 + Math.sin(ph*2.7)*0.3 + Math.sin(ph*6.1)*0.12;
+          var py = h/2 + v*h*0.3;
+          px===0 ? g.moveTo(px,py) : g.lineTo(px,py);
+        }
+      } else {
+        g.moveTo(0, h/2); g.lineTo(w, h/2);
+      }
+      g.stroke(); g.shadowBlur = 0;
+      if (!radioOn){
+        g.fillStyle = "rgba(134,224,140,.4)"; g.font = "12px 'Arimo Stalker', Bahnschrift, Arial";
+        g.fillText("NO SIGNAL", w/2 - 34, h/2 - 12);
+      }
+    }
+    if (!reduced) requestAnimationFrame(drawScope);
+  }
+  if (reduced) drawScope(1200); else requestAnimationFrame(drawScope);
+})();
+</script>
