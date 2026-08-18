@@ -83,6 +83,7 @@ namespace PipOS
         // BSFadeNode / NiAVObject flag bit forcing a fade node to render fully opaque (IDA: BSFadeNode
         // fast-paths visible nodes when 0x8000 + fade fields are all set). Ported from PreviewRenderTree.
         constexpr std::uint64_t kNiAVObjectFadeDone = 0x8000;
+        constexpr std::uint64_t kNiAVObjectTopFadeNode = 0x4000;   // 0.0.64: distance-faded-LOD-root flag; cleared on the clone
 
         // ForceUpgradeTextures(NiAVObject*, bool, bool) -- OG 1.10.163, TF3DHUD Address.cpp REL::ID{1417022}.
         REL::Relocation<void (*)(RE::NiAVObject*, bool, bool)> g_forceUpgradeTextures{ REL::ID(1417022) };
@@ -219,6 +220,41 @@ namespace PipOS
             return clone ? RE::NiPointer<RE::NiAVObject>(static_cast<RE::NiAVObject*>(clone)) : nullptr;
         }
 
+        // ------------------------------------------------------------------ fade-node repair (PreviewRenderTree.cpp)
+        // 0.0.64 THE LIVE-3D FIX. Re-own each cloned geometry's shader-property fadeNode to the nearest enclosing
+        // BSFadeNode IN THE CLONE. BSShaderProperty::fadeNode (0x48) is a NON-OWNING back-pointer that
+        // NiCloningProcess does not remap, so after CloneSubtree every cloned geometry's fadeNode still points at
+        // the SOURCE player's fade node. The offscreen deferred path (Offscreen_SetPostEffect(kModMenu)) clears a
+        // geometry's draw passes when its fadeNode lacks kNiAVObjectFadeDone / has currentFade<=0 -- so with the
+        // stale source pointer the clone contributes NO geometry to the offscreen RT and the figure slot is an
+        // empty black hole (renderer/RT/quad all fine -> "reports success but nothing renders"). Pointing each
+        // property at the clone's own sanitised fade node (currentFade=1, FadeDone-flagged) restores the passes.
+        // Ported from TF3DHUD PreviewRenderTree::RepairShaderFadeNodes. Returns the count of properties whose
+        // pointer was actually changed (diagnostic: >0 confirms the stale-back-pointer diagnosis in the field).
+        int RepairShaderFadeNodes(RE::NiAVObject& a_object, RE::BSFadeNode* a_currentFadeNode)
+        {
+            int repaired = 0;
+            if (auto* fade = netimmerse_cast<RE::BSFadeNode*>(std::addressof(a_object))) {
+                a_currentFadeNode = fade;
+            }
+            if (a_currentFadeNode) {
+                if (auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object))) {
+                    for (auto& property : geometry->properties) {
+                        if (auto* shaderProperty = netimmerse_cast<RE::BSShaderProperty*>(property.get())) {
+                            if (shaderProperty->fadeNode != a_currentFadeNode) { ++repaired; }
+                            shaderProperty->fadeNode = a_currentFadeNode;
+                        }
+                    }
+                }
+            }
+            if (auto* node = netimmerse_cast<RE::NiNode*>(std::addressof(a_object))) {
+                for (auto& child : node->children) {
+                    if (child) { repaired += RepairShaderFadeNodes(*child, a_currentFadeNode); }
+                }
+            }
+            return repaired;
+        }
+
         // ------------------------------------------------------------------ sanitise (PreviewRenderTree.cpp)
         void SanitizeClone(RE::NiAVObject& a_root)
         {
@@ -227,11 +263,21 @@ namespace PipOS
                 a_object.fadeAmount = 1.0f;
                 if (auto* fade = netimmerse_cast<RE::BSFadeNode*>(std::addressof(a_object))) {
                     a_object.flags.flags |= kNiAVObjectFadeDone;
+                    a_object.flags.flags &= ~kNiAVObjectTopFadeNode;   // 0.0.64: fade-node-scoped (matches TF3DHUD; not every node) -- stop treating the clone as a distance-faded LOD root
                     fade->currentFade = 1.0f;
                     fade->currentDecalFade = 1.0f;
                     fade->previousMaxA = 1.0f;
                 }
+                // 0.0.64: DELIBERATELY no blanket SetAppCulled(false). TF3DHUD renders the same cloned player
+                // subtree without un-culling (the offscreen renderer draws the attached tree on its own pass), and
+                // a blanket un-cull risks revealing neck-gore / intentionally-hidden parts. If a future test shows
+                // an app-culled-invisible model, port TF3DHUD's SELECTIVE cull (gore + missing-material) instead.
             });
+
+            // Re-own the shader fadeNode back-pointers to the clone BEFORE the flush Update below, so the single
+            // Update() propagates the corrected tree (matches TF3DHUD's order).
+            const int repaired = RepairShaderFadeNodes(a_root, nullptr);
+            logger::info("[PipOS][3D] fade-node repair: re-owned {} shader properties to the clone", repaired);
 
             RE::NiUpdateData updateData{};
             a_root.Update(updateData);
