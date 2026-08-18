@@ -342,19 +342,29 @@ namespace PipOS
             const float fov = settings ? settings->Char3DFov() : 70.0f;
             const RE::BSFixedString name(kRendererName);
 
+            // 0.0.67 COMPOSITING FIX (vanilla-item-preview trace): the 0.0.60 kTerminal(0x9) depth experiment is
+            // REVERTED -- the engine's Interface3D composite loop does not draw that depth while the Pip-Boy is
+            // the active menu (renderer enabled, never composited = the exact symptom; the original invisibility
+            // it tried to fix was actually the fade-node bug, fixed in 0.0.64). Back to kStandard3DModel(0x7),
+            // the engine's DOCUMENTED "3D model over a menu" depth (Container3D / WorkbenchItem3D -- the same
+            // layer family the provably-working vanilla Pip-Boy item preview composites in), and
+            // alwaysRenderWhenEnabled=true so the renderer composites every frame while enabled instead of
+            // waiting for a menu owner to claim its depth (none does over the fullscreen Scaleform Pip-Boy).
+            // Depth is fixed at Create, so RELEASE any renderer persisted under the old depth and recreate --
+            // makes the fix deterministic without requiring a fresh game launch.
             g_renderer = RE::Interface3D::Renderer::GetByName(name);
-            if (!g_renderer) {
-                // 0.0.60: kTerminal (0x9), not kStandard3DModel (0x7). PipboyMenu draws at kStandard (0x6) but
-                // the pipboy layer family reaches kPipboy (0x8); at 0x7 the screen-attached quad could composite
-                // UNDER the (Baka-fullscreened) menu -- the "renderer enabled but no figure visible" symptom.
-                // kTerminal sits above both, below game messages/cursor, and only exists while the Pip-Boy is open.
-                g_renderer = RE::Interface3D::Renderer::Create(
-                    name, RE::UI_DEPTH_PRIORITY::kTerminal, fov, false);
+            if (g_renderer) {
+                logger::info("[PipOS][3D] releasing persisted renderer (depth may be stale); recreating");
+                g_renderer->Release();
+                g_renderer = nullptr;
             }
+            g_renderer = RE::Interface3D::Renderer::Create(
+                name, RE::UI_DEPTH_PRIORITY::kStandard3DModel, fov, true);
             if (!g_renderer) {
                 logger::error("[PipOS][3D] Interface3D renderer creation returned null");
                 return false;
             }
+            g_renderer->alwaysRenderWhenEnabled = true;   // belt: member @055, in case Create's arg is advisory
 
             g_renderer->MainScreen_SetBackgroundMode(RE::Interface3D::BackgroundMode::kLive);
             g_renderer->useFullPremultAlpha = true;
