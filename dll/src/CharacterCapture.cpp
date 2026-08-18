@@ -56,7 +56,13 @@ namespace PipOS
     {
         constexpr auto kRendererName = "PipOS_Char3D";
         constexpr auto kDisplayMeshPath = "Interface/GunModMenu/ModMenuRenderMesh.nif";
-        constexpr auto kDisplayMeshGeometry = "ModMenuRenderMesh:0";
+        // 0.0.69: display quad switched from the ModMenu mesh to the SAME glass mesh the provably-working
+        // vanilla Pip-Boy item preview uses ([3DDIAG] ground truth: geom='HUDGlassFlat:0',
+        // mat='Materials\Interface\HUDGlassFlat.BGEM', mask='HUDShadowFlat:0'). One constant feeds
+        // SetDisplayMode AND the clip-rect reshaping lookups.
+        constexpr auto kDisplayMeshGeometry = "HUDGlassFlat:0";
+        constexpr auto kDisplayMeshMaterial = "Materials\\Interface\\HUDGlassFlat.BGEM";
+        constexpr auto kDisplayMaskGeometry = "HUDShadowFlat:0";
         constexpr float kDisplayRootY = 375.0f;
         constexpr float kPi = 3.14159265358979323846f;
         constexpr std::string_view kPipboyMenu = "PipboyMenu"sv;
@@ -358,37 +364,40 @@ namespace PipOS
                 g_renderer->Release();
                 g_renderer = nullptr;
             }
+            // 0.0.69: depth = kMessage (0xF) -- [3DDIAG] ground truth: the vanilla item preview's
+            // 'PipboyScreenModel' composites at depth 15, ABOVE the fullscreen Scaleform menu (that is why the
+            // weapon preview floats OVER the Pip-Boy UI while our depth-7 red block rendered UNDER it, visible
+            // only through transparent regions). Matching it puts the character over our UI as requested.
             g_renderer = RE::Interface3D::Renderer::Create(
-                name, RE::UI_DEPTH_PRIORITY::kStandard3DModel, fov, true);
+                name, RE::UI_DEPTH_PRIORITY::kMessage, fov, true);
             if (!g_renderer) {
                 logger::error("[PipOS][3D] Interface3D renderer creation returned null");
                 return false;
             }
             g_renderer->alwaysRenderWhenEnabled = true;   // belt: member @055, in case Create's arg is advisory
 
+            // 0.0.69: config mirrored onto the [3DDIAG]-dumped VANILLA item-preview renderer ('PipboyScreenModel')
+            // -- the one setup PROVEN to composite over this exact menu: HUDGlassFlat quad + its BGEM material +
+            // HUDShadowFlat mask, PostEffect kHUDGlass(2) (was kModMenu 4), fullPremultAlpha=false (vanilla),
+            // hideScreenWhenDisabled=true (vanilla). Deliberate deviation: useLongRangeCamera stays TRUE (our
+            // character sits at Char3DDistance~200 game units; the item preview's short-range camera could clip it).
+            // RED-RT test REVERTED (it proved compositing works AND leaked into the vanilla preview's shared
+            // default RT -- the fullscreen red examine view): clear stays on, background back to transparent.
             g_renderer->MainScreen_SetBackgroundMode(RE::Interface3D::BackgroundMode::kLive);
-            g_renderer->useFullPremultAlpha = true;
+            g_renderer->useFullPremultAlpha = false;
+            g_renderer->hideScreenWhenDisabled = true;
             g_renderer->MainScreen_SetPostAA(true);
             g_renderer->Offscreen_Enable3D(true);
             g_renderer->Offscreen_SetUseLongRangeCamera(true);
             g_renderer->Offscreen_SetRenderTargetSize(RE::Interface3D::OffscreenMenuSize::kFullFrame);
             g_renderer->Offscreen_SetDisplayMode(
-                RE::Interface3D::ScreenMode::kScreenAttached, kDisplayMeshGeometry, nullptr);
-            g_renderer->MainScreen_EnableScreenAttached3DMasking(nullptr, nullptr);
-            g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kModMenu);
+                RE::Interface3D::ScreenMode::kScreenAttached, kDisplayMeshGeometry, kDisplayMeshMaterial);
+            g_renderer->MainScreen_EnableScreenAttached3DMasking(kDisplayMaskGeometry, nullptr);
+            g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kHUDGlass);
             g_renderer->customRenderTarget = -1;
             g_renderer->customSwapTarget = -1;
-
-            // 0.0.66 RED-RT BISECTION DIAGNOSTIC (TEMPORARY -- revert next build). The fade-node fix engaged
-            // (log: "re-owned N shader properties") yet the figure slot is still empty, so the fault is either the
-            // model not landing in-frame OR the offscreen RT never compositing to screen. Clear the RT to opaque
-            // RED every frame: if the figure slot shows a RED block -> compositing/quad/clipRect all work and the
-            // fault is purely the model subtree (framing/in-frame); if it stays BLACK -> the offscreen RT is not
-            // being composited (quad/RT wiring) and that is where to look next. This tints the live figure, so it
-            // MUST be reverted before release (never written to the user's INI).
             g_renderer->Offscreen_SetClearRenderTarget(true);
-            g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 1.0f, 0.0f, 0.0f, 1.0f });
-            logger::info("[PipOS][3D] RED-RT DIAGNOSTIC active: figure slot should show a RED block if compositing works");
+            g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 0.0f, 0.0f, 0.0f, 0.0f });
 
             logger::info("[PipOS][3D] Interface3D renderer '{}' configured (offscreen RT={}x{})",
                 kRendererName,

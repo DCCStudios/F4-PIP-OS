@@ -173,6 +173,19 @@ package pipos
       public function get length():int { return this._entries ? this._entries.length : 0; }
       public function get hoverIndex():int { return this._hoverIdx; }   // 0.0.62: DLL-forwarded right-click asks which row the cursor is on
       public function entryAt(i:int):Object { return (i >= 0 && i < this._entries.length) ? this._entries[i] : null; }
+      // 0.0.69: POSITION-based row hit-test for the context menu. hoverIndex depends on ROLL_OVER events, which
+      // GFx does not re-fire when the context menu closes under a stationary cursor -- so the second right-click
+      // on the same spot saw hoverIndex==-1 and the menu "broke until highlighting another item". Pure math on
+      // the live mouse position instead; no event dependency.
+      public function rowAtMouse():int
+      {
+         var lx:Number = this.mouseX, ly:Number = this.mouseY;
+         if (lx < 0 || lx > this._w || ly < 0) { return -1; }
+         var r:int = int(Math.floor(ly / this._rowH));
+         if (r < 0 || r >= this._visible) { return -1; }
+         var idx:int = this._top + r;
+         return (idx >= 0 && idx < this._entries.length) ? idx : -1;
+      }
 
       public function setItems(entries:Array, adapter:Function):void
       {

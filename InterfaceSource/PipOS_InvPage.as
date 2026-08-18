@@ -1496,17 +1496,34 @@ package
          if (stage != null) { stage.addEventListener(MouseEvent.MOUSE_DOWN, this.onCtxStageDown, true); }   // capture: close on outside click
       }
 
+      // 0.0.69: the stage CAPTURE handler now dispatches menu actions BY COORDINATES instead of trusting
+      // display-list targets (0.0.68 field trail: IV.rc fired but row clicks produced zero action marks --
+      // GFx target/contains behavior over the pooled menu proved unreliable). Any mouse-down while the menu
+      // is open resolves here: inside the menu -> run that row's action; outside -> just close.
       private function onCtxStageDown(e:MouseEvent):void
       {
-         if (this._ctxMenu != null && e.target != null) {
-            try { if (this._ctxMenu.contains(e.target as DisplayObject)) { return; } } catch (ec:*) {}
+         if (this._ctxMenu == null || !this._ctxMenu.visible) { return; }
+         var lp:Point = this._ctxMenu.globalToLocal(new Point(e.stageX, e.stageY));
+         var n:int = this._ctxActions.length;
+         var h:Number = 2 * CTX_PAD + n * CTX_ROWH;
+         if (lp.x >= 0 && lp.x <= CTX_W && lp.y >= 0 && lp.y <= h) {
+            var i:int = int(Math.floor((lp.y - CTX_PAD) / CTX_ROWH));
+            var act:String = (i >= 0 && i < n) ? String(this._ctxActions[i]) : null;
+            Theme.life("CX." + (act != null ? act : "pad"));
+            this.closeContextMenu();
+            if (act != null) { this.doContextAction(act); }
+         } else {
+            Theme.life("CX.out");
+            this.closeContextMenu();
          }
-         this.closeContextMenu();
       }
       private function onCtxRowClick(e:MouseEvent):void
       {
+         // 0.0.69: retained as a FALLBACK only (the capture handler above normally acts first and closes).
+         if (!this._ctxOpen) { return; }
          var i:int = int(String(e.currentTarget.name).substr(2));   // "cx2" -> 2
          var act:String = (i >= 0 && i < this._ctxActions.length) ? String(this._ctxActions[i]) : null;
+         Theme.life("CXr." + (act != null ? act : "null"));
          this.closeContextMenu();
          if (act != null) { this.doContextAction(act); }
       }
@@ -1529,6 +1546,7 @@ package
          if (!this._ctxOpen && (this._ctxMenu == null || !this._ctxMenu.visible)) { return; }
          if (this._ctxMenu != null) { this._ctxMenu.visible = false; this._ctxHi.graphics.clear(); }
          this._ctxOpen = false; this._ctxFolderKey = null;
+         this._ctxActions = [];   // 0.0.69: dead menu carries no actions (guards the fallback row handler)
          if (stage != null) { stage.removeEventListener(MouseEvent.MOUSE_DOWN, this.onCtxStageDown, true); }
       }
       private function doContextAction(act:String):void
@@ -1984,6 +2002,7 @@ package
       private function doDrop():void
       {
          var di:int = this.invIdx(this._list.selectedIndex);
+         Theme.life("IV.d" + di);   // 0.0.69: PRE-guard mark -- di==-1 (folder-header selection) shows up too
          if (di < 0) { return; }
          // 0.0.62: diagnostic -- log the selected item's count/favorite/equipped so a test reveals WHY the engine
          // rejects the drop (the index is proven correct: the same invIdx equips fine). Vanilla drops single items
@@ -1997,7 +2016,8 @@ package
          // 0.0.65 DEDICATED DROP DIAGNOSTIC: the life-trail cap (700 chars) was eating the IV.dr marks, so write a
          // fresh string to root1.PipOS_droplog (DLL logs it immediately on change). Reveals listIdx vs invIdx vs
          // name/count/equipState so a test settles whether ItemDrop wants the display index or the InvItems index.
-         try { var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr != null) { rr.PipOS_droplog = (++this._dropSeq) + "|list=" + listIdx + "|inv=" + di + "|cnt=" + cnt + "|fav=" + fav + "|eq=" + eqp + "|" + nm; } } catch (ed:*) {}
+         var fidS:String = (row != null && row.formID != null) ? this.fidKey(row.formID) : "0";   // 0.0.69: canonical unsigned formID (feeds a future native-drop fallback)
+         try { var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr != null) { rr.PipOS_droplog = (++this._dropSeq) + "|list=" + listIdx + "|inv=" + di + "|cnt=" + cnt + "|fav=" + fav + "|eq=" + eqp + "|fid=" + fidS + "|" + nm; } } catch (ed:*) {}
          this.sfx("UIMenuOK");
          BGSExternalInterface.call(this.codeObj, "ItemDrop", di, cnt);
       }
@@ -2230,8 +2250,13 @@ package
                if (rv != this._rclickLast) {
                   this._rclickLast = rv;
                   Theme.life("IV.rc");
-                  var hi:int = (this._list != null) ? this._list.hoverIndex : -1;
-                  if (!this._ctxOpen && hi >= 0) {
+                  // 0.0.69: POSITION-based row targeting (rowAtMouse), not hoverIndex -- GFx never re-fires
+                  // ROLL_OVER when the menu closes under a stationary cursor, so hover went stale and the menu
+                  // "broke" after one use. A right-click with the menu already open RE-TARGETS to the row under
+                  // the cursor (close+reopen) instead of just closing.
+                  var hi:int = (this._list != null) ? this._list.rowAtMouse() : -1;
+                  if (hi >= 0) {
+                     this.closeContextMenu();
                      var ent:Object = this._list.entryAt(hi);
                      var gp:Point = this.localToGlobal(new Point(this.mouseX, this.mouseY));
                      this.onRowContext(hi, ent, gp.x, gp.y);
@@ -2290,7 +2315,7 @@ package
          // While inspecting, the overlay CAPTURES W/S/R/Escape and the underlying list does NOT act on any key.
          if (this._inspecting) { this.onInspectKey(e.keyCode); return; }
          if (e.keyCode == 69) { this.doExpand(); return; }   // E = expand/collapse the inventory list (QOL-4 hotkey)
-         if (e.keyCode == 82) { this.doDrop(); return; }     // 0.0.60: R = DROP claimed directly (the engine's R dispatch never reached this page)
+         if (e.keyCode == 82) { Theme.life("IV.rK"); this.doDrop(); return; }   // 0.0.60: R = DROP claimed directly; 0.0.69: mark PROVES the key reaches this branch
          this._list.handleKey(e.keyCode);
       }
 
