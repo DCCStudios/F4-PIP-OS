@@ -305,7 +305,7 @@ package
 
       // 0.0.62: the list panel now extends UPWARD by LIST_HEADROOM so the EXPAND button has its own clean strip
       // above the "INVENTORY · <CAT>" title (was overlapping the VAL header / title). Rows/headers are unchanged.
-      private static const LIST_HEADROOM:Number = 20;
+      private static const LIST_HEADROOM:Number = 16;   // 0.0.65: was 20 -- top came down ~4px (expand button follows)
       // Graphics-only (safe on any path): redraw the list panel background at height h (extended up by the headroom).
       private function drawListBg(h:Number):void
       {
@@ -1991,11 +1991,17 @@ package
          var row:Object = (this._lastData != null && this._lastData.InvItems != null && di < this._lastData.InvItems.length) ? this._lastData.InvItems[di] : null;
          var cnt:int = (row != null && row.count != null) ? int(row.count) : 1; if (cnt < 1) { cnt = 1; }
          var fav:int = (row != null && row.favorite != null) ? int(row.favorite) : -1;
-         var eqp:* = (row != null && row.hasOwnProperty("equipped")) ? row.equipped : "?";
-         Theme.life("IV.dr" + di + "c" + cnt + "f" + fav + "e" + eqp);
+         var eqp:* = (row != null && row.hasOwnProperty("equipState")) ? row.equipState : "?";
+         var nm:String = (row != null && row.text != null) ? String(row.text) : "?";
+         var listIdx:int = this._list.selectedIndex;
+         // 0.0.65 DEDICATED DROP DIAGNOSTIC: the life-trail cap (700 chars) was eating the IV.dr marks, so write a
+         // fresh string to root1.PipOS_droplog (DLL logs it immediately on change). Reveals listIdx vs invIdx vs
+         // name/count/equipState so a test settles whether ItemDrop wants the display index or the InvItems index.
+         try { var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr != null) { rr.PipOS_droplog = (++this._dropSeq) + "|list=" + listIdx + "|inv=" + di + "|cnt=" + cnt + "|fav=" + fav + "|eq=" + eqp + "|" + nm; } } catch (ed:*) {}
          this.sfx("UIMenuOK");
          BGSExternalInterface.call(this.codeObj, "ItemDrop", di, cnt);
       }
+      private var _dropSeq:int = 0;
       private function doCycleDamage():void { this._dmgIndex++; this.sfx("UIMenuPrevNext"); this.renderCard(); }
       private function doFav():void     { if (this.invIdx(this._list.selectedIndex) >= 0) { this.sfx("UIPipBoyFavoriteMenuDPadA"); BGSExternalInterface.call(this.codeObj, "SetQuickkey", this.invIdx(this._list.selectedIndex), 0); } }
       // Z / L3 fallback: cycle our own per-category sort NAME(A-Z) -> WT(desc) -> VAL(desc) -> NAME ... (matches the

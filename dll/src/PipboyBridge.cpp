@@ -1218,6 +1218,14 @@ namespace PipOS
 
     void PollRightClick()
     {
+        // 0.0.65 DIAGNOSTIC: 0.0.62-0.0.64 forwarding never fired (log IV.rc=0). Confirm (a) this poll runs while
+        // the Pip-Boy is open and (b) whether GetAsyncKeyState actually SEES the right button in this runtime
+        // (FO4 uses raw/DirectInput -- GetAsyncKeyState may not report mouse buttons). One-time heartbeat + an
+        // edge log settle it: if [RC] poll active prints but no [RC] edge ever does, GetAsyncKeyState is blind to
+        // the RMB and we must switch to an input hook / the game's own mouse state.
+        static bool s_heartbeat = false;
+        if (!s_heartbeat) { s_heartbeat = true; logger::info("[PipOS][RC] right-click poll active (frame task running while Pip-Boy open)"); }
+
         static bool s_prevDown = false;
         const bool down = (GetAsyncKeyState(0x02) & 0x8000) != 0;
         const bool edge = down && !s_prevDown;
@@ -1225,13 +1233,40 @@ namespace PipOS
         if (!edge) { return; }
         static std::uint32_t s_seq = 0;
         const std::uint32_t seq = ++s_seq;
+        logger::info("[PipOS][RC] right-button PRESS edge #{} detected -> bumping root1.PipOS_rclickN", seq);
         if (auto* task = F4SE::GetTaskInterface()) {
             task->AddUITask([seq]() {
                 if (auto* ui = RE::UI::GetSingleton()) {
                     if (auto menu = ui->GetMenu(kPipboyMenu)) {
                         if (auto* view = menu->uiMovie.get()) {
                             Scaleform::GFx::Value v(static_cast<double>(seq));
-                            view->SetVariable("root1.PipOS_rclickN", v);
+                            const bool ok = view->SetVariable("root1.PipOS_rclickN", v);
+                            logger::info("[PipOS][RC] SetVariable root1.PipOS_rclickN={} ok={}", seq, ok);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // 0.0.65: read the dedicated drop diagnostic (root1.PipOS_droplog) and log it on change -- bypasses the AS
+    // life-trail 700-char cap that was eating the IV.dr marks. Reveals listIdx vs invIdx vs name/count/equipState
+    // so a test settles whether the engine's ItemDrop wants the display index or the InvItems index.
+    void ReadDropLog()
+    {
+        static std::uint32_t s_ctr = 0;
+        if (++s_ctr % 20 != 0) { return; }   // rate-limit: at most one UI task ~3x/sec (drop is infrequent)
+        if (auto* task = F4SE::GetTaskInterface()) {
+            task->AddUITask([]() {
+                static std::string s_last;
+                if (auto* ui = RE::UI::GetSingleton()) {
+                    if (auto menu = ui->GetMenu(kPipboyMenu)) {
+                        if (auto* view = menu->uiMovie.get()) {
+                            Scaleform::GFx::Value v;
+                            if (view->GetVariable(std::addressof(v), "root1.PipOS_droplog") && v.IsString()) {
+                                std::string cur = v.GetString();
+                                if (cur != s_last) { s_last = cur; logger::info("[PipOS][DROP] {}", cur); }
+                            }
                         }
                     }
                 }

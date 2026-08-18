@@ -770,7 +770,7 @@ namespace PipOS
             // 0.0.60: piggyback the equipment live-refresh on this main-thread pass (runs while the Pip-Boy is
             // open regardless of bLive3D -- Tick() early-outs but this line still fires). Rate-limited inside.
             // 0.0.62: also poll the right mouse button here (forwards right-click to the AS context menu).
-            if (g_pipboyOpen.load()) { RepushEquipmentPeriodic(); PollRightClick(); }
+            if (g_pipboyOpen.load()) { RepushEquipmentPeriodic(); PollRightClick(); ReadDropLog(); }
         }
 
         // WORKER-THREAD-SAFE hook body: on this fork RunActorUpdates fires on BSMTAManager / HighFPSPhysics
