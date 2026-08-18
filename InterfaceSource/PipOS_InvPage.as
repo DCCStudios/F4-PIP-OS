@@ -269,7 +269,10 @@ package
          this._listHdr = new Sprite(); addChild(this._listHdr);
          this._hdrMark = new Sprite(); this._hdrMark.mouseEnabled = false; this._hdrMark.mouseChildren = false; this._listHdr.addChild(this._hdrMark);
          this._hdrHitLayer = new Sprite(); addChild(this._hdrHitLayer); this.buildHeaderHits();
-         this._expandBtn = new Sprite(); this._expandBtn.x = this.LX + this.LW - 26; this._expandBtn.y = Theme.BY + 6; this._expandBtn.buttonMode = true; this._expandBtn.addEventListener(MouseEvent.MOUSE_DOWN, this.onExpandBtn); addChild(this._expandBtn); this.drawExpandGlyph();
+         // 0.0.59: raised from BY+6 to BY-2 -- at BY+6 the 18px glyph sat straight over the right-aligned VAL
+         // column header (BY+16..). At BY-2 it ends exactly where VAL starts and only overlaps the empty right
+         // end of the INVENTORY title band (button added later == on top, so its clicks are unaffected).
+         this._expandBtn = new Sprite(); this._expandBtn.x = this.LX + this.LW - 26; this._expandBtn.y = Theme.BY - 2; this._expandBtn.buttonMode = true; this._expandBtn.addEventListener(MouseEvent.MOUSE_DOWN, this.onExpandBtn); addChild(this._expandBtn); this.drawExpandGlyph();
          this._card = new Sprite(); this._card.x = this.LX + P; this._card.y = cardTop + P; addChild(this._card);
          this._card.scrollRect = new Rectangle(0, 0, this.LW - 2 * P, (Theme.BB - cardTop) - 2 * P);
          addEventListener(Event.ADDED_TO_STAGE, this.onPageStage);
@@ -531,11 +534,23 @@ package
             var hit:Sprite = new Sprite();
             hit.graphics.beginFill(0, 0.004); hit.graphics.drawRect(x - 4, -2, t.width + 8, 22); hit.graphics.endFill();
             hit.name = "h" + i; hit.buttonMode = true; hit.addEventListener(MouseEvent.MOUSE_DOWN, this.onSubtabClick);
+            hit.addEventListener(MouseEvent.ROLL_OVER, this.onSubtabOver); hit.addEventListener(MouseEvent.ROLL_OUT, this.onSubtabOut);   // 0.0.59 hover
             this._subtabs.addChild(hit);
             this._subUL.push({ x:(x - 4), w:(t.width + 8) });
             x += t.width + 24;
          }
          this.updateSubtabs();
+      }
+      // 0.0.59 HOVER (parity with Stats/Data): recolour-only, crash-law-safe.
+      private function onSubtabOver(e:MouseEvent):void
+      {
+         var i:int = int(e.currentTarget.name.substr(1));
+         if (i != this._curTab && i < this._subFields.length) { (this._subFields[i] as TextField).textColor = Theme.PHOS_BRIGHT; }
+      }
+      private function onSubtabOut(e:MouseEvent):void
+      {
+         var i:int = int(e.currentTarget.name.substr(1));
+         if (i != this._curTab && i < this._subFields.length) { (this._subFields[i] as TextField).textColor = Theme.PHOS_DIM; }
       }
       // UPDATE-ONLY (tab change): recolour the frozen labels + redraw the underline from stored rects.
       private function updateSubtabs():void
@@ -604,7 +619,7 @@ package
          // 0.0.38: refresh the folders toggle from the DLL push (fallback to Theme.FOLDERS => 0.0.37 behavior).
          // 0.0.43: refresh the RPM display switch from the same push (fallback FALSE => firerate behavior).
          this._foldersOn = Theme.FOLDERS; this._showRPM = false;
-         try { var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr != null) { this._itemInfo = rr.PipOS_iteminfo; this._itemStats = rr.PipOS_itemstats; this._itemMods = rr.PipOS_itemmods; this._favs = rr.PipOS_favorites; var st:* = rr.PipOS_settings; if (st != null && st.hasOwnProperty("folders")) { this._foldersOn = (st.folders == true); } if (st != null && st.hasOwnProperty("showRPM")) { this._showRPM = (st.showRPM == true); } } } catch (ex:*) { this._itemInfo = null; this._itemStats = null; this._itemMods = null; this._favs = null; }
+         try { var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr != null) { this._itemInfo = rr.PipOS_iteminfo; this._itemStats = rr.PipOS_itemstats; this._itemMods = rr.PipOS_itemmods; this._favs = rr.PipOS_favorites; var st:* = rr.PipOS_settings; if (st != null && st.hasOwnProperty("folders")) { this._foldersOn = (st.folders == true); } if (st != null && st.hasOwnProperty("showRPM")) { this._showRPM = (st.showRPM == true); } this.hydrateFolderMem(rr); } } catch (ex:*) { this._itemInfo = null; this._itemStats = null; this._itemMods = null; this._favs = null; }
          this.hideTooltip();   // B: drop any stale tooltip across a data refresh (re-shown on next hover)
          // Filter (vanilla ListFilterer rule) + per-category sort + setItems, preserving the selected item.
          this.rebuildList(d);
@@ -883,6 +898,44 @@ package
          if (tab < 0 || tab >= this._folderState.length) { return; }
          if (this._folderState[tab] == null) { this._folderState[tab] = {}; }
          if (collapsed) { delete this._folderState[tab][key]; } else { this._folderState[tab][key] = true; }
+         this.persistFolderMem();   // 0.0.59: mirror every change out to the DLL-backed session store
+      }
+      // 0.0.59 SESSION FOLDER MEMORY: the page dies with the menu, so opened-folder state is mirrored into
+      // root1.PipOS_folderMem (string "tab:KEY|KEY;tab:KEY"). The DLL reads it at menu close and re-seeds it on
+      // the next open (survives across Pip-Boy opens within a game session; intentionally not saved to disk).
+      private var _folderMemLoaded:Boolean = false;
+      private function persistFolderMem():void
+      {
+         try {
+            var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null;
+            if (rr == null) { return; }
+            var s:String = "";
+            for (var t:int = 0; t < this._folderState.length; t++) {
+               var m:Object = this._folderState[t]; if (m == null) { continue; }
+               var keys:String = "";
+               for (var k:String in m) { if (m[k] == true) { keys += (keys.length > 0 ? "|" : "") + k; } }
+               if (keys.length > 0) { s += (s.length > 0 ? ";" : "") + t + ":" + keys; }
+            }
+            rr.PipOS_folderMem = s;
+         } catch (ep:*) {}
+      }
+      private function hydrateFolderMem(rr:*):void
+      {
+         if (this._folderMemLoaded) { return; }
+         this._folderMemLoaded = true;
+         try {
+            var s:* = (rr != null) ? rr.PipOS_folderMem : null;
+            if (s == null) { return; }
+            var tabs:Array = String(s).split(";");
+            for (var i:int = 0; i < tabs.length; i++) {
+               var part:String = String(tabs[i]); var c:int = part.indexOf(":"); if (c <= 0) { continue; }
+               var t:int = int(part.substr(0, c));
+               if (t < 0 || t >= this._folderState.length) { continue; }
+               if (this._folderState[t] == null) { this._folderState[t] = {}; }
+               var keys:Array = part.substr(c + 1).split("|");
+               for (var j:int = 0; j < keys.length; j++) { var k:String = String(keys[j]); if (k.length > 0) { this._folderState[t][k] = true; } }
+            }
+         } catch (eh:*) {}
       }
       // Folder header click (from PipList.onFolderToggle): flip this category+tag's collapse state and rebuild.
       // Pool-safe: rebuildList -> setItems/selectIndexSilent are update-only on the already-built pool.
@@ -1843,6 +1896,29 @@ package
             // Chrome.onAdded is field-confirmed (sub-tabs/list rows/hover all clickable), so the capture-phase
             // stage/page MOUSE_DOWN loggers + logAncestors have served their purpose and are removed.
          }
+         // 0.0.59 LIVE-3D SWAP: the DLL's PipOS_char3d contract flips available:true ~35ms AFTER this page is
+         // built (log-proven ordering), so a build-time check always misses it. Poll every frame (two dynamic
+         // member reads + at most one visibility write -- crash-law-safe) and swap Vault Boy <-> the 3D window.
+         if (this._charPoll == null) { this._charPoll = new Ticker(this, this.onCharPoll); }
+         this._charPoll.start();
+      }
+      // Hide the Vault Boy while the DLL reports its offscreen 3D character renderer active+available; restore
+      // it the moment the contract drops (menu close resets it, so re-opens re-evaluate cleanly).
+      private var _charPoll:Ticker;
+      private var _char3dOn:Boolean = false;
+      private function onCharPoll(dt:Number):void
+      {
+         var avail:Boolean = false;
+         try {
+            var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null;
+            var c3:* = (rr != null) ? rr.PipOS_char3d : null;
+            avail = (c3 != null && c3.active == true && c3.available == true);
+         } catch (e3:*) { avail = false; }
+         if (avail != this._char3dOn) {
+            this._char3dOn = avail;
+            if (this._vb != null) { this._vb.visible = !avail; }
+            Theme.life(avail ? "IV.3d1" : "IV.3d0");   // trail: figure slot switched to 3D / back to Vault Boy
+         }
       }
       private function onPageUnstage(e:Event):void
       {
@@ -1856,6 +1932,7 @@ package
          // overlay fully CLOSED + state reset so re-opening the Pip-Boy starts clean (never a stale overlay).
          if (this._insTicker != null) { this._insTicker.stop(); }
          if (this._expandTicker != null) { this._expandTicker.stop(); }
+         if (this._charPoll != null) { this._charPoll.stop(); }   // 0.0.59: 3D-contract poll dies with the page
          this._inspecting = false; this._insFadeDir = 0; this._insFade = 0;
          if (this._insLay != null) { this._insLay.visible = false; this._insLay.alpha = 0; }
       }

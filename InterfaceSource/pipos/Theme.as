@@ -398,6 +398,40 @@ package pipos
          g.endFill();
       }
 
+      // 0.0.59 ARTIFACT-PROOF DIAGONAL: a FILLED thin quad between two points instead of a lineStyle stroke.
+      // Same rationale as frameRect -- the fill path never touches the line pen, so it cannot emit the stray
+      // fan segments the limb-connector strokes produced in-game. moveTo/lineTo here define the FILL path only
+      // (no lineStyle is ever set), which the inventory-window fills already proved clean in the field.
+      public static function fillLine(g:Graphics, x0:Number, y0:Number, x1:Number, y1:Number, color:uint, alpha:Number, th:Number = 1):void
+      {
+         var dx:Number = x1 - x0, dy:Number = y1 - y0;
+         var len:Number = Math.sqrt(dx * dx + dy * dy);
+         if (len < 0.01) { return; }
+         var nx:Number = (-dy / len) * (th / 2), ny:Number = (dx / len) * (th / 2);
+         g.lineStyle();   // belt: guarantee NO stroke is active for this path
+         g.beginFill(color, alpha);
+         g.moveTo(x0 + nx, y0 + ny); g.lineTo(x1 + nx, y1 + ny);
+         g.lineTo(x1 - nx, y1 - ny); g.lineTo(x0 - nx, y0 - ny);
+         g.endFill();
+      }
+
+      // 0.0.59: display-sanitize an externally-supplied tab label (PipboyTabs inis can carry glyphs outside the
+      // embedded PipOSFont range U+0020-007E / 00A0-00FF -- those render as notdef squares). Keeps chars the font
+      // actually has, uppercases for the strip look, and falls back to a placeholder so the tab stays clickable.
+      public static function tabLabel(raw:String, slot:int):String
+      {
+         if (raw == null) { return "TAB " + slot; }
+         var up:String = raw.toUpperCase(); var out:String = "";
+         for (var i:int = 0; i < up.length; i++) {
+            var c:Number = up.charCodeAt(i);
+            if ((c >= 0x20 && c <= 0x7E) || (c >= 0xA0 && c <= 0xFF)) { out += up.charAt(i); }
+         }
+         // trim
+         while (out.length > 0 && out.charAt(0) == " ") { out = out.substr(1); }
+         while (out.length > 0 && out.charAt(out.length - 1) == " ") { out = out.substr(0, out.length - 1); }
+         return (out.length > 0) ? out : ("TAB " + slot);
+      }
+
       // Bottom button-prompt bar (mockup .keybar), PER PAGE. Each page passes ONLY the prompts wired to its own
       // real actions (its BSButtonHintData set) + a universal ESC BACK, so no page shows a dead/foreign prompt
       // ("every element has purpose"). entries = Array of { key:String, label:String }. Builds a self-contained

@@ -158,6 +158,21 @@ package
          this._list.onSelectionChange = this.onListSel; this._list.playSound = this.sfx; this._list.visible = false; addChild(this._list);
          this._descPanel = new Sprite(); this._descPanel.visible = false; addChild(this._descPanel);
 
+         // 0.0.59 CLICK FIX: decorative layers must be MOUSE-TRANSPARENT. The limb layer's (formerly stroked)
+         // geometry extended over the sub-tab strip and intercepted its clicks (probe: CK.instance69/CK.instance30
+         // where h1/h2 should have fired). mouseEnabled=false on the CONTAINERS keeps their own graphics out of
+         // hit-testing; _limbs keeps mouseChildren=true so the limb-chip hit sprites still take stimpak clicks.
+         this._meters.mouseEnabled = false; this._meters.mouseChildren = false;
+         this._special.mouseEnabled = false; this._special.mouseChildren = false;
+         this._figure.mouseEnabled = false; this._figure.mouseChildren = false;
+         this._effects.mouseEnabled = false; this._effects.mouseChildren = false;
+         this._levelBox.mouseEnabled = false; this._levelBox.mouseChildren = false;
+         this._limbs.mouseEnabled = false;      // children (limb hits) stay clickable
+         this._status.mouseEnabled = false;     // container itself never a target
+         // And the sub-tab strip goes ON TOP of the content layers (re-addChild == move to front), so no
+         // content geometry can ever sit between the cursor and the strip's hit sprites again.
+         addChild(this._subtabs);
+
          addEventListener(Event.ADDED_TO_STAGE, this.onPageStage);
          addEventListener(Event.REMOVED_FROM_STAGE, this.onPageUnstage);
          Theme.life("ST.p2");   // buildPanels completed
@@ -208,8 +223,8 @@ package
          // ----- SPECIAL / PERKS list panel (border drawn once; h3 + column headers pooled) -----
          var lpg:* = this._listPanel.graphics;
          lpg.beginFill(Theme.PANEL, 0.82); lpg.drawRoundRect(Theme.CX, Theme.BY, LPW, Theme.BB - Theme.BY, 8, 8); lpg.endFill();
-         lpg.lineStyle(1, Theme.LINE, 0.38); lpg.drawRoundRect(Theme.CX + 0.5, Theme.BY + 0.5, LPW - 1, (Theme.BB - Theme.BY) - 1, 8, 8); lpg.lineStyle();
-         lpg.lineStyle(1, Theme.LINE, 0.2); lpg.moveTo(Theme.CX + P, Theme.BY + 46); lpg.lineTo(Theme.CX + LPW - P, Theme.BY + 46); lpg.lineStyle();
+         Theme.frameRect(lpg, Theme.CX, Theme.BY, LPW, Theme.BB - Theme.BY, Theme.LINE, 0.38);   // 0.0.59: fills, no strokes anywhere on this page
+         lpg.beginFill(Theme.LINE, 0.2); lpg.drawRect(Theme.CX + P, Theme.BY + 46, LPW - 2 * P, 1); lpg.endFill();
          this._listH3 = Theme.mk(this._listPanel, 12, Theme.PHOS_BRIGHT, true); this._listH3.x = Theme.CX + P; this._listH3.y = Theme.BY + 8; var lh3f:* = this._listH3.defaultTextFormat; lh3f.letterSpacing = 1.4; this._listH3.defaultTextFormat = lh3f; Theme.setText(this._listH3, "S.P.E.C.I.A.L.");   // 0.0.46: bright heading
          this._listColL = Theme.mk(this._listPanel, 9, Theme.PHOS_DIM, true); this._listColL.x = Theme.CX + P + 12; this._listColL.y = Theme.BY + 30; var lclf:* = this._listColL.defaultTextFormat; lclf.letterSpacing = 1.2; this._listColL.defaultTextFormat = lclf; Theme.setText(this._listColL, "ATTRIBUTE");
          this._listColR = Theme.mk(this._listPanel, 9, Theme.PHOS_DIM, true, "right"); this._listColR.autoSize = "none"; this._listColR.width = LPW - 2 * P - 12; this._listColR.height = 12; this._listColR.x = Theme.CX + P; this._listColR.y = Theme.BY + 30; var lcrf:* = this._listColR.defaultTextFormat; lcrf.letterSpacing = 1.2; this._listColR.defaultTextFormat = lcrf; Theme.setText(this._listColR, "VALUE");
@@ -219,8 +234,8 @@ package
          var dpw:Number = Theme.CR - dpx;
          var dpg:* = this._descPanel.graphics;
          dpg.beginFill(Theme.PANEL, 0.82); dpg.drawRoundRect(dpx, Theme.BY, dpw, 118, 8, 8); dpg.endFill();
-         dpg.lineStyle(1, Theme.LINE, 0.38); dpg.drawRoundRect(dpx + 0.5, Theme.BY + 0.5, dpw - 1, 117, 8, 8); dpg.lineStyle();
-         dpg.lineStyle(1, Theme.LINE, 0.2); dpg.moveTo(dpx + P, Theme.BY + 32); dpg.lineTo(dpx + dpw - P, Theme.BY + 32); dpg.lineStyle();
+         Theme.frameRect(dpg, dpx, Theme.BY, dpw, 118, Theme.LINE, 0.38);   // 0.0.59: fills, no strokes anywhere on this page
+         dpg.beginFill(Theme.LINE, 0.2); dpg.drawRect(dpx + P, Theme.BY + 32, dpw - 2 * P, 1); dpg.endFill();
          this._descH3 = Theme.mk(this._descPanel, 12, Theme.PHOS_BRIGHT, true); this._descH3.autoSize = "none"; this._descH3.width = dpw - 2 * P; this._descH3.height = 18; this._descH3.x = dpx + P; this._descH3.y = Theme.BY + 8; var dh3f:* = this._descH3.defaultTextFormat; dh3f.letterSpacing = 1.2; this._descH3.defaultTextFormat = dh3f; Theme.setText(this._descH3, "");
          this._descBody = Theme.mk(this._descPanel, 12, Theme.PHOS_DIM, false); this._descBody.autoSize = "none"; this._descBody.multiline = true; this._descBody.wordWrap = true; this._descBody.width = dpw - 2 * P; this._descBody.height = 72; this._descBody.x = dpx + P; this._descBody.y = Theme.BY + 40; Theme.setText(this._descBody, "");
 
@@ -257,6 +272,7 @@ package
             this._subFields.push(t);
             var hit:Sprite = new Sprite(); hit.graphics.beginFill(0, 0.004); hit.graphics.drawRect(x - 4, -2, t.width + 8, 22); hit.graphics.endFill();
             hit.name = "h" + i; hit.buttonMode = true; hit.addEventListener(MouseEvent.MOUSE_DOWN, this.onSubtabClick);
+            hit.addEventListener(MouseEvent.ROLL_OVER, this.onSubtabOver); hit.addEventListener(MouseEvent.ROLL_OUT, this.onSubtabOut);   // 0.0.59 hover
             this._subtabs.addChild(hit);
             this._subUL.push({ x:(x - 4), w:(t.width + 8) });
             x += t.width + 22;
@@ -271,6 +287,7 @@ package
             this._subFields.push(et);
             var eh:Sprite = new Sprite(); eh.graphics.beginFill(0, 0.004); eh.graphics.drawRect(ex - 4, -2, PBT_PITCH - 6, 22); eh.graphics.endFill();
             eh.name = "h" + (3 + e); eh.buttonMode = true; eh.visible = false; eh.addEventListener(MouseEvent.MOUSE_DOWN, this.onSubtabClick);
+            eh.addEventListener(MouseEvent.ROLL_OVER, this.onSubtabOver); eh.addEventListener(MouseEvent.ROLL_OUT, this.onSubtabOut);   // 0.0.59 hover
             this._subtabs.addChild(eh); this._pbtHits.push(eh);
             this._subUL.push({ x:(ex - 4), w:(PBT_PITCH - 6) });
          }
@@ -289,7 +306,13 @@ package
                var nm:String = (_TabNames != null && i < _TabNames.length && _TabNames[i] != null) ? String(_TabNames[i]) : null;
                f.visible = (nm != null);
                if (i - 3 < this._pbtHits.length) { (this._pbtHits[i - 3] as Sprite).visible = (nm != null); }
-               if (nm != null) { Theme.setText(f, nm); } else { continue; }
+               if (nm != null) {
+                  // 0.0.59: PBT ini names can carry glyphs outside the embedded font (rendered as squares).
+                  // Sanitize for display; life-log the raw char codes ONCE so the odd tab can be identified.
+                  var shown:String = Theme.tabLabel(nm, i);
+                  if (shown != nm && !this._tnLogged) { this._tnLogged = true; var codes:String = ""; for (var tc:int = 0; tc < nm.length && tc < 6; tc++) { codes += (tc > 0 ? "-" : "") + nm.charCodeAt(tc).toString(16); } Theme.life("TN" + i + "." + codes); }
+                  Theme.setText(f, shown);
+               } else { continue; }
             }
             var on:Boolean = (i == this._curTab);
             f.textColor = on ? Theme.PHOS_BRIGHT : Theme.PHOS_DIM;
@@ -300,6 +323,19 @@ package
                this._subtabs.graphics.endFill();
             }
          }
+      }
+      private var _tnLogged:Boolean = false;   // 0.0.59: one-shot raw-name diagnostic for the squares tab
+      // 0.0.59 HOVER: recolour-only (crash-law-safe -- textColor is a paint write, no reflow). Active tab keeps
+      // its bright colour; hovering any OTHER tab brightens it until roll-out restores the dim resting state.
+      private function onSubtabOver(e:MouseEvent):void
+      {
+         var i:int = int(e.currentTarget.name.substr(1));
+         if (i != this._curTab && i < this._subFields.length) { (this._subFields[i] as TextField).textColor = Theme.PHOS_BRIGHT; }
+      }
+      private function onSubtabOut(e:MouseEvent):void
+      {
+         var i:int = int(e.currentTarget.name.substr(1));
+         if (i != this._curTab && i < this._subFields.length) { (this._subFields[i] as TextField).textColor = Theme.PHOS_DIM; }
       }
       private var _menu:Object = null;
       private function acquireMenu():Object
@@ -418,7 +454,10 @@ package
             var sev:uint = (cond < 0.35) ? Theme.CRIT : (cond < 0.70 ? Theme.WARN : Theme.PHOS);
             // leader from the chip edge nearest the target to the target dot
             var startY:Number = (ty2 > cy) ? (cy + CHIPH / 2) : (cy - CHIPH / 2);
-            lg.lineStyle(1, Theme.PHOS_DIM, 0.5); lg.moveTo(cx, startY); lg.lineTo(tx2, ty2); lg.lineStyle();
+            // 0.0.59: FILLED quad, not a stroke -- the connector strokes were the LAST redrawn lineStyle on this
+            // page and the source of the in-game diagonal-line fan (and, because this layer sits over the sub-tab
+            // strip, the stray geometry also swallowed the strip's clicks: probe logged CK.instance69 up there).
+            Theme.fillLine(lg, cx, startY, tx2, ty2, Theme.PHOS_DIM, 0.5);
             lg.beginFill(Theme.PHOS_DIM, 0.9); lg.drawCircle(tx2, ty2, 2); lg.endFill();
             // chip
             lg.beginFill(Theme.PANEL, 0.9); lg.drawRoundRect(cx - CHIPW / 2, cy - CHIPH / 2, CHIPW, CHIPH, 5, 5); lg.endFill();

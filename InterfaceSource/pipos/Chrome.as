@@ -697,11 +697,19 @@ package pipos
                   Theme.life("MD.heal");
                   this._medicRedisp = 0;
                }
-               // 0.0.58: banish the VANILLA button-hint bar OFF-SCREEN (alpha=0 alone did not stick in the field --
-               // the bar's own redraw path re-shows it; a position write survives redraws). Idempotent per tick.
+               // 0.0.59: REMOVE the vanilla button-hint bar from the display list. Neither alpha=0 (0.0.46+) nor
+               // y=4000/visible=false (0.0.58) survived in the field, and the log explains why: the pages update
+               // their BSButtonHintData texts every refresh ("STIMPAK (5)"...), each update re-triggers the bar's
+               // own redraw/re-show AFTER our per-tick write -- and our own medic pump fires one such refresh
+               // every 0.5s. removeChild is immune to redraws (nothing in the shell ever re-addChild's the bar;
+               // SetButtonHintData still works on the detached instance, so the medic path is unaffected).
+               // Guarded per tick in case anything ever re-parents it. KB.rm in the life trail = it happened.
                try {
                   var vb:* = this._menu.ButtonHintBar_mc;
-                  if (vb != null) { vb.y = 4000; vb.visible = false; vb.alpha = 0; vb.mouseEnabled = false; vb.mouseChildren = false; }
+                  if (vb != null) {
+                     if (vb.parent != null) { vb.parent.removeChild(vb); Theme.life("KB.rm"); }
+                     vb.visible = false; vb.alpha = 0; vb.mouseEnabled = false; vb.mouseChildren = false;
+                  }
                } catch (em8:*) {}
                // If the flag stayed stuck, the shell can't pump events; substitute a full-mask re-dispatch every
                // 0.5s -- and IMMEDIATELY when the native page/tab changes (0.0.57: makes sub-tab clicks feel

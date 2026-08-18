@@ -96,7 +96,7 @@ package
          this._colHead = new Sprite(); addChild(this._colHead);
          var chL:TextField = Theme.mk(this._colHead, 10, Theme.PHOS_DIM, true); chL.x = lhx + 12; chL.y = Theme.BY + 30; var chlf:* = chL.defaultTextFormat; chlf.letterSpacing = 1; chL.defaultTextFormat = chlf; Theme.setText(chL, "QUEST");
          var chR:TextField = Theme.mk(this._colHead, 10, Theme.PHOS_DIM, true, "right"); chR.autoSize = "none"; chR.width = 96; chR.height = 14; chR.x = lhx + lInnerW - 12 - 96; chR.y = Theme.BY + 30; var chrf:* = chR.defaultTextFormat; chrf.letterSpacing = 1; chR.defaultTextFormat = chrf; Theme.setText(chR, "STATUS");
-         this._colHead.graphics.lineStyle(1, Theme.LINE, 0.3); this._colHead.graphics.moveTo(lhx + 2, Theme.BY + 45); this._colHead.graphics.lineTo(lhx + lInnerW - 2, Theme.BY + 45); this._colHead.graphics.lineStyle();
+         this._colHead.graphics.beginFill(Theme.LINE, 0.3); this._colHead.graphics.drawRect(lhx + 2, Theme.BY + 45, lInnerW - 4, 1); this._colHead.graphics.endFill();   // 0.0.59: filled divider (stroke elimination)
          // P1: create the FULL detail/objective field set ONCE, on-stage. Render only updates .text/.visible
          // on these pre-attached, font-resolved fields - NEVER `new TextField` in a handler (FindFont AV).
          var innerW:Number = Theme.ms(430) - 2 * Theme.PAD;
@@ -149,6 +149,7 @@ package
             this._subFields.push(t);
             var hit:Sprite = new Sprite(); hit.graphics.beginFill(0,0.004); hit.graphics.drawRect(x-4,-2,t.width+8,22); hit.graphics.endFill();
             hit.name = "h"+i; hit.buttonMode = true; hit.addEventListener(MouseEvent.MOUSE_DOWN, this.onSubtabClick);
+            hit.addEventListener(MouseEvent.ROLL_OVER, this.onSubtabOver); hit.addEventListener(MouseEvent.ROLL_OUT, this.onSubtabOut);   // 0.0.59 hover
             this._subtabs.addChild(hit);
             this._subUL.push({ x:(x-4), w:(t.width+8) });
             x += t.width + 26;
@@ -162,6 +163,7 @@ package
             this._subFields.push(et);
             var eh:Sprite = new Sprite(); eh.graphics.beginFill(0, 0.004); eh.graphics.drawRect(ex - 4, -2, PBT_PITCH - 6, 22); eh.graphics.endFill();
             eh.name = "h" + (3 + e); eh.buttonMode = true; eh.visible = false; eh.addEventListener(MouseEvent.MOUSE_DOWN, this.onSubtabClick);
+            eh.addEventListener(MouseEvent.ROLL_OVER, this.onSubtabOver); eh.addEventListener(MouseEvent.ROLL_OUT, this.onSubtabOut);   // 0.0.59 hover
             this._subtabs.addChild(eh); this._pbtHits.push(eh);
             this._subUL.push({ x:(ex - 4), w:(PBT_PITCH - 6) });
          }
@@ -180,7 +182,11 @@ package
                var nm:String = (_TabNames != null && i < _TabNames.length && _TabNames[i] != null) ? String(_TabNames[i]) : null;
                f.visible = (nm != null);
                if (i - 3 < this._pbtHits.length) { (this._pbtHits[i - 3] as Sprite).visible = (nm != null); }
-               if (nm != null) { Theme.setText(f, nm); } else { continue; }
+               if (nm != null) {
+                  var shown:String = Theme.tabLabel(nm, i);   // 0.0.59: sanitize PBT names to the embedded glyph set
+                  if (shown != nm && !this._tnLogged) { this._tnLogged = true; var codes:String = ""; for (var tc:int = 0; tc < nm.length && tc < 6; tc++) { codes += (tc > 0 ? "-" : "") + nm.charCodeAt(tc).toString(16); } Theme.life("TN" + i + "." + codes); }
+                  Theme.setText(f, shown);
+               } else { continue; }
             }
             var on:Boolean = (i == this._curTab);
             f.textColor = on ? Theme.PHOS_BRIGHT : Theme.PHOS_DIM;
@@ -193,6 +199,18 @@ package
                this._subtabs.graphics.endFill();
             }
          }
+      }
+      private var _tnLogged:Boolean = false;   // 0.0.59: one-shot raw-name diagnostic for unrenderable PBT names
+      // 0.0.59 HOVER (mirrors StatsPage): recolour-only, crash-law-safe.
+      private function onSubtabOver(e:MouseEvent):void
+      {
+         var i:int = int(e.currentTarget.name.substr(1));
+         if (i != this._curTab && i < this._subFields.length) { (this._subFields[i] as TextField).textColor = Theme.PHOS_BRIGHT; }
+      }
+      private function onSubtabOut(e:MouseEvent):void
+      {
+         var i:int = int(e.currentTarget.name.substr(1));
+         if (i != this._curTab && i < this._subFields.length) { (this._subFields[i] as TextField).textColor = Theme.PHOS_DIM; }
       }
       // P1-A: route sub-tab clicks through the shell's guarded TryToSetTab(uint), Chrome-idiom acquire.
       private var _menu:Object = null;

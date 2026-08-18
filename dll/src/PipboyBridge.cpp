@@ -389,13 +389,42 @@ namespace PipOS
             }
         }
 
+        // 0.0.59 INSTANCE-DATA RESOLUTION (the "every gun says DAMAGE 17 / ACC 0" fix). The base weapon record
+        // carries only AUTHORED values -- the real damage/fire-rate/aim-cone of a modded gun lives in the OMOD
+        // deltas (receivers especially), which the engine resolves via TESBoundObject::ApplyMods into a fresh
+        // per-instance data block. Both helpers are SEH leaves (POD/reference params only, no unwinding locals)
+        // so a malformed modded item degrades to base values instead of crashing the menu.
+        [[nodiscard]] RE::BGSObjectInstanceExtra* GetInstanceExtraSEH(RE::BGSInventoryItem::Stack* a_stack) noexcept
+        {
+            __try {
+                if (a_stack) {
+                    if (auto* extra = a_stack->extra.get()) {
+                        return extra->GetByType<RE::BGSObjectInstanceExtra>();
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            return nullptr;
+        }
+
+        void ResolveInstanceSEH(RE::TESBoundObject*                          a_obj,
+                                const RE::BGSObjectInstanceExtra*            a_oie,
+                                RE::BSTSmartPointer<RE::TBO_InstanceData>&   a_inst) noexcept
+        {
+            __try {
+                a_obj->ApplyMods(a_inst, a_oie);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // leave a_inst as delivered (typically null) -> caller falls back to the base record
+            }
+        }
+
         // SEH CONTAINMENT NET (defense-in-depth). Reads ONE inventory item's raw native data into the POD
         // out-param. An access violation on any single unusual modded item (Complex Sorter / FIS instance
         // data) is caught here and reported via out.ok=false, so the caller skips that one item instead of
         // the whole Pip-Boy menu crashing. NOTHING with a non-trivial destructor may be declared in this
         // function body (std::string / std::vector / Scaleform value) -- that would trip C2712. std::span
-        // and std::string_view are trivially destructible and therefore allowed.
-        [[nodiscard]] bool ExtractItemRaw(RE::TESBoundObject* a_obj, RE::BGSInventoryItem::Stack* a_stack, ItemRawPOD& a_out) noexcept
+        // and std::string_view are trivially destructible and therefore allowed. a_inst (may be null) is the
+        // caller-owned OMOD-resolved instance data; when present it REPLACES the base record's numbers.
+        [[nodiscard]] bool ExtractItemRaw(RE::TESBoundObject* a_obj, RE::BGSInventoryItem::Stack* a_stack, const RE::TBO_InstanceData* a_inst, ItemRawPOD& a_out) noexcept
         {
             __try {
                 a_out.type = CategoryFor(a_obj->GetFormType());
@@ -425,7 +454,11 @@ namespace PipOS
                 // ---- per-type stat numbers / strings -----------------------------------------------------
                 if (auto* weap = a_obj->As<RE::TESObjectWEAP>()) {
                     a_out.isWeap = true;
-                    const auto& wd = weap->weaponData;
+                    // 0.0.59: prefer the OMOD-resolved instance data (real modded damage / fire rate / aim cone /
+                    // ammo); the base record is the fallback for stacks with no instance extra.
+                    const auto& wd = (a_inst != nullptr)
+                        ? *static_cast<const RE::TESObjectWEAP::InstanceData*>(a_inst)
+                        : weap->weaponData;
                     // WEAPON STAT MAPPING (all plain member reads off TESObjectWEAP::Data, no engine calls;
                     // these are the UNMODDED authored base values -- per-instance mod deltas are intentionally
                     // NOT applied, see "HONEST SCOPE" above -- and the AS card rounds each to an integer):
@@ -479,7 +512,10 @@ namespace PipOS
                     }
                 } else if (auto* armo = a_obj->As<RE::TESObjectARMO>()) {
                     a_out.isArmo = true;
-                    const auto& ad = armo->armorData;
+                    // 0.0.59: same instance-data preference for armor (misc-mod DR deltas, lining enchantments).
+                    const auto& ad = (a_inst != nullptr)
+                        ? *static_cast<const RE::TESObjectARMO::InstanceData*>(a_inst)
+                        : armo->armorData;
                     a_out.dr = static_cast<double>(ad.rating);
                     if (ad.damageTypes) {
                         for (const auto& dt : *ad.damageTypes) {
@@ -609,7 +645,14 @@ namespace PipOS
                             // out only; every std::string / std::vector / Scaleform value below is built OUTSIDE
                             // the SEH from this POD.
                             ItemRawPOD pod{};
-                            if (!ExtractItemRaw(obj, std::addressof(a_stack), pod)) {
+                            // 0.0.59: resolve the stack's OMOD instance data first (SEH-leaf helpers; smart
+                            // pointer owned HERE, outside any __try) so the raw read reports the REAL modded
+                            // numbers instead of the base record's (the "every gun is DAMAGE 17" bug).
+                            RE::BSTSmartPointer<RE::TBO_InstanceData> inst;
+                            if (auto* oie = GetInstanceExtraSEH(std::addressof(a_stack))) {
+                                ResolveInstanceSEH(obj, oie, inst);
+                            }
+                            if (!ExtractItemRaw(obj, std::addressof(a_stack), inst.get(), pod)) {
                                 LogItemGuardFired(id);
                                 return true;
                             }
@@ -948,9 +991,67 @@ namespace PipOS
                 } else {
                     logger::info("[PipOS][MENUKIDS] life-trail: <unavailable (chrome not attached yet?)>");
                 }
+                // 0.0.59: ROOT1-LEVEL child sweep. If a button-hint bar (or anything else) survives at a level the
+                // Menu_mc sweep can't see -- e.g. a bar cloned to root by another mod -- this names it: class, name,
+                // y and visible per child. Cheap, read-only, runs in the same snapshots.
+                Scaleform::GFx::Value r1;
+                if (a_view->GetVariable(std::addressof(r1), "root1") && r1.IsObject()) {
+                    double rnc = -1.0;
+                    Scaleform::GFx::Value rn;
+                    if (r1.GetMember("numChildren", std::addressof(rn)) && rn.IsNumber()) { rnc = rn.GetNumber(); }
+                    const int rcount = (rnc >= 0.0 && rnc < 12.0) ? static_cast<int>(rnc) : 8;
+                    logger::info("[PipOS][MENUKIDS] root1 numChildren={}", rnc);
+                    for (int ri = 0; ri < rcount; ++ri) {
+                        Scaleform::GFx::Value rchild;
+                        Scaleform::GFx::Value ridx(static_cast<double>(ri));
+                        if (!r1.Invoke("getChildAt", std::addressof(rchild), std::addressof(ridx), 1) || !rchild.IsObject()) {
+                            logger::info("[PipOS][MENUKIDS]   root1[{}] <getChildAt failed>", ri);
+                            continue;
+                        }
+                        const char* rcls = "?";
+                        Scaleform::GFx::Value rstr;
+                        if (rchild.Invoke("toString", std::addressof(rstr), nullptr, 0) && rstr.IsString()) { rcls = rstr.GetString(); }
+                        const char* rnm = "?";
+                        Scaleform::GFx::Value rnmv;
+                        if (rchild.GetMember("name", std::addressof(rnmv)) && rnmv.IsString()) { rnm = rnmv.GetString(); }
+                        double cy = 0.0; bool cvis = false;
+                        Scaleform::GFx::Value cyv, cvv;
+                        if (rchild.GetMember("y", std::addressof(cyv)) && cyv.IsNumber()) { cy = cyv.GetNumber(); }
+                        if (rchild.GetMember("visible", std::addressof(cvv)) && cvv.IsBoolean()) { cvis = cvv.GetBoolean(); }
+                        logger::info("[PipOS][MENUKIDS]   root1[{}] class={} name={} y={} visible={}", ri, rcls, rnm, cy, cvis);
+                    }
+                }
             } catch (...) {
                 logger::error("[PipOS][MENUKIDS] diagnostic threw; skipped");
             }
+        }
+
+        // 0.0.59 SESSION FOLDER MEMORY. The Inv page mirrors its opened-folder state into root1.PipOS_folderMem
+        // ("tab:KEY|KEY;tab:KEY"); the page (and root1) die with the menu, so we bank the string here at close
+        // and re-seed it onto the fresh root1 at the next open. Session-scoped by design (not saved to disk).
+        std::string s_folderMem{};
+
+        void CaptureFolderMemNow(Scaleform::GFx::Movie* a_view)
+        {
+            if (!a_view) { return; }
+            try {
+                Scaleform::GFx::Value v;
+                if (a_view->GetVariable(std::addressof(v), "root1.PipOS_folderMem") && v.IsString()) {
+                    s_folderMem = v.GetString();
+                    logger::info("[PipOS] folderMem: captured '{}' at close", s_folderMem);
+                }
+            } catch (...) {}
+        }
+
+        void SeedFolderMemNow(Scaleform::GFx::Movie* a_view)
+        {
+            if (!a_view || s_folderMem.empty()) { return; }
+            try {
+                Scaleform::GFx::Value v(s_folderMem.c_str());
+                if (a_view->SetVariable("root1.PipOS_folderMem", v)) {
+                    logger::info("[PipOS] folderMem: re-seeded '{}' at open", s_folderMem);
+                }
+            } catch (...) {}
         }
 
         // 0.0.53: periodic life-trail capture while the Pip-Boy is open (~every 1.5-3s). With flush-on-write,
@@ -1010,6 +1111,7 @@ namespace PipOS
                         if (auto menu = ui->GetMenu(kPipboyMenu)) {
                             logger::info("[PipOS][MENUKIDS] ---- close snapshot ----");
                             LogMenuChildren(menu->uiMovie.get());
+                            CaptureFolderMemNow(menu->uiMovie.get());   // 0.0.59: bank opened-folder state for the next open
                         }
                     }
                 }
@@ -1033,6 +1135,7 @@ namespace PipOS
                                     PushItemInfoNow(view);   // 0.0.23 P1-D: per-item WT/VAL/AMMO -> root1.PipOS_iteminfo
                                     PushItemStatsNow(view);  // 0.0.25: per-item stats + mods + favorites (formID-keyed)
                                     PushSettingsNow(view);   // 0.0.38: customization -> root1.PipOS_settings (veil/breathe/openAnim/folders)
+                                    SeedFolderMemNow(view);  // 0.0.59: session folder memory -> root1.PipOS_folderMem
                                     if (auto* s = Settings::GetSingleton()) {
                                         DiagnoseViewport(view, s->WidescreenSpike());  // spike: default 0 = no-op
                                     }

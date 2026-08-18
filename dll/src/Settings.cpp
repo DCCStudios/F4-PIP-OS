@@ -52,14 +52,13 @@ namespace PipOS
         _folders = true;
         _showRPM = false;
 
-        const auto path = std::filesystem::path("Data/F4SE/Plugins/PipOSPipboy.ini");
-        std::ifstream in(path);
-        if (!in) {
-            logger::info("[PipOS] no PipOSPipboy.ini; defaulting all tabs to PipOS pages");
-            return;
-        }
-
+        // 0.0.59 TWO-FILE SETTINGS: the shipped PipOSPipboy.ini is REPLACED by every build install (the FOMOD
+        // zip carries it), which silently wiped all in-game customization saves (field-observed: live3D/showRPM
+        // saved true in one session loaded false the next -- the 0.0.58 install had overwritten the ini).
+        // In-game saves therefore go to PipOSPipboy_User.ini, which is NEVER shipped in the package; it is
+        // parsed AFTER the main ini so its values override the shipped defaults.
         static constexpr std::array<std::string_view, 5> keys{ "STAT", "INV", "DATA", "MAP", "RADIO" };
+        const auto parseStream = [&](std::istream& in) {
         std::string line;
         while (std::getline(in, line)) {
             const auto hash = line.find_first_of(";#");
@@ -147,7 +146,25 @@ namespace PipOS
                 if (key == keys[i]) { _pageModes[i] = ParseMode(val); }
             }
         }
-        logger::info("[PipOS] settings loaded from PipOSPipboy.ini");
+        };  // parseStream
+
+        {
+            std::ifstream in(std::filesystem::path("Data/F4SE/Plugins/PipOSPipboy.ini"));
+            if (in) {
+                parseStream(in);
+            } else {
+                logger::info("[PipOS] no PipOSPipboy.ini; defaulting all tabs to PipOS pages");
+            }
+        }
+        bool userIni = false;
+        {
+            std::ifstream in(std::filesystem::path("Data/F4SE/Plugins/PipOSPipboy_User.ini"));
+            if (in) {
+                parseStream(in);
+                userIni = true;
+            }
+        }
+        logger::info("[PipOS] settings loaded from PipOSPipboy.ini{}", userIni ? " + PipOSPipboy_User.ini overrides" : " (no user override file yet)");
     }
 
     PageMode Settings::Mode(std::size_t a_pageIndex) const
@@ -157,11 +174,12 @@ namespace PipOS
 
     void Settings::SaveCustomization() const
     {
-        // Rewrite ONLY the [Customization] keys, preserving every other line (Pages / Character / comments)
-        // verbatim. The flat Load() parser is section-insensitive (a line with no '=' is skipped), so the
-        // [Customization] header is purely for humans; the keys are read wherever they sit. Best-effort:
-        // any filesystem failure is logged and swallowed (never throws into the ImGui render thread).
-        const auto path = std::filesystem::path("Data/F4SE/Plugins/PipOSPipboy.ini");
+        // 0.0.59: all in-game saves go to PipOSPipboy_User.ini -- a file the FOMOD package NEVER ships, so a
+        // build install can no longer wipe them (0.0.58's in-place rewrite of the shipped ini was correct, but
+        // the next zip install replaced the whole file and every saved value reverted; field-observed twice).
+        // We own this file outright, so a plain full rewrite of the known keys is enough. Best-effort: any
+        // filesystem failure is logged and swallowed (never throws into the ImGui render thread).
+        const auto path = std::filesystem::path("Data/F4SE/Plugins/PipOSPipboy_User.ini");
 
         auto fmtF = [](float a_v, const char* a_fmt = "%.2f") -> std::string {
             char b[32];
@@ -169,91 +187,29 @@ namespace PipOS
             return std::string(b);
         };
 
-        // bLive3D is persisted too (the page toggles it), keyed on the SAME [Character] bLive3D the
-        // CharacterCapture gate already reads. If a [Character] bLive3D line exists it is updated in place;
-        // otherwise it lands in the appended [Customization] block (the flat parser reads it either way). The
-        // figure-slot placement keys (Char3D*) round-trip the same way so in-game slider tuning survives a
-        // restart; an existing [Character] line is updated in place, else appended.
-        struct KV { const char* canon; const char* upper; std::string val; bool written; };
-        std::vector<KV> entries{
-            { "VeilAlpha",        "VEILALPHA",        fmtF(_veilAlpha),                       false },
-            { "CrtBreathe",       "CRTBREATHE",       _crtBreathe ? "true" : "false",         false },
-            { "OpenAnim",         "OPENANIM",         _openAnim   ? "true" : "false",         false },
-            { "Folders",          "FOLDERS",          _folders    ? "true" : "false",         false },
-            { "ShowRPM",          "SHOWRPM",          _showRPM    ? "true" : "false",         false },
-            { "bLive3D",          "BLIVE3D",          _live3D     ? "true" : "false",         false },
-            { "Char3DScale",      "CHAR3DSCALE",      fmtF(_char3dScale, "%.3f"),             false },
-            { "Char3DDistance",   "CHAR3DDISTANCE",   fmtF(_char3dDistance, "%.1f"),          false },
-            { "Char3DTarget",     "CHAR3DTARGET",     std::to_string(_char3dTarget),          false },
-            { "Char3DClipLeft",   "CHAR3DCLIPLEFT",   fmtF(_char3dClipLeft, "%.1f"),          false },
-            { "Char3DClipTop",    "CHAR3DCLIPTOP",    fmtF(_char3dClipTop, "%.1f"),           false },
-            { "Char3DClipRight",  "CHAR3DCLIPRIGHT",  fmtF(_char3dClipRight, "%.1f"),         false },
-            { "Char3DClipBottom", "CHAR3DCLIPBOTTOM", fmtF(_char3dClipBottom, "%.1f"),        false },
-        };
-
-        auto upperTrimKey = [](const std::string& a_line) -> std::string {
-            const auto eq = a_line.find('=');
-            if (eq == std::string::npos) { return {}; }
-            std::string k = a_line.substr(0, eq);
-            k.erase(0, k.find_first_not_of(" \t"));
-            const auto last = k.find_last_not_of(" \t");
-            if (last == std::string::npos) { return {}; }
-            k.erase(last + 1);
-            for (auto& c : k) { c = static_cast<char>(::toupper(c)); }
-            return k;
-        };
-
-        std::vector<std::string> lines;
-        bool hasCustomHeader = false;
-        {
-            std::ifstream in(path);
-            if (in) {
-                std::string line;
-                while (std::getline(in, line)) {
-                    if (!line.empty() && line.back() == '\r') { line.pop_back(); }
-                    // Detect a [Customization] header (trimmed, case-insensitive) so we don't duplicate it.
-                    std::string t = line;
-                    t.erase(0, t.find_first_not_of(" \t"));
-                    const auto te = t.find_last_not_of(" \t");
-                    if (te != std::string::npos) { t.erase(te + 1); }
-                    std::string tl = t; for (auto& c : tl) { c = static_cast<char>(::tolower(c)); }
-                    if (tl == "[customization]") { hasCustomHeader = true; }
-
-                    // Update an existing customization key in place (skip comment lines).
-                    const auto firstNs = line.find_first_not_of(" \t");
-                    const bool isComment = (firstNs != std::string::npos && (line[firstNs] == ';' || line[firstNs] == '#'));
-                    if (!isComment) {
-                        const std::string ukey = upperTrimKey(line);
-                        for (auto& e : entries) {
-                            if (!e.written && ukey == e.upper) {
-                                line = std::string(e.canon) + "=" + e.val;
-                                e.written = true;
-                                break;
-                            }
-                        }
-                    }
-                    lines.push_back(std::move(line));
-                }
-            }
-        }
-
-        const bool anyMissing = std::any_of(entries.begin(), entries.end(),
-            [](const KV& e) { return !e.written; });
-
         std::ofstream out(path, std::ios::trunc);
         if (!out) {
-            logger::error("[PipOS] SaveCustomization: cannot open PipOSPipboy.ini for write");
+            logger::error("[PipOS] SaveCustomization: cannot open PipOSPipboy_User.ini for write");
             return;
         }
-        for (const auto& l : lines) { out << l << "\n"; }
-        if (anyMissing) {
-            if (!lines.empty()) { out << "\n"; }
-            if (!hasCustomHeader) { out << "[Customization]\n"; }
-            for (const auto& e : entries) {
-                if (!e.written) { out << e.canon << "=" << e.val << "\n"; }
-            }
-        }
-        logger::info("[PipOS] SaveCustomization: veil={} breathe={} openAnim={} folders={} showRPM={} live3D={} "
+        out << "; PIP-OS in-game customization saves. Written by the mod; NOT shipped in the package,\n"
+               "; so build updates never overwrite it. Values here override PipOSPipboy.ini.\n"
+               "[Customization]\n";
+        out << "VeilAlpha=" << fmtF(_veilAlpha) << "\n";
+        out << "CrtBreathe=" << (_crtBreathe ? "true" : "false") << "\n";
+        out << "OpenAnim=" << (_openAnim ? "true" : "false") << "\n";
+        out << "Folders=" << (_folders ? "true" : "false") << "\n";
+        out << "ShowRPM=" << (_showRPM ? "true" : "false") << "\n";
+        out << "bLive3D=" << (_live3D ? "true" : "false") << "\n";
+        out << "Char3DScale=" << fmtF(_char3dScale, "%.3f") << "\n";
+        out << "Char3DDistance=" << fmtF(_char3dDistance, "%.1f") << "\n";
+        out << "Char3DTarget=" << _char3dTarget << "\n";
+        out << "Char3DClipLeft=" << fmtF(_char3dClipLeft, "%.1f") << "\n";
+        out << "Char3DClipTop=" << fmtF(_char3dClipTop, "%.1f") << "\n";
+        out << "Char3DClipRight=" << fmtF(_char3dClipRight, "%.1f") << "\n";
+        out << "Char3DClipBottom=" << fmtF(_char3dClipBottom, "%.1f") << "\n";
+
+        logger::info("[PipOS] SaveCustomization -> PipOSPipboy_User.ini: veil={} breathe={} openAnim={} folders={} showRPM={} live3D={} "
                      "char3d(scale={} dist={} target={} clipL={} clipT={} clipR={} clipB={})",
             fmtF(_veilAlpha), _crtBreathe, _openAnim, _folders, _showRPM, _live3D,
             _char3dScale, _char3dDistance, _char3dTarget,
