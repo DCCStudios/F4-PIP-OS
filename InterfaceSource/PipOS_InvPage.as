@@ -7,6 +7,7 @@ package
    import pipos.VaultBoy;
    import pipos.Debug;
    import pipos.Ticker;
+   import flash.display.DisplayObject;
    import flash.display.Graphics;
    import flash.display.Shape;
    import flash.display.Sprite;
@@ -14,6 +15,7 @@ package
    import flash.events.KeyboardEvent;
    import flash.events.MouseEvent;
    import flash.geom.Rectangle;
+   import flash.geom.Point;
    import flash.text.TextField;
 
    // PIP-OS Inventory page, laid out to the M1 mockup (876x700, sidebar gutter): three columns
@@ -266,6 +268,7 @@ package
          this._list.onSelectionChange = this.onListSel; this._list.onItemPress = this.onListPress; this._list.playSound = this.sfx;
          this._list.onHover = this.onListHover;   // B: row hover -> item tooltip (pure callback; no fields/geometry)
          this._list.onFolderToggle = this.onFolderToggle;   // FIS folders: header click -> collapse toggle (pure callback)
+         this._list.onRowContext = this.onRowContext;       // 0.0.61: right-click -> context menu
          // 4-column config is STABLE (NAME|AMMO|WT|VAL); set here (font-free) so columnGeom() can align headers.
          this._list.columns = [{w:0,align:"left"},{w:64,align:"left"},{w:40,align:"right"},{w:44,align:"right"}]; this._list.optCol = 1; this._list.optOn = false;
          this._colGeom = this._list.columnGeom();
@@ -467,6 +470,7 @@ package
             this._quick.addChild(qhit); this._qHit.push(qhit);
          }
          this.buildTooltip();
+         this.buildContextMenu();   // 0.0.61: pooled right-click menu (built once, on-stage)
          // 0.0.31: the list column config is STABLE (4 columns: NAME | AMMO | WT | VAL) so PipList can pool its
          // rows ONCE at fixed geometry. The AMMO column is OPTIONAL (optCol=1): on non-weapon tabs layoutHeader
          // flips _list.optOn=false, and PipList hides AMMO + widens the NAME viewport via scrollRect ONLY -- no
@@ -671,6 +675,7 @@ package
          this._foldersOn = Theme.FOLDERS; this._showRPM = false;
          try { var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr != null) { this._itemInfo = rr.PipOS_iteminfo; this._itemStats = rr.PipOS_itemstats; this._itemMods = rr.PipOS_itemmods; this._favs = rr.PipOS_favorites; var st:* = rr.PipOS_settings; if (st != null && st.hasOwnProperty("folders")) { this._foldersOn = (st.folders == true); } if (st != null && st.hasOwnProperty("showRPM")) { this._showRPM = (st.showRPM == true); } this.hydrateFolderMem(rr); } } catch (ex:*) { this._itemInfo = null; this._itemStats = null; this._itemMods = null; this._favs = null; }
          this.hideTooltip();   // B: drop any stale tooltip across a data refresh (re-shown on next hover)
+         this.closeContextMenu();   // 0.0.61: a live data refresh rebuilds the list -> drop any open context menu
          // Filter (vanilla ListFilterer rule) + per-category sort + setItems, preserving the selected item.
          this.rebuildList(d);
          this.updateInvTitle(); this.drawSortIndicator();
@@ -906,6 +911,7 @@ package
             }
          }
          if (!anyTag) {
+            this._curFolderKeys = [];   // 0.0.61: flat list (no folders) -> nothing for Expand/Collapse All
             for (i = 0; i < pairs.length; i++) { entries.push(pairs[i].it); map.push(int(pairs[i].oi)); }
             return { entries:entries, map:map, grouped:false };
          }
@@ -920,6 +926,7 @@ package
          order.sort();
          var ui:int = order.indexOf(UNTAG);
          if (ui >= 0) { order.splice(ui, 1); order.push(UNTAG); }   // catch-all MISC folder always trails
+         this._curFolderKeys = order.concat();   // 0.0.61: stash this tab's folder keys for Expand All / Collapse All
          for (var gi:int = 0; gi < order.length; gi++) {
             var k:String = String(order[gi]); var idxs:Array = buckets[k] as Array;
             var lbl:String = (labelOf[k] != null) ? String(labelOf[k]) : k;
@@ -1365,6 +1372,163 @@ package
          }
       }
 
+      // ==========================================================================================
+      // 0.0.61 RIGHT-CLICK CONTEXT MENU. Pooled like the tooltip: all fields created ONCE here (on-stage build
+      // window); open/close/hover are UPDATE-ONLY (setText / textColor / visible / graphics / container .x/.y).
+      // Item rows -> EQUIP|USE (by category), INSPECT, DROP. Folder headers -> EXPAND/COLLAPSE (this) + EXPAND
+      // ALL / COLLAPSE ALL. Opening dismisses the hover box (and suppresses it while open). Trigger delivery
+      // (GFx right-mouse) is runtime-unproven here -> onRowContext logs IV.rc so a test confirms it.
+      private static const CTX_W:Number = 172;
+      private static const CTX_ROWH:Number = 26;
+      private static const CTX_PAD:Number = 5;
+      private static const CTX_MAX:int = 4;
+      private var _ctxMenu:Sprite;
+      private var _ctxBg:Shape;
+      private var _ctxHi:Shape;
+      private var _ctxRowsTF:Array = [];
+      private var _ctxHits:Array = [];
+      private var _ctxActions:Array = [];
+      private var _ctxOpen:Boolean = false;
+      private var _ctxFolderKey:String = null;
+      private var _curFolderKeys:Array = [];   // this tab's folder keys (stashed in groupPairs; for Expand/Collapse All)
+
+      private function buildContextMenu():void
+      {
+         this._ctxMenu = new Sprite(); this._ctxMenu.visible = false; addChild(this._ctxMenu);   // topmost (after tooltip)
+         this._ctxBg = new Shape(); this._ctxMenu.addChild(this._ctxBg);
+         this._ctxHi = new Shape(); this._ctxMenu.addChild(this._ctxHi);   // hover highlight (below text)
+         this._ctxRowsTF = []; this._ctxHits = [];
+         for (var i:int = 0; i < CTX_MAX; i++) {
+            var ry:Number = CTX_PAD + i * CTX_ROWH;
+            var tf:TextField = Theme.mk(this._ctxMenu, 12, Theme.PHOS, true); tf.autoSize = "none"; tf.width = CTX_W - 2 * CTX_PAD - 12; tf.height = 18; tf.x = CTX_PAD + 10; tf.y = ry + 4; tf.mouseEnabled = false; tf.visible = false; this._ctxRowsTF.push(tf);
+            var hs:Sprite = new Sprite(); hs.graphics.beginFill(0, 0.004); hs.graphics.drawRect(CTX_PAD, ry, CTX_W - 2 * CTX_PAD, CTX_ROWH); hs.graphics.endFill();
+            hs.name = "cx" + i; hs.buttonMode = true; hs.visible = false;
+            hs.addEventListener(MouseEvent.MOUSE_DOWN, this.onCtxRowClick);
+            hs.addEventListener(MouseEvent.ROLL_OVER, this.onCtxRowOver);
+            hs.addEventListener(MouseEvent.ROLL_OUT, this.onCtxRowOut);
+            this._ctxMenu.addChild(hs); this._ctxHits.push(hs);
+         }
+      }
+
+      // PipList right-click -> decide folder vs item menu. Selection (items) + folder tag capture happen here.
+      private function onRowContext(idx:int, entry:Object, ex:Number, ey:Number):void
+      {
+         Theme.life("IV.rc");   // breadcrumb: GFx actually delivered a right-click to a row
+         this.hideTooltip();
+         var opts:Array = [];
+         if (entry != null && entry.__folder == true) {
+            this._ctxFolderKey = (entry.tag != null) ? String(entry.tag) : null;
+            if (entry.collapsed == true) { opts.push({ label:"EXPAND", act:"expand" }); }
+            else { opts.push({ label:"COLLAPSE", act:"collapse" }); }
+            opts.push({ label:"EXPAND ALL", act:"expandall" });
+            opts.push({ label:"COLLAPSE ALL", act:"collapseall" });
+         } else {
+            this._ctxFolderKey = null;
+            if (this._list != null) { this._list.selectIndex(idx); }   // right-click selects the item it targets
+            var eq:String = this.equipUseLabel();
+            if (eq != null) { opts.push({ label:eq, act:"equip" }); }
+            opts.push({ label:"INSPECT", act:"inspect" });
+            opts.push({ label:"DROP", act:"drop" });
+         }
+         this.openContextMenu(opts, ex, ey);
+      }
+
+      // EQUIP for weapons/apparel, USE for aid; MISC/JUNK/MODS/AMMO carry only INSPECT + DROP (no dead action).
+      private function equipUseLabel():String
+      {
+         if (this._curTab == 0 || this._curTab == 1) { return "EQUIP"; }
+         if (this._curTab == 2) { return "USE"; }
+         return null;
+      }
+
+      private function openContextMenu(opts:Array, ex:Number, ey:Number):void
+      {
+         if (this._ctxMenu == null) { return; }
+         var n:int = Math.min(opts.length, CTX_MAX);
+         this._ctxActions = [];
+         for (var i:int = 0; i < CTX_MAX; i++) {
+            var tf:TextField = this._ctxRowsTF[i] as TextField; var hs:Sprite = this._ctxHits[i] as Sprite;
+            if (i < n) {
+               Theme.setText(tf, String(opts[i].label)); tf.textColor = Theme.PHOS; tf.visible = true; hs.visible = true;
+               this._ctxActions.push(String(opts[i].act));
+            } else { tf.visible = false; hs.visible = false; }
+         }
+         var h:Number = 2 * CTX_PAD + n * CTX_ROWH;
+         var g:* = this._ctxBg.graphics; g.clear();
+         g.beginFill(Theme.GROUND, 0.97); g.drawRoundRect(0, 0, CTX_W, h, 6, 6); g.endFill();
+         Theme.frameRect(g, 0, 0, CTX_W, h, Theme.PHOS, 0.55);
+         this._ctxHi.graphics.clear();
+         // position at the cursor (page-local), clamped inside the content frame
+         var p:Point = this.globalToLocal(new Point(ex, ey));
+         var px:Number = p.x + 2, py:Number = p.y + 2;
+         if (px + CTX_W > Theme.CR) { px = p.x - CTX_W - 2; }
+         if (py + h > Theme.BB) { py = Theme.BB - h; }
+         if (px < Theme.CX) { px = Theme.CX; }
+         if (py < Theme.FY) { py = Theme.FY; }
+         this._ctxMenu.x = px; this._ctxMenu.y = py;
+         this._ctxMenu.visible = true; this._ctxOpen = true;
+         if (stage != null) { stage.addEventListener(MouseEvent.MOUSE_DOWN, this.onCtxStageDown, true); }   // capture: close on outside click
+      }
+
+      private function onCtxStageDown(e:MouseEvent):void
+      {
+         if (this._ctxMenu != null && e.target != null) {
+            try { if (this._ctxMenu.contains(e.target as DisplayObject)) { return; } } catch (ec:*) {}
+         }
+         this.closeContextMenu();
+      }
+      private function onCtxRowClick(e:MouseEvent):void
+      {
+         var i:int = int(String(e.currentTarget.name).substr(2));   // "cx2" -> 2
+         var act:String = (i >= 0 && i < this._ctxActions.length) ? String(this._ctxActions[i]) : null;
+         this.closeContextMenu();
+         if (act != null) { this.doContextAction(act); }
+      }
+      private function onCtxRowOver(e:MouseEvent):void
+      {
+         var i:int = int(String(e.currentTarget.name).substr(2));
+         var ry:Number = CTX_PAD + i * CTX_ROWH;
+         var g:* = this._ctxHi.graphics; g.clear();
+         g.beginFill(Theme.PHOS, 0.16); g.drawRect(CTX_PAD, ry, CTX_W - 2 * CTX_PAD, CTX_ROWH); g.endFill();
+         if (i >= 0 && i < this._ctxRowsTF.length) { (this._ctxRowsTF[i] as TextField).textColor = Theme.PHOS_BRIGHT; }
+      }
+      private function onCtxRowOut(e:MouseEvent):void
+      {
+         this._ctxHi.graphics.clear();
+         var i:int = int(String(e.currentTarget.name).substr(2));
+         if (i >= 0 && i < this._ctxRowsTF.length) { (this._ctxRowsTF[i] as TextField).textColor = Theme.PHOS; }
+      }
+      private function closeContextMenu():void
+      {
+         if (!this._ctxOpen && (this._ctxMenu == null || !this._ctxMenu.visible)) { return; }
+         if (this._ctxMenu != null) { this._ctxMenu.visible = false; this._ctxHi.graphics.clear(); }
+         this._ctxOpen = false; this._ctxFolderKey = null;
+         if (stage != null) { stage.removeEventListener(MouseEvent.MOUSE_DOWN, this.onCtxStageDown, true); }
+      }
+      private function doContextAction(act:String):void
+      {
+         if (act == "equip") {
+            var oi:int = this.invIdx(this._list.selectedIndex);
+            if (oi >= 0) { this.sfx("UIMenuOK"); BGSExternalInterface.call(this.codeObj, "SelectItem", oi); }
+         } else if (act == "inspect") { this.doInspect(); }
+         else if (act == "drop") { this.doDrop(); }
+         else if (act == "expand") { if (this._ctxFolderKey != null) { this.setFolderCollapsed(this._curTab, this._ctxFolderKey, false); this.rebuildAfterFolders(); } }
+         else if (act == "collapse") { if (this._ctxFolderKey != null) { this.setFolderCollapsed(this._curTab, this._ctxFolderKey, true); this.rebuildAfterFolders(); } }
+         else if (act == "expandall") { this.setAllFolders(false); }
+         else if (act == "collapseall") { this.setAllFolders(true); }
+      }
+      private function setAllFolders(collapsed:Boolean):void
+      {
+         if (this._curFolderKeys == null) { return; }
+         for (var i:int = 0; i < this._curFolderKeys.length; i++) { this.setFolderCollapsed(this._curTab, String(this._curFolderKeys[i]), collapsed); }
+         this.rebuildAfterFolders();
+      }
+      private function rebuildAfterFolders():void
+      {
+         this.sfx("UIMenuPrevNext");
+         if (this._lastData != null) { this.rebuildList(this._lastData); this.updateInvTitle(); this.drawSortIndicator(); }
+      }
+
       // ---- B. TOOLTIP interaction (UPDATE-ONLY: setText/textColor/visible + panel graphics + Sprite-container
       // .x/.y. NO TextField geometry write anywhere below; the pooled fields keep the geometry baked in buildTooltip.
       private var _tipH:Number = 60;   // last drawn panel height (drives clamp; not a TextField geometry write)
@@ -1395,6 +1559,7 @@ package
       private function showTooltip(name:String, formID:String, hintType:String):void
       {
          if (this._tip == null || this._tipName == null) { return; }
+         if (this._ctxOpen) { return; }   // 0.0.61: the context menu temporarily suppresses the hover box
          var stats:Object = null;
          if (formID != null && String(formID).length > 0 && String(formID) != "0" && this._itemStats != null) {
             try { stats = this._itemStats[String(formID)]; } catch (e1:*) { stats = null; }
@@ -2022,6 +2187,7 @@ package
          if (this._insTicker != null) { this._insTicker.stop(); }
          if (this._expandTicker != null) { this._expandTicker.stop(); }
          if (this._charPoll != null) { this._charPoll.stop(); }   // 0.0.59: 3D-contract poll dies with the page
+         this.closeContextMenu();   // 0.0.61: drop any open context menu + its stage listener on teardown
          this._inspecting = false; this._insFadeDir = 0; this._insFade = 0;
          if (this._insLay != null) { this._insLay.visible = false; this._insLay.alpha = 0; }
       }
@@ -2051,6 +2217,8 @@ package
                return;
             }
          }
+         // 0.0.61: while the context menu is open it captures keys -- Escape closes it, everything else is swallowed.
+         if (this._ctxOpen) { if (e.keyCode == 27) { this.closeContextMenu(); } return; }
          // While inspecting, the overlay CAPTURES W/S/R/Escape and the underlying list does NOT act on any key.
          if (this._inspecting) { this.onInspectKey(e.keyCode); return; }
          if (e.keyCode == 69) { this.doExpand(); return; }   // E = expand/collapse the inventory list (QOL-4 hotkey)

@@ -40,6 +40,11 @@ package pipos
       // with the header ENTRY object. ADDITIVE + null-guarded -- a page that never assigns it keeps plain,
       // non-clickable separators (DATA/RADIO). Pure callback: onRowClick stays create-free + geometry-free.
       public var onFolderToggle:Function;      // function(entry:Object)
+      // 0.0.61: right-click context callback. Fired on a row's RIGHT_MOUSE_DOWN with (displayIdx, entry, stageX,
+      // stageY). ADDITIVE + null-guarded -- a page that never assigns it is behaviourally identical. Pure callback
+      // (no fields/geometry), so it stays pool-safe. NOTE: whether GFx delivers right-mouse to the movie at all is
+      // runtime-unproven here; the page logs a breadcrumb when this fires so a test decides it.
+      public var onRowContext:Function;        // function(idx:int, entry:Object, ex:Number, ey:Number)
       public var columns:Array = null;         // optional [{w,align}]; adapter returns cols:[String,...]. STABLE by pool-build time.
       public var optCol:int = -1;              // index of an OPTIONAL column (e.g. INV AMMO); toggled by optOn without geometry writes
       public var optOn:Boolean = true;         // when false the opt column is hidden and the NAME cell widens (scrollRect only)
@@ -295,6 +300,15 @@ package pipos
          if (playSound != null) { playSound("UIMenuOK"); }
       }
 
+      // 0.0.61: right-click on a row -> page context callback (display index + entry + stage coords). Selection
+      // and folder/item routing are the page's job; this only forwards. Guarded, create-free, geometry-free.
+      private function onRowRightClick(e:MouseEvent):void
+      {
+         var idx:int = int(String(e.currentTarget.name).substr(1));
+         if (idx < 0 || idx >= this._entries.length) { return; }
+         if (onRowContext != null) { onRowContext(idx, this._entries[idx], e.stageX, e.stageY); }
+      }
+
       private function onRowOver(e:MouseEvent):void
       {
          var idx:int = int(String(e.currentTarget.name).substr(1));
@@ -364,6 +378,7 @@ package pipos
             hit.graphics.beginFill(0x000000, 0.004); hit.graphics.drawRect(0, y, this._w, this._rowH); hit.graphics.endFill();
             hit.buttonMode = true; hit.mouseEnabled = false; hit.name = "r-1";
             hit.addEventListener(MouseEvent.MOUSE_DOWN, this.onRowClick);
+            hit.addEventListener(MouseEvent.RIGHT_MOUSE_DOWN, this.onRowRightClick);   // 0.0.61 context menu
             hit.addEventListener(MouseEvent.ROLL_OVER, this.onRowOver);
             hit.addEventListener(MouseEvent.ROLL_OUT, this.onRowOut);
             this._rows.addChild(hit); slot.hit = hit;
