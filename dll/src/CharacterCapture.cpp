@@ -833,13 +833,13 @@ namespace PipOS
 
     bool CharacterCapture::Install()
     {
-        auto* settings = Settings::GetSingleton();
-        if (!settings || !settings->Live3D()) {
-            // DEFAULT-OFF path: byte-identical to the v1 stub -- no trampoline, no hooks, no renderer.
-            logger::info("[PipOS][3D] live 3D character disabled ([Character] bLive3D=false); "
-                         "no hooks installed, figure slot uses the Vault Boy fallback");
-            return false;
-        }
+        // 0.0.58 (user request): the hook installs UNCONDITIONALLY; bLive3D is now a pure RUNTIME toggle -- the
+        // frame hook's wantShow gate (settings->Live3D() && PipboyOpen()) reads the live setting every frame, so
+        // flipping it in the Menu Framework page switches 3D character <-> Vault Boy on the next Pip-Boy open,
+        // no game restart needed.
+        logger::info("[PipOS][3D] installing capture hook unconditionally; bLive3D={} gates at runtime (toggle "
+                     "applies on next Pip-Boy open)",
+            Settings::GetSingleton() ? Settings::GetSingleton()->Live3D() : false);
 
         bool expected = false;
         if (!g_installed.compare_exchange_strong(expected, true)) { return true; }
@@ -862,8 +862,10 @@ namespace PipOS
             target);
 
         RegisterContractSink();
-        logger::info("[PipOS][3D] live 3D character ENABLED (renderer='{}', fov={}, scale={}, yaw={})",
-            kRendererName, settings->Char3DFov(), settings->Char3DScale(), settings->Char3DYaw());
+        if (auto* settings = Settings::GetSingleton()) {
+            logger::info("[PipOS][3D] capture hook armed (renderer='{}', fov={}, scale={}, yaw={}); bLive3D toggles at runtime",
+                kRendererName, settings->Char3DFov(), settings->Char3DScale(), settings->Char3DYaw());
+        }
         return true;
     }
 

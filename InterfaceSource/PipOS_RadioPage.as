@@ -111,7 +111,7 @@ package
          // first render() can never fire from an interaction path (onWheel/handleKey) later.
          if (this._list != null && stage != null) { this._list.render(); }
          // 0.0.57: keybar restored (see InvPage note).
-         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"ENTER",label:"TUNE"},{key:"T",label:"PERK CHART"}], Theme.my(858));
+         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"ENTER",label:"TUNE"},{key:"T",label:"PERK CHART"}], Theme.my(830));   // 0.0.58: raised (was clipped at the frame bottom edge)
          Theme.life("RA.t3");   // buildText completed
       }
 

@@ -122,7 +122,7 @@ package
          // Per-page bottom keybar: only DATA's wired actions (SHOW ON MAP / SUMMARY) + ESC BACK. TRACK stays on
          // Enter/Accept (intentionally no chip -- it is dead on the Workshops/Stats sub-tabs).
          // 0.0.57: keybar restored (see InvPage note).
-         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"R",label:"SHOW ON MAP"},{key:"C",label:"SUMMARY"},{key:"T",label:"PERK CHART"}], Theme.my(858));
+         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"R",label:"SHOW ON MAP"},{key:"C",label:"SUMMARY"},{key:"T",label:"PERK CHART"}], Theme.my(830));   // 0.0.58: raised (was clipped at the frame bottom edge)
       }
 
       private var _textBuilt:Boolean = false;
@@ -257,7 +257,7 @@ package
          var display:Array = []; this._displayMap = [];
          var active:Array = [], completed:Array = [];
          var n:int = qs != null ? qs.length : 0; if (n > 600) { n = 600; }   // hard cap
-         for (var i:int = 0; i < n; i++) { if (qs[i] != null && qs[i].isCompleted == true) { completed.push(i); } else { active.push(i); } }
+         for (var i:int = 0; i < n; i++) { if (qs[i] != null && (qs[i].isCompleted == true || qs[i].completed == true)) { completed.push(i); } else { active.push(i); } }   // 0.0.58: accept both field spellings
          for each (var ai:int in active) { display.push({ q: ai, e: qs[ai] }); this._displayMap.push(ai); }
          if (completed.length > 0)
          {
@@ -271,7 +271,7 @@ package
       {
          if (e != null && e.separator == true) { return { separator:true, label:"COMPLETED" }; }
          var q:Object = (e != null) ? e.e : null;
-         var done:Boolean = (q != null && q.isCompleted == true);
+         var done:Boolean = (q != null && (q.isCompleted == true || q.completed == true));   // 0.0.58: accept both field spellings
          // Every quest shows a STATUS under the column header: DONE (completed), TRACKED (player-tracked),
          // else ACTIVE. Answers the 0.0.40 "none of the quests have statuses" note; the column is never blank.
          var status:String = done ? "DONE" : ((q != null && q.isTracked == true) ? "TRACKED" : "ACTIVE");

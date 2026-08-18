@@ -470,7 +470,7 @@ package
          this.buildInspect();   // pooled fullscreen inspect overlay (topmost page child; hidden until activated)
          // 0.0.57: per-page keybar RESTORED (exonerated -- the radio/data CTDs were the font-donor unload, fixed
          // by the chrome page-def preloader). Vanilla hint bar is now hidden persistently by the chrome.
-         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"R",label:"INSPECT"},{key:"X",label:"DROP"},{key:"C",label:"CYCLE DAMAGE"},{key:"Q",label:"FAV"},{key:"Z",label:"SORT"},{key:"E",label:"EXPAND"},{key:"T",label:"PERK CHART"}], Theme.my(858));
+         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"R",label:"INSPECT"},{key:"X",label:"DROP"},{key:"C",label:"CYCLE DAMAGE"},{key:"Q",label:"FAV"},{key:"Z",label:"SORT"},{key:"E",label:"EXPAND"},{key:"T",label:"PERK CHART"}], Theme.my(830));   // 0.0.58: raised (was clipped at the frame bottom edge)
          // NOTE (0.0.47): the per-page custom keybar was REMOVED. The vanilla shell's button-hint bar is still
          // visible in game and already shows the correct per-page prompts (incl. the dynamic T "LEVEL UP (n)" /
          // perk-chart state), so our own bar just duplicated it. Restyling/repositioning the vanilla bar to the

@@ -697,9 +697,12 @@ package pipos
                   Theme.life("MD.heal");
                   this._medicRedisp = 0;
                }
-               // 0.0.57: persistently hide the VANILLA button-hint bar (the medic's SetButtonHintData and every
-               // normal page load re-show it; the mockup uses our own per-page keybar instead). Idempotent writes.
-               try { this._menu.ButtonHintBar_mc.alpha = 0; this._menu.ButtonHintBar_mc.mouseEnabled = false; this._menu.ButtonHintBar_mc.mouseChildren = false; } catch (em8:*) {}
+               // 0.0.58: banish the VANILLA button-hint bar OFF-SCREEN (alpha=0 alone did not stick in the field --
+               // the bar's own redraw path re-shows it; a position write survives redraws). Idempotent per tick.
+               try {
+                  var vb:* = this._menu.ButtonHintBar_mc;
+                  if (vb != null) { vb.y = 4000; vb.visible = false; vb.alpha = 0; vb.mouseEnabled = false; vb.mouseChildren = false; }
+               } catch (em8:*) {}
                // If the flag stayed stuck, the shell can't pump events; substitute a full-mask re-dispatch every
                // 0.5s -- and IMMEDIATELY when the native page/tab changes (0.0.57: makes sub-tab clicks feel
                // instant instead of waiting for the next 0.5s beat).

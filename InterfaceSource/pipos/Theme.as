@@ -384,6 +384,20 @@ package pipos
          g.lineStyle();
       }
 
+      // 0.0.58 ARTIFACT-PROOF RECT OUTLINE: four FILLED 1px rects instead of a lineStyle stroke. In-game GFx
+      // emits stray segments from the stale pen position into stroked primitives (the diagonal-line artifacts;
+      // Ruffle never reproduces it, and even pen-parking moveTo did not fully kill it in the field). Fills never
+      // touch the line-pen path, so this cannot stray. Use on any REDRAWN-per-render outline.
+      public static function frameRect(g:Graphics, x:Number, y:Number, w:Number, h:Number, color:uint, alpha:Number, th:Number = 1):void
+      {
+         g.beginFill(color, alpha);
+         g.drawRect(x, y, w, th);                 // top
+         g.drawRect(x, y + h - th, w, th);        // bottom
+         g.drawRect(x, y + th, th, h - 2 * th);   // left
+         g.drawRect(x + w - th, y + th, th, h - 2 * th);   // right
+         g.endFill();
+      }
+
       // Bottom button-prompt bar (mockup .keybar), PER PAGE. Each page passes ONLY the prompts wired to its own
       // real actions (its BSButtonHintData set) + a universal ESC BACK, so no page shows a dead/foreign prompt
       // ("every element has purpose"). entries = Array of { key:String, label:String }. Builds a self-contained
@@ -403,7 +417,9 @@ package pipos
             x = lt.x + lt.width + space;
          }
          var totalW:Number = x - space;   // drop the trailing inter-entry gap
-         bar.x = (CX + CR) / 2 - totalW / 2;
+         // 0.0.58: 15% larger for readability (container transform -- crash-law-safe), centered on scaled width.
+         bar.scaleX = 1.15; bar.scaleY = 1.15;
+         bar.x = (CX + CR) / 2 - (totalW * 1.15) / 2;
          bar.y = yTop;
          return bar;
       }

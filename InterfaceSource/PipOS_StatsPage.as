@@ -228,7 +228,7 @@ package
          if (this._list != null && stage != null) { this._list.render(); }
          // Per-page bottom keybar: only STAT's wired actions (STIMPAK / RADAWAY / figure toggle) + ESC BACK.
          // 0.0.57: keybar restored (see InvPage note).
-         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"E",label:"STIMPAK"},{key:"R",label:"RADAWAY"},{key:"V",label:"VAULT BOY"},{key:"T",label:"PERK CHART"}], Theme.my(858));
+         Theme.keybar(this, [{key:"ESC",label:"BACK"},{key:"E",label:"STIMPAK"},{key:"R",label:"RADAWAY"},{key:"V",label:"VAULT BOY"},{key:"T",label:"PERK CHART"}], Theme.my(830));   // 0.0.58: raised (was clipped at the frame bottom edge)
          Theme.life("ST.t1");   // buildText completed
       }
 
@@ -369,7 +369,7 @@ package
          Theme.setText(this._lvNum, String(d.XPLevel));
          var g:* = this._levelBox.graphics; g.clear();
          var bx:Number = 66, bw:Number = 184 - 66, by:Number = 4;
-         g.lineStyle(1, Theme.PHOS, 0.5); g.moveTo(bx, by); g.drawRoundRect(bx, by, bw, 9, 3, 3); g.lineStyle();
+         Theme.frameRect(g, bx, by, bw, 9, Theme.PHOS, 0.5);
          g.beginFill(0x000000, 0.4); g.drawRoundRect(bx + 1, by + 1, bw - 2, 7, 2, 2); g.endFill();
          g.beginFill(Theme.PHOS, 0.9); g.drawRoundRect(bx + 1, by + 1, (bw - 2) * Math.max(0, Math.min(1, d.XPProgressPct)), 7, 2, 2); g.endFill();
       }
@@ -387,11 +387,11 @@ package
          for (var mi:int = 0; mi < 3; mi++) {
             var my0:Number = Theme.BY + mi * METER_PITCH;
             mg.beginFill(Theme.PANEL, 0.5); mg.drawRoundRect(Theme.CX, my0, LEFTW, METER_H, 6, 6); mg.endFill();
-            mg.lineStyle(1, Theme.LINE, 0.3); mg.moveTo(Theme.CX + 0.5, my0 + 0.5); mg.drawRoundRect(Theme.CX + 0.5, my0 + 0.5, LEFTW - 1, METER_H - 1, 6, 6); mg.lineStyle();   // 0.0.57: moveTo parks the pen (GFx draws a stray segment from the stale pen position into stroked rects -- the diagonal-line artifact)
+            Theme.frameRect(mg, Theme.CX, my0, LEFTW, METER_H, Theme.LINE, 0.3);   // 0.0.58: filled frame (stroke strays in GFx)
             Theme.setText(this._mVal[mi], String(mStr[mi]));
             var barY:Number = my0 + 28, bx:Number = Theme.CX + 12, bw:Number = LEFTW - 24;
             var frac:Number = (Number(mMax[mi]) > 0) ? (Number(mCur[mi]) / Number(mMax[mi])) : 0; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-            mg.lineStyle(1, uint(mCol[mi]), 0.5); mg.moveTo(bx, barY); mg.drawRoundRect(bx, barY, bw, 8, 2, 2); mg.lineStyle();
+            Theme.frameRect(mg, bx, barY, bw, 8, uint(mCol[mi]), 0.5);
             mg.beginFill(0x000000, 0.4); mg.drawRoundRect(bx + 1, barY + 1, bw - 2, 6, 2, 2); mg.endFill();
             mg.beginFill(uint(mCol[mi]), 0.9); mg.drawRoundRect(bx + 1, barY + 1, (bw - 2) * frac, 6, 2, 2); mg.endFill();
          }
@@ -403,7 +403,7 @@ package
          for (var s:int = 0; s < 7; s++) {
             var tx:Number = tileX0 + s * (TILE_W + TILE_GAP);
             sg.beginFill(Theme.PANEL, 0.5); sg.drawRoundRect(tx, tileY, TILE_W, TILE_H, 5, 5); sg.endFill();
-            sg.lineStyle(1, Theme.LINE, 0.4); sg.moveTo(tx + 0.5, tileY + 0.5); sg.drawRoundRect(tx + 0.5, tileY + 0.5, TILE_W - 1, TILE_H - 1, 5, 5); sg.lineStyle();
+            Theme.frameRect(sg, tx, tileY, TILE_W, TILE_H, Theme.LINE, 0.4);
             var val:String = (sp != null && s < sp.length && sp[s] != null && sp[s].value != null) ? String(sp[s].value) : "-";
             Theme.setText(this._spVal[s], val);
          }
@@ -422,11 +422,11 @@ package
             lg.beginFill(Theme.PHOS_DIM, 0.9); lg.drawCircle(tx2, ty2, 2); lg.endFill();
             // chip
             lg.beginFill(Theme.PANEL, 0.9); lg.drawRoundRect(cx - CHIPW / 2, cy - CHIPH / 2, CHIPW, CHIPH, 5, 5); lg.endFill();
-            lg.lineStyle(1, sev, 0.75); lg.moveTo(cx - CHIPW / 2, cy - CHIPH / 2); lg.drawRoundRect(cx - CHIPW / 2, cy - CHIPH / 2, CHIPW, CHIPH, 5, 5); lg.lineStyle();
+            Theme.frameRect(lg, cx - CHIPW / 2, cy - CHIPH / 2, CHIPW, CHIPH, sev, 0.75);
             (this._limbName[i] as TextField).textColor = sev;
             // condition bar under the name
             var lbx:Number = cx - CHIPW / 2 + 7, lbw:Number = CHIPW - 14, lby:Number = cy + CHIPH / 2 - 8;
-            lg.lineStyle(1, sev, 0.4); lg.moveTo(lbx, lby); lg.drawRoundRect(lbx, lby, lbw, 4, 1, 1); lg.lineStyle();
+            Theme.frameRect(lg, lbx, lby, lbw, 4, sev, 0.4);
             var lc:Number = Math.max(0, Math.min(1, cond));
             lg.beginFill(sev, 0.9); lg.drawRoundRect(lbx + 1, lby + 1, (lbw - 2) * lc, 2, 1, 1); lg.endFill();
          }
@@ -437,8 +437,8 @@ package
          var efW:Number = (Theme.CR - EFX);
          var eg:* = this._effects.graphics; eg.clear();
          eg.beginFill(Theme.PANEL, 0.82); eg.drawRoundRect(0, 0, efW, panelH, 8, 8); eg.endFill();
-         eg.lineStyle(1, Theme.LINE, 0.38); eg.moveTo(0.5, 0.5); eg.drawRoundRect(0.5, 0.5, efW - 1, panelH - 1, 8, 8); eg.lineStyle();
-         eg.lineStyle(1, Theme.LINE, 0.2); eg.moveTo(P, P + 40); eg.lineTo(efW - P, P + 40); eg.lineStyle();
+         Theme.frameRect(eg, 0, 0, efW, panelH, Theme.LINE, 0.38);
+         eg.beginFill(Theme.LINE, 0.2); eg.drawRect(P, P + 40, efW - 2 * P, 1); eg.endFill();
          for (var f:int = 0; f < EF_ROWS; f++) {
             var show:Boolean = (f < count && fx[f] != null);
             (this._efRowL[f] as TextField).visible = show;
@@ -470,8 +470,19 @@ package
       private function doToggleFigure():void { this._showVaultBoy = !this._showVaultBoy; this._vbtn.ButtonText = this._showVaultBoy ? "CHARACTER" : "VAULT BOY"; this.sfx("UIMenuPrevNext"); if (this._lastData != null && this._curTab == 0) { this.renderStatus(this._lastData); } }
       private function onLimbClick(e:MouseEvent):void { this.doStim(); }
 
-      private function onPageStage(e:Event):void { Theme.life("ST.s"); this.ensureText(); if (this._vb != null) { this._vb.begin(); } if (stage != null) { stage.addEventListener(KeyboardEvent.KEY_DOWN, this.onKey); } }
-      private function onPageUnstage(e:Event):void { if (stage != null) { stage.removeEventListener(KeyboardEvent.KEY_DOWN, this.onKey); } }
+      private function onPageStage(e:Event):void { Theme.life("ST.s"); this.ensureText(); if (this._vb != null) { this._vb.begin(); } if (stage != null) { stage.addEventListener(KeyboardEvent.KEY_DOWN, this.onKey); stage.addEventListener(MouseEvent.MOUSE_DOWN, this.onClickProbe); } }
+      // 0.0.58 CLICK FORENSICS: sub-tab buttons report as unclickable in game; log the first few stage-level click
+      // targets into the life trail so the next log names whatever display object is actually swallowing the clicks.
+      private var _probeN:int = 0;
+      private function onClickProbe(e:MouseEvent):void
+      {
+         if (this._probeN >= 6) { return; }
+         this._probeN++;
+         var nm:String = "?";
+         try { nm = (e.target != null && e.target.name != null) ? String(e.target.name) : String(e.target); } catch (ep:*) {}
+         Theme.life("CK." + nm);
+      }
+      private function onPageUnstage(e:Event):void { if (stage != null) { stage.removeEventListener(KeyboardEvent.KEY_DOWN, this.onKey); stage.removeEventListener(MouseEvent.MOUSE_DOWN, this.onClickProbe); } }
 
       private function onKey(e:KeyboardEvent):void {
          if (this._dbg != null) {
