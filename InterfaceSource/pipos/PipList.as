@@ -477,6 +477,9 @@ package pipos
             var gy:Number = y + this._rowH / 2 - 1;
             var mg:* = this._markers.graphics;
             var isColsRow:Boolean = (slot.cols != null && a.cols != null);
+            // 0.0.63: EQUIPPED indicator -- a bright accent bar on the row's LEFT edge (distinct from the faint
+            // hover fill and the selection brackets). Marks the currently worn/wielded item in the list.
+            if (a.equipped == true) { mg.beginFill(isSel ? 0x0A140A : Theme.PHOS_BRIGHT, 0.95); mg.drawRect(0, y + 2, 2.5, this._rowH - 5); mg.endFill(); }
             if (isColsRow) {
                // legendary sparkle sits in the ~12px left padding, slightly preceding the name (mockup look).
                if (a.legendary) { Theme.legendaryMark(mg, 6, gy, 5, isSel ? 0x0A140A : Theme.WARN); }   // 0.0.60: diamond, not a second star

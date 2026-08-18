@@ -715,7 +715,20 @@ package
          var cols:Array = [nm, a, w, v];
          // P2-C: star == favorite, EXACTLY as vanilla InvListEntry (param1.favorite > 0). legendary mirrors
          // vanilla LegendaryIcon (param1.isLegendary). Both are the ground-truth vanilla rules, not guesses.
-         return { cols: cols, star:(e.favorite > 0), legendary:(e.isLegendary == true), dim:false };
+         // 0.0.63: equipped indicator -- InvItems rows carry equipState (0 = not equipped; the backtick dump
+         // confirmed it). Non-zero => currently worn/wielded; PipList draws a bright left-edge accent bar.
+         var eqp:Boolean = (e.equipState != null && int(e.equipState) != 0);
+         return { cols: cols, star:(e.favorite > 0), legendary:(e.isLegendary == true), equipped:eqp, dim:false };
+      }
+      // 0.0.63: canonical unsigned formID key. The ENGINE hands AS the formID as a SIGNED 32-bit int (a mod/ESL
+      // form with the high bit set reads NEGATIVE, e.g. Desert Warrior -32675651), but the DLL keys itemstats/
+      // itemmods with "%u" (unsigned, 4262291645). String(formID) therefore never matched for high-bit forms ->
+      // those weapons showed no DMG/RPM/ammo. uint() wraps the signed value to the same unsigned decimal.
+      private function fidKey(formID:*):String
+      {
+         var n:Number = Number(formID);
+         if (isNaN(n)) { return String(formID); }
+         return String(uint(n));
       }
 
       // ==========================================================================================
@@ -1056,10 +1069,10 @@ package
          }
          var stats:Object = null; var mods:Array = null;
          if (row != null && row.formID != null && this._itemStats != null) {
-            try { stats = this._itemStats[String(row.formID)]; } catch (e1:*) { stats = null; }
+            try { stats = this._itemStats[this.fidKey(row.formID)]; } catch (e1:*) { stats = null; }
          }
          if (row != null && row.formID != null && this._itemMods != null) {
-            try { mods = this._itemMods[String(row.formID)] as Array; } catch (e2:*) { mods = null; }
+            try { mods = this._itemMods[this.fidKey(row.formID)] as Array; } catch (e2:*) { mods = null; }
          }
          var type:String = (stats != null && stats.type != null) ? String(stats.type) : "";
 
@@ -1575,7 +1588,7 @@ package
          if (this._ctxOpen) { return; }   // 0.0.61: the context menu temporarily suppresses the hover box
          var stats:Object = null;
          if (formID != null && String(formID).length > 0 && String(formID) != "0" && this._itemStats != null) {
-            try { stats = this._itemStats[String(formID)]; } catch (e1:*) { stats = null; }
+            try { stats = this._itemStats[this.fidKey(formID)]; } catch (e1:*) { stats = null; }
          }
          var type:String = (stats != null && stats.type != null) ? String(stats.type) : ((hintType != null) ? hintType : "");
          // DISPLAY the tag-stripped clean name; JOIN (tipLinesFor -> PipOS_iteminfo) still uses the RAW `name`.
@@ -1896,8 +1909,8 @@ package
          if (this._insTitle == null) { return; }
          var row:Object = this._selRow;
          var stats:Object = null; var mods:Array = null;
-         if (row != null && row.formID != null && this._itemStats != null) { try { stats = this._itemStats[String(row.formID)]; } catch (e1:*) { stats = null; } }
-         if (row != null && row.formID != null && this._itemMods != null) { try { mods = this._itemMods[String(row.formID)] as Array; } catch (e2:*) { mods = null; } }
+         if (row != null && row.formID != null && this._itemStats != null) { try { stats = this._itemStats[this.fidKey(row.formID)]; } catch (e1:*) { stats = null; } }
+         if (row != null && row.formID != null && this._itemMods != null) { try { mods = this._itemMods[this.fidKey(row.formID)] as Array; } catch (e2:*) { mods = null; } }
          var type:String = (stats != null && stats.type != null) ? String(stats.type) : ((this._curTab == 1) ? "apparel" : "weapon");
 
          Theme.setText(this._insTitle, this.cardName(row)); this._insTitle.visible = true;
