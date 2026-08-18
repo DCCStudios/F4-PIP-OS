@@ -1203,37 +1203,19 @@ namespace PipOS
         };
     }
 
-    // 0.0.60: equipment live-refresh driver. Called once per frame from CharacterCapture's main-thread task
-    // while the Pip-Boy is open; every ~30th call re-pushes root1.PipOS_equip via a UI task (quiet -- no log
-    // spam), so equipping from the inventory list updates the EQUIPMENT panel within ~half a second.
-    // 0.0.62: right-click forwarder. GFx does not deliver RIGHT_MOUSE_DOWN to the movie in this runtime
-    // (0.0.61 log: the AS breadcrumb IV.rc never fired), so we poll the physical right mouse button here (this
-    // runs on the game main thread, once per frame while the Pip-Boy is open) and bump root1.PipOS_rclickN on
-    // each PRESS edge. The AS side (InvPage.onCharPoll) reads the counter and opens the context menu at the
-    // hovered row. The Pip-Boy ignores right-click natively (it never closed on right-click in the field), so
-    // there is nothing to suppress.
-    // Forward-declare the one Win32 API we need (avoids pulling <Windows.h> and its min/max/other macros into
-    // this TU). VK_RBUTTON == 0x02; the high bit of the return marks the key currently down.
-    extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int a_vKey);
-
-    void PollRightClick()
+    // 0.0.68 RIGHT-CLICK VIA THE GAME'S OWN INPUT CHAIN. Field-proven history: GFx never delivers
+    // RIGHT_MOUSE_DOWN to the movie (0.0.61, IV.rc=0) AND GetAsyncKeyState never sees the RMB in FO4's
+    // raw-input runtime (0.0.65-0.0.67: "[RC] poll active" printed, zero press edges). So we hook where the
+    // click PROVABLY arrives: UI::PerformInputProcessing (BSInputEventReceiver vtable slot 0 -- the same
+    // receiver-hook technique that fixed the F4SE Menu Framework's input dispatch). The chain carries mouse
+    // ButtonEvents (left-clicks reach Scaleform through this very path); we watch for device kMouse,
+    // idCode 1 (right button), just-pressed, while the Pip-Boy is open, and bump root1.PipOS_rclickN via a
+    // UI task. Observe-only: the original PerformInputProcessing always runs first, nothing is swallowed.
+    void BumpRclickCounter()
     {
-        // 0.0.65 DIAGNOSTIC: 0.0.62-0.0.64 forwarding never fired (log IV.rc=0). Confirm (a) this poll runs while
-        // the Pip-Boy is open and (b) whether GetAsyncKeyState actually SEES the right button in this runtime
-        // (FO4 uses raw/DirectInput -- GetAsyncKeyState may not report mouse buttons). One-time heartbeat + an
-        // edge log settle it: if [RC] poll active prints but no [RC] edge ever does, GetAsyncKeyState is blind to
-        // the RMB and we must switch to an input hook / the game's own mouse state.
-        static bool s_heartbeat = false;
-        if (!s_heartbeat) { s_heartbeat = true; logger::info("[PipOS][RC] right-click poll active (frame task running while Pip-Boy open)"); }
-
-        static bool s_prevDown = false;
-        const bool down = (GetAsyncKeyState(0x02) & 0x8000) != 0;
-        const bool edge = down && !s_prevDown;
-        s_prevDown = down;
-        if (!edge) { return; }
         static std::uint32_t s_seq = 0;
         const std::uint32_t seq = ++s_seq;
-        logger::info("[PipOS][RC] right-button PRESS edge #{} detected -> bumping root1.PipOS_rclickN", seq);
+        logger::info("[PipOS][RC] right-button press seen in UI input chain (#{}) -> bumping root1.PipOS_rclickN", seq);
         if (auto* task = F4SE::GetTaskInterface()) {
             task->AddUITask([seq]() {
                 if (auto* ui = RE::UI::GetSingleton()) {
@@ -1247,6 +1229,35 @@ namespace PipOS
                 }
             });
         }
+    }
+
+    struct UIInputHook
+    {
+        static void thunk(RE::UI* a_this, const RE::InputEvent* a_head)
+        {
+            func(a_this, a_head);   // the engine's processing ALWAYS runs, untouched
+            if (!a_this || !a_head) { return; }
+            if (!a_this->GetMenu(kPipboyMenu)) { return; }   // observe only while the Pip-Boy is open
+            for (const auto* e = a_head; e; e = e->next) {
+                const auto* be = e->As<RE::ButtonEvent>();
+                if (!be) { continue; }
+                if (be->device.get() != RE::INPUT_DEVICE::kMouse) { continue; }
+                if (be->idCode != 1) { continue; }   // mouse idCode 1 == right button
+                if (!be->QJustPressed()) { continue; }
+                BumpRclickCounter();
+            }
+        }
+        static inline REL::Relocation<decltype(&thunk)> func;
+    };
+
+    void InstallRightClickHook()
+    {
+        static bool s_installed = false;
+        if (s_installed) { return; }
+        s_installed = true;
+        REL::Relocation<std::uintptr_t> vtbl{ RE::VTABLE::UI[0] };
+        UIInputHook::func = vtbl.write_vfunc(0, UIInputHook::thunk);
+        logger::info("[PipOS][RC] UI::PerformInputProcessing vfunc hook installed (right-click observer)");
     }
 
     // 0.0.65: read the dedicated drop diagnostic (root1.PipOS_droplog) and log it on change -- bypasses the AS
@@ -1291,6 +1302,7 @@ namespace PipOS
 
     bool PipboyBridge::Install()
     {
+        InstallRightClickHook();   // 0.0.68: right-click observer on UI's input receiver
         static MenuSink sink;
         auto* ui = RE::UI::GetSingleton();
         if (!ui) {

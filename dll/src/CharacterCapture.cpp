@@ -773,6 +773,63 @@ namespace PipOS
             g_available.store(true);
         }
 
+        // 0.0.68 GROUND-TRUTH RENDERER DIFF. The red-RT test proved our fully-configured renderer NEVER
+        // composites inside the Pip-Boy (no red block even at kStandard3DModel + alwaysRenderWhenEnabled),
+        // while the VANILLA item preview provably composites in the same menu. Its Inventory3DManager names
+        // its renderer (PipboyManager->inv3DModelManager.str3DRendererName); dump that live renderer's full
+        // config next to ours ONCE each so the next log carries the exact working-vs-broken field diff --
+        // no more hypothesis-driven probing. Main-thread only (called from RunCaptureTask).
+        void DumpOneRenderer(const char* a_tag, RE::Interface3D::Renderer* a_r)
+        {
+            if (!a_r) { return; }
+            logger::info(
+                "[PipOS][3DDIAG] {}: name='{}' depth={} enabled={} offscr3D={} alwaysRender={} defRenderMain={} "
+                "screenmode={} omsize={} postfx={} bgmode={} menuBlend={} postAA={} fullPremult={} usePremult={} "
+                "clearRT={} hideWhenDisabled={} longRange={} enableAO={} geom='{}' mat='{}' maskGeom='{}' "
+                "customRT={} customSwap={} opacity={} mainLights={} offLights={} offscreenElement={} screenRoot={} "
+                "displayGeom={}",
+                a_tag, a_r->name.c_str(),
+                static_cast<int>(a_r->depth.get()), a_r->enabled, a_r->offscreen3DEnabled,
+                a_r->alwaysRenderWhenEnabled, a_r->defRenderMainScreen,
+                static_cast<int>(a_r->screenmode.get()), static_cast<int>(a_r->omsize.get()),
+                static_cast<int>(a_r->postfx.get()), static_cast<int>(a_r->bgmode.get()),
+                static_cast<int>(a_r->menuBlend.get()), a_r->postAA, a_r->useFullPremultAlpha,
+                a_r->usePremultAlpha, a_r->clearRenderTarget, a_r->hideScreenWhenDisabled,
+                a_r->useLongRangeCamera, a_r->enableAO,
+                a_r->screenGeomName.c_str() ? a_r->screenGeomName.c_str() : "",
+                a_r->screenMaterialName.c_str() ? a_r->screenMaterialName.c_str() : "",
+                a_r->maskedGeomName.c_str() ? a_r->maskedGeomName.c_str() : "",
+                a_r->customRenderTarget, a_r->customSwapTarget, a_r->opacityAlpha,
+                a_r->mainLights.size(), a_r->offscreenLights.size(),
+                a_r->offscreenElement != nullptr, a_r->screenAttachedElementRoot != nullptr,
+                a_r->displayGeometry.size());
+        }
+
+        void DumpRendererDiag()
+        {
+            static bool s_oursDumped = false;
+            static bool s_vanillaDumped = false;
+            if (s_oursDumped && s_vanillaDumped) { return; }
+            if (!s_oursDumped && g_renderer) {
+                s_oursDumped = true;
+                DumpOneRenderer("OURS(PipOS_Char3D)", g_renderer);
+            }
+            if (!s_vanillaDumped) {
+                // The vanilla preview renderer exists only after the user selects an item (updateItem3D ->
+                // Begin3D); keep checking until it appears, then dump once. NOTE the name itself is also gold.
+                if (auto* pm = RE::PipboyManager::GetSingleton()) {
+                    const auto& nm = pm->inv3DModelManager.str3DRendererName;
+                    if (nm.c_str() && nm.c_str()[0] != '\0') {
+                        if (auto* vr = RE::Interface3D::Renderer::GetByName(nm)) {
+                            s_vanillaDumped = true;
+                            logger::info("[PipOS][3DDIAG] vanilla item-preview renderer name='{}'", nm.c_str());
+                            DumpOneRenderer("VANILLA(item-preview)", vr);
+                        }
+                    }
+                }
+            }
+        }
+
         // MAIN-THREAD task body: the entire build/attach/idle/teardown pass. Scheduled from the hook via
         // AddTask; F4SE drains it serially on the game main thread. Re-pushes the AS3 contract whenever the
         // "clone is live" availability flips, so the AS3 side learns when the capture actually goes live.
@@ -790,8 +847,8 @@ namespace PipOS
             }
             // 0.0.60: piggyback the equipment live-refresh on this main-thread pass (runs while the Pip-Boy is
             // open regardless of bLive3D -- Tick() early-outs but this line still fires). Rate-limited inside.
-            // 0.0.62: also poll the right mouse button here (forwards right-click to the AS context menu).
-            if (g_pipboyOpen.load()) { RepushEquipmentPeriodic(); PollRightClick(); ReadDropLog(); }
+            // 0.0.68: right-click moved to the UI input-receiver vfunc hook (GetAsyncKeyState was blind to it).
+            if (g_pipboyOpen.load()) { RepushEquipmentPeriodic(); ReadDropLog(); DumpRendererDiag(); }
         }
 
         // WORKER-THREAD-SAFE hook body: on this fork RunActorUpdates fires on BSMTAManager / HighFPSPhysics
