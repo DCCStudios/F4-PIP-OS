@@ -369,6 +369,17 @@ namespace PipOS
             g_renderer->customRenderTarget = -1;
             g_renderer->customSwapTarget = -1;
 
+            // 0.0.66 RED-RT BISECTION DIAGNOSTIC (TEMPORARY -- revert next build). The fade-node fix engaged
+            // (log: "re-owned N shader properties") yet the figure slot is still empty, so the fault is either the
+            // model not landing in-frame OR the offscreen RT never compositing to screen. Clear the RT to opaque
+            // RED every frame: if the figure slot shows a RED block -> compositing/quad/clipRect all work and the
+            // fault is purely the model subtree (framing/in-frame); if it stays BLACK -> the offscreen RT is not
+            // being composited (quad/RT wiring) and that is where to look next. This tints the live figure, so it
+            // MUST be reverted before release (never written to the user's INI).
+            g_renderer->Offscreen_SetClearRenderTarget(true);
+            g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 1.0f, 0.0f, 0.0f, 1.0f });
+            logger::info("[PipOS][3D] RED-RT DIAGNOSTIC active: figure slot should show a RED block if compositing works");
+
             logger::info("[PipOS][3D] Interface3D renderer '{}' configured (offscreen RT={}x{})",
                 kRendererName,
                 g_renderer->Offscreen_GetRenderTargetWidth(),
