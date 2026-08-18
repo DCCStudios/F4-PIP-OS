@@ -56,13 +56,13 @@ namespace PipOS
     {
         constexpr auto kRendererName = "PipOS_Char3D";
         constexpr auto kDisplayMeshPath = "Interface/GunModMenu/ModMenuRenderMesh.nif";
-        // 0.0.69: display quad switched from the ModMenu mesh to the SAME glass mesh the provably-working
-        // vanilla Pip-Boy item preview uses ([3DDIAG] ground truth: geom='HUDGlassFlat:0',
-        // mat='Materials\Interface\HUDGlassFlat.BGEM', mask='HUDShadowFlat:0'). One constant feeds
-        // SetDisplayMode AND the clip-rect reshaping lookups.
-        constexpr auto kDisplayMeshGeometry = "HUDGlassFlat:0";
-        constexpr auto kDisplayMeshMaterial = "Materials\\Interface\\HUDGlassFlat.BGEM";
-        constexpr auto kDisplayMaskGeometry = "HUDShadowFlat:0";
+        // 0.0.70: BACK to the ModMenu display mesh. 0.0.69's switch to the vanilla preview's HUDGlassFlat:0
+        // was OVER-mirroring: the engine auto-creates a display quad only for the ModMenu mesh name (0.0.66-68
+        // field-proven -- the red RT composited through it and clipRect reshaping found it), while HUDGlassFlat
+        // is a NIF the PIPBOY MACHINERY attaches to ITS renderer itself -- for ours it never appeared
+        // ("clipRect skipped: display geometry not ready", nothing composited at all). The one config field that
+        // actually mattered from the [3DDIAG] diff is the DEPTH (15/kMessage, kept in ConfigureRenderer).
+        constexpr auto kDisplayMeshGeometry = "ModMenuRenderMesh:0";
         constexpr float kDisplayRootY = 375.0f;
         constexpr float kPi = 3.14159265358979323846f;
         constexpr std::string_view kPipboyMenu = "PipboyMenu"sv;
@@ -383,17 +383,20 @@ namespace PipOS
             // character sits at Char3DDistance~200 game units; the item preview's short-range camera could clip it).
             // RED-RT test REVERTED (it proved compositing works AND leaked into the vanilla preview's shared
             // default RT -- the fullscreen red examine view): clear stays on, background back to transparent.
+            // 0.0.70: the WORKING COMBINATION -- the 0.0.66-68 quad pipeline (ModMenuRenderMesh + kModMenu +
+            // TF3DHUD alpha flags: FIELD-PROVEN to composite, it carried the red block) at the 0.0.69 depth
+            // (kMessage 15, [3DDIAG]-proven to layer ABOVE the fullscreen menu). 0.0.69's extra mirroring of the
+            // vanilla quad/material/mask is reverted -- it killed the engine-auto-created display quad entirely.
             g_renderer->MainScreen_SetBackgroundMode(RE::Interface3D::BackgroundMode::kLive);
-            g_renderer->useFullPremultAlpha = false;
-            g_renderer->hideScreenWhenDisabled = true;
+            g_renderer->useFullPremultAlpha = true;
             g_renderer->MainScreen_SetPostAA(true);
             g_renderer->Offscreen_Enable3D(true);
             g_renderer->Offscreen_SetUseLongRangeCamera(true);
             g_renderer->Offscreen_SetRenderTargetSize(RE::Interface3D::OffscreenMenuSize::kFullFrame);
             g_renderer->Offscreen_SetDisplayMode(
-                RE::Interface3D::ScreenMode::kScreenAttached, kDisplayMeshGeometry, kDisplayMeshMaterial);
-            g_renderer->MainScreen_EnableScreenAttached3DMasking(kDisplayMaskGeometry, nullptr);
-            g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kHUDGlass);
+                RE::Interface3D::ScreenMode::kScreenAttached, kDisplayMeshGeometry, nullptr);
+            g_renderer->MainScreen_EnableScreenAttached3DMasking(nullptr, nullptr);
+            g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kModMenu);
             g_renderer->customRenderTarget = -1;
             g_renderer->customSwapTarget = -1;
             g_renderer->Offscreen_SetClearRenderTarget(true);
