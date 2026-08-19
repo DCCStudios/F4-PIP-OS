@@ -282,6 +282,24 @@ namespace PipOS
             func(a_object);
         }
 
+        // 0.0.74: whole-tree name search -- the FINAL bone-resolution fallback. 0.0.73's field counters
+        // (102 rebound / 229 UNRESOLVED) proved most skin bones are NOT in the flattened tree: weapon nodes,
+        // attach points and helper bones are ordinary NiNodes elsewhere in the skeleton. TF3DHUD resolves
+        // against BOTH indexes (its CollectNamedNodes map covers the whole tree); this is our equivalent.
+        RE::NiAVObject* FindNodeByNameRecursive(RE::NiAVObject* a_root, const RE::BSFixedString& a_name)
+        {
+            if (!a_root) { return nullptr; }
+            if (a_root->name == a_name) { return a_root; }
+            if (auto* node = netimmerse_cast<RE::NiNode*>(a_root)) {
+                for (auto& child : node->children) {
+                    if (child) {
+                        if (auto* found = FindNodeByNameRecursive(child.get(), a_name)) { return found; }
+                    }
+                }
+            }
+            return nullptr;
+        }
+
         int RebindClonedSkins(RE::NiAVObject& a_root, RE::NiAVObject* a_source)
         {
             // AUDIT F1 (required): the clone's flattened tree carries the SAME unremapped-pointer disease --
@@ -307,7 +325,7 @@ namespace PipOS
                 });
             }
 
-            int boundBones = 0, geoms = 0, sharedSkipped = 0, unresolved = 0;
+            int boundBones = 0, geoms = 0, sharedSkipped = 0, unresolved = 0, viaTree = 0;
             ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
                 auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object));
                 if (!geometry) { return; }
@@ -328,6 +346,14 @@ namespace PipOS
                             dstBone = fb->node.get();
                         }
                     }
+                    if (!dstBone) {
+                        // 0.0.74: FINAL fallback -- the whole clone tree. 0.0.73 field counters (229/331
+                        // unresolved) proved most skin bones live OUTSIDE the flattened tree as ordinary nodes
+                        // (weapon/attach/helper bones); TF3DHUD's CollectNamedNodes map covers exactly these.
+                        if (auto* wt = FindNodeByNameRecursive(std::addressof(a_root), srcBone->GetName())) {
+                            dstBone = wt; ++viaTree;
+                        }
+                    }
                     if (dstBone) { skin->bones[i] = dstBone; ++boundBones; }
                     else { ++unresolved; }
                     if (!skin->worldTransforms.empty()) {
@@ -340,8 +366,8 @@ namespace PipOS
                 ++geoms;
             });
             // AUDIT F3: honest field signal -- bones actually rebound, not just geometries touched.
-            logger::info("[PipOS][3D] skin rebind: {} bones rebound across {} geometries ({} shared-with-source skipped, {} unresolved)",
-                boundBones, geoms, sharedSkipped, unresolved);
+            logger::info("[PipOS][3D] skin rebind: {} bones rebound ({} via whole-tree search) across {} geometries ({} shared-with-source skipped, {} unresolved)",
+                boundBones, viaTree, geoms, sharedSkipped, unresolved);
             return boundBones;
         }
 
