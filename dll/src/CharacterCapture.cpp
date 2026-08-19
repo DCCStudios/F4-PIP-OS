@@ -1,6 +1,7 @@
 #include "PCH.h"
 #include "CharacterCapture.h"
 #include "PipboyBridge.h"
+#include "RE_BSSkin.h"   // 0.0.73: full BSSkin::Instance layout (TF3DHUD, offset-asserted) -- the fork only forward-declares it
 #include "Settings.h"
 #include "Scaleform/G/GFx_ASMovieRootBase.h"
 
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <unordered_set>
 #include <vector>
 
 // =====================================================================================================
@@ -261,8 +263,91 @@ namespace PipOS
             return repaired;
         }
 
+        // ------------------------------------------------------------------ skin rebind (Previewer.cpp)
+        // 0.0.73 THE SKINNED-CLONE FIX. Field-proven elimination: our clone in the ENABLED vanilla weapon-preview
+        // renderer still drew nothing -- the fault is the clone. Cause: BSSkin::Instance holds RAW pointers
+        // (bones[] NiAVObject*, worldTransforms[] NiTransform* INTO the skeleton, rootNode) that NiCloningProcess
+        // cannot remap (same disease as the fixed shader fadeNode). So every cloned body mesh still skins against
+        // the SOURCE player's live skeleton and renders at the PLAYER'S world position -- nowhere near the
+        // offscreen camera -> empty picture with valid passes. TF3DHUD treats the rebind as REQUIRED-for-
+        // correctness (Previewer::RebindSkinInstance): re-point each skin's bones/worldTransforms at the target
+        // skeleton BY NAME, set rootNode, zero paletteStamp (forces the GPU skin palette rebuild). Our exact
+        // full-root clone carries its OWN BSFlattenedBoneTree with matching bone names, so we rebind onto that.
+        // Returns the rebound-geometry count (log: >0 = engaged; -1 = no flattened tree found in the clone).
+        // Engine bone-map rebuild (TF3DHUD Address.cpp:102): re-resolves a flattened tree's internal
+        // FlattenedBone::node pointers + its name->bone hash after cloning/structural change. OG 1.10.163 ID.
+        void EngineCreateBoneMap(RE::NiAVObject* a_object)
+        {
+            static REL::Relocation<void (*)(RE::NiAVObject*)> func{ REL::ID(1131947) };
+            func(a_object);
+        }
+
+        int RebindClonedSkins(RE::NiAVObject& a_root, RE::NiAVObject* a_source)
+        {
+            // AUDIT F1 (required): the clone's flattened tree carries the SAME unremapped-pointer disease --
+            // its FlattenedBone::node NiPointers (raw heap array) + boneMap hash still reference the SOURCE
+            // skeleton after cloning, so a name lookup without a rebuild returns null or SOURCE bones. The
+            // engine's CreateBoneMap re-resolves both; TF3DHUD calls it before EVERY rebind, in this exact
+            // root -> flattened -> root order (RefreshPreviewBoneLookup, Previewer.cpp:1251-1263).
+            EngineCreateBoneMap(std::addressof(a_root));
+            auto* flattened = FindFlattenedBoneTree(std::addressof(a_root));   // the CLONE's own skeleton
+            if (!flattened) { return -1; }
+            EngineCreateBoneMap(flattened);
+            EngineCreateBoneMap(std::addressof(a_root));
+
+            // AUDIT F2 (required): NEVER mutate a skin instance the clone SHARES with the live player --
+            // rebinding a shared skin would repoint the real character's body at the clone's skeleton and
+            // dangle when the clone dies (TF3DHUD's sourceSkins guard, Previewer.cpp:1825-1840).
+            std::unordered_set<const void*> sourceSkins;
+            if (a_source) {
+                ForEachAVObject(a_source, [&](RE::NiAVObject& a_object) {
+                    if (auto* g = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object))) {
+                        if (auto* s = g->skinInstance.get()) { sourceSkins.insert(s); }
+                    }
+                });
+            }
+
+            int boundBones = 0, geoms = 0, sharedSkipped = 0, unresolved = 0;
+            ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
+                auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object));
+                if (!geometry) { return; }
+                auto* skin = geometry->skinInstance.get();
+                if (!skin) { return; }
+                if (sourceSkins.find(skin) != sourceSkins.end()) { ++sharedSkipped; return; }   // F2 guard
+                if (skin->bones.empty() || skin->bones.size() > RE::BSSkin::kMaxExpectedBones) { return; }
+                if (!skin->worldTransforms.empty() && skin->worldTransforms.size() != skin->bones.size()) { return; }
+
+                for (std::uint32_t i = 0; i < skin->bones.size(); ++i) {
+                    auto* srcBone = skin->bones[i];
+                    const char* nm = srcBone ? srcBone->GetName().c_str() : nullptr;
+                    if (!nm || nm[0] == '\0') { ++unresolved; continue; }   // AUDIT F4: never look up empty names
+                    RE::NiAVObject* dstBone = flattened->GetObjectByName(srcBone->GetName());
+                    if (!dstBone) {
+                        // AUDIT F3: same linear FlattenedBone fallback the framing helper already uses.
+                        if (auto* fb = FindFlattenedBoneByName(*flattened, std::string_view(nm))) {
+                            dstBone = fb->node.get();
+                        }
+                    }
+                    if (dstBone) { skin->bones[i] = dstBone; ++boundBones; }
+                    else { ++unresolved; }
+                    if (!skin->worldTransforms.empty()) {
+                        auto* t = dstBone ? dstBone : skin->bones[i];
+                        skin->worldTransforms[i] = t ? std::addressof(t->world) : nullptr;
+                    }
+                }
+                skin->rootNode = std::addressof(a_root);
+                skin->paletteStamp = 0;   // force the skin-palette rebuild against the new transforms
+                ++geoms;
+            });
+            // AUDIT F3: honest field signal -- bones actually rebound, not just geometries touched.
+            logger::info("[PipOS][3D] skin rebind: {} bones rebound across {} geometries ({} shared-with-source skipped, {} unresolved)",
+                boundBones, geoms, sharedSkipped, unresolved);
+            return boundBones;
+        }
+
         // ------------------------------------------------------------------ sanitise (PreviewRenderTree.cpp)
-        void SanitizeClone(RE::NiAVObject& a_root)
+        // 0.0.73: a_source = the LIVE tree the clone came from (for the shared-skin guard); may be null.
+        void SanitizeClone(RE::NiAVObject& a_root, RE::NiAVObject* a_source)
         {
             ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
                 a_object.controllers.reset();  // no cloned controllers should drive the offscreen copy
@@ -284,6 +369,11 @@ namespace PipOS
             // Update() propagates the corrected tree (matches TF3DHUD's order).
             const int repaired = RepairShaderFadeNodes(a_root, nullptr);
             logger::info("[PipOS][3D] fade-node repair: re-owned {} shader properties to the clone", repaired);
+
+            // 0.0.73: rebind skinned geometry to the clone's own skeleton, also before the flush Update (matching
+            // TF3DHUD's order: RebindPreviewSkinInstances precedes the final Update). Logs its own counts.
+            const int rebound = RebindClonedSkins(a_root, a_source);
+            if (rebound < 0) { logger::info("[PipOS][3D] skin rebind: NO flattened bone tree found in the clone"); }
 
             RE::NiUpdateData updateData{};
             a_root.Update(updateData);
@@ -720,7 +810,7 @@ namespace PipOS
                 logger::error("[PipOS][3D] player biped clone failed");
                 return false;
             }
-            SanitizeClone(*clone);
+            SanitizeClone(*clone, std::addressof(a_source));
             FrameClone(*clone);
             AttachToRenderer(*clone);
             g_previewRoot = clone;
@@ -824,7 +914,7 @@ namespace PipOS
                 if (!g_previewRoot || g_dirty || g_sourceRoot != source) {
                     auto clone = CloneSubtree(*source);
                     if (!clone) { logger::error("[PipOS][3D] player biped clone failed"); HideAndRelease(); return; }
-                    SanitizeClone(*clone);
+                    SanitizeClone(*clone, source);
                     // AUDIT M1: the item preview's camera is SHORT-RANGE (items sit close); our default 200-unit
                     // distance is likely past its far plane. Cap the framing distance on this path; the in-game
                     // Camera-distance slider still applies below the cap.
