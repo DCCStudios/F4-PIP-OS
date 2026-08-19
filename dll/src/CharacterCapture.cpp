@@ -290,12 +290,15 @@ namespace PipOS
         }
 
         // ------------------------------------------------------------------ framing (PreviewFraming.cpp)
-        void FrameClone(RE::NiAVObject& a_root)
+        // a_distanceCap > 0 clamps the camera distance (0.0.72: the borrowed item-preview camera is short-range;
+        // the own-renderer long-range path passes no cap).
+        void FrameClone(RE::NiAVObject& a_root, float a_distanceCap = 0.0f)
         {
             auto* settings = Settings::GetSingleton();
             const float scale = settings ? settings->Char3DScale() : 0.45f;
             const float yaw = settings ? settings->Char3DYaw() : 160.0f;
-            const float distance = settings ? settings->Char3DDistance() : 200.0f;
+            float distance = settings ? settings->Char3DDistance() : 200.0f;
+            if (a_distanceCap > 0.0f && distance > a_distanceCap) { distance = a_distanceCap; }
             const int target = settings ? settings->Char3DTarget() : 1;
 
             RE::NiTransform transform = RE::NiTransform::IDENTITY;
@@ -726,8 +729,47 @@ namespace PipOS
             return true;
         }
 
+        // ---------------------------------------------------------- 0.0.72 PLAN A.2: the VANILLA renderer
+        // Primary path per the item-preview investigation: borrow the Pip-Boy's OWN 'PipboyScreenModel'
+        // renderer (PipboyManager->inv3DModelManager.str3DRendererName) -- the one object FIELD-PROVEN to draw
+        // 3D models over this exact fullscreen menu (engine-wired HUDGlass quad, forward kHUDGlass composite,
+        // right depth, engine-managed lifecycle). We only borrow its OFFSCREEN SLOT:
+        //   - Offscreen_Set3D(ourClone), but ONLY while the slot is empty or already ours -- a live item
+        //     preview owns the slot and is never fought (we resume when it clears);
+        //   - NEVER Enable/Disable/Release/End3D the vanilla renderer (the manager owns it);
+        //   - one guarded Begin3D() per Pip-Boy open stands the renderer up before any item is selected
+        //     (Begin3D with no queued item is unverified engine-internal -- if it no-ops we retry next pass).
+        bool g_usingVanilla{ false };
+        bool g_weEnabledVanilla{ false };
+
+        RE::Interface3D::Renderer* AcquireVanillaRenderer()
+        {
+            // AUDIT H3: the Begin3D()-on-idle-manager stand-up was REMOVED (engine-internal body could deref the
+            // null itemBase/tempRef of an idle manager = main-thread AV). The renderer therefore only exists
+            // after the user inspects an item once per Pip-Boy session; until then we simply return null and the
+            // caller retries next pass. Documented UX cost, zero crash risk.
+            auto* pm = RE::PipboyManager::GetSingleton();
+            if (!pm) { return nullptr; }
+            const auto& nm = pm->inv3DModelManager.str3DRendererName;
+            if (!nm.c_str() || nm.c_str()[0] == '\0') { return nullptr; }
+            return RE::Interface3D::Renderer::GetByName(nm);
+        }
+
         void HideAndRelease()
         {
+            if (g_usingVanilla) {
+                // Give the borrowed slot back iff it still holds OUR clone, and restore the disabled state we
+                // found it in (tracked symmetric enable, audit H1). Never Release/End3D -- the manager owns it.
+                auto* pm = RE::PipboyManager::GetSingleton();
+                auto* vr = pm ? RE::Interface3D::Renderer::GetByName(pm->inv3DModelManager.str3DRendererName) : nullptr;
+                if (vr && g_previewRoot && vr->offscreenElement.get() == g_previewRoot.get()) {
+                    vr->Offscreen_Set3D(nullptr);
+                    if (g_weEnabledVanilla && vr->enabled) { vr->Disable(); }
+                    logger::info("[PipOS][3D] vanilla renderer slot returned (enable restored={})", g_weEnabledVanilla);
+                }
+                g_usingVanilla = false;
+                g_weEnabledVanilla = false;
+            }
             if (g_renderer) {
                 g_renderer->Offscreen_Set3D(nullptr);
                 if (g_visible || g_renderer->enabled) { g_renderer->Disable(); }
@@ -763,15 +805,73 @@ namespace PipOS
             auto* player = RE::PlayerCharacter::GetSingleton();
             if (!player) { HideAndRelease(); return; }
 
+            auto* source = player->Get3D(false);  // third-person root (carries worn armor + weapon)
+            if (!source) { HideAndRelease(); return; }
+
+            // 0.0.72 VANILLA-FIRST: borrow the PipboyScreenModel offscreen slot (see AcquireVanillaRenderer
+            // note). Our own renderer path below remains the fallback when the vanilla one can't be resolved
+            // (i.e. until the user has inspected one item this Pip-Boy session -- Begin3D stand-up removed per
+            // audit H3).
+            if (auto* vr = AcquireVanillaRenderer()) {
+                // AUDIT H2: if the fallback path ran earlier this session, its renderer is still enabled with
+                // its own offscreen 3D -- tear that down before borrowing, or both composite at once.
+                if (g_renderer && (g_renderer->enabled || g_visible)) {
+                    g_renderer->Offscreen_Set3D(nullptr);
+                    g_renderer->Disable();
+                    g_visible = false;
+                    logger::info("[PipOS][3D] own renderer parked; handing off to the vanilla renderer");
+                }
+                if (!g_previewRoot || g_dirty || g_sourceRoot != source) {
+                    auto clone = CloneSubtree(*source);
+                    if (!clone) { logger::error("[PipOS][3D] player biped clone failed"); HideAndRelease(); return; }
+                    SanitizeClone(*clone);
+                    // AUDIT M1: the item preview's camera is SHORT-RANGE (items sit close); our default 200-unit
+                    // distance is likely past its far plane. Cap the framing distance on this path; the in-game
+                    // Camera-distance slider still applies below the cap.
+                    FrameClone(*clone, 80.0f);
+                    g_forceUpgradeTextures(clone.get(), false, false);
+                    g_previewRoot = clone;
+                    g_sourceRoot = source;
+                    g_dirty = false;
+                    logger::info("[PipOS][3D] preview built for the VANILLA renderer path");
+                }
+                auto* cur = vr->offscreenElement.get();
+                if (cur == nullptr && g_previewRoot) {
+                    vr->Offscreen_Set3D(g_previewRoot.get());
+                    if (!g_usingVanilla) { logger::info("[PipOS][3D] clone attached to vanilla renderer '{}' (enabled={})", vr->name.c_str(), vr->enabled); }
+                    g_usingVanilla = true;
+                }
+                const bool slotIsOurs = g_previewRoot && vr->offscreenElement.get() == g_previewRoot.get();
+                if (slotIsOurs) {
+                    // AUDIT H1: the manager leaves the renderer DISABLED at idle -- a borrowed slot on a disabled
+                    // renderer composites nothing. TRACKED SYMMETRIC ENABLE: we enable only while the slot holds
+                    // OUR clone, remember that we did, and restore disabled state when handing the slot back
+                    // (HideAndRelease). While a real item preview owns the slot we never touch enable state.
+                    if (!vr->enabled) {
+                        vr->Enable(false);
+                        g_weEnabledVanilla = true;
+                        logger::info("[PipOS][3D] vanilla renderer enabled for the character (will restore on close)");
+                    }
+                    ApplyIdle(*g_previewRoot, a_delta);
+                    g_visible = true;
+                    g_available.store(true);   // AS hides the Vault Boy only while our figure actually shows
+                } else {
+                    // AUDIT M2: while yielding to a live item preview, do NOT report available (the AS side keeps
+                    // the Vault Boy) and skip idle work on the detached clone.
+                    static bool s_yieldLogged = false;
+                    if (cur != nullptr && !s_yieldLogged) { s_yieldLogged = true; logger::info("[PipOS][3D] vanilla slot busy with an item preview; yielding until it clears"); }
+                    g_visible = false;
+                    g_available.store(false);
+                }
+                return;
+            }
+
             if (!ConfigureRenderer() || !g_renderer) {
                 logger::error("[PipOS][3D] renderer unavailable; disabling live 3D for this session");
                 g_failed = true;
                 HideAndRelease();
                 return;
             }
-
-            auto* source = player->Get3D(false);  // third-person root (carries worn armor + weapon)
-            if (!source) { HideAndRelease(); return; }
 
             if (!g_previewRoot || g_dirty || g_sourceRoot != source) {
                 if (!BuildPreview(*source)) { HideAndRelease(); return; }
