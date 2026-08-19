@@ -57,6 +57,13 @@ namespace PipOS
     namespace
     {
         constexpr auto kRendererName = "PipOS_Char3D";
+        // 0.0.78 TEST BUILD: reproduce the field-visible 0.0.68 opaque-red render-target setup while changing
+        // only its UI depth from kStandard3DModel (7) to kMessage (15). The owned renderer is forced while this
+        // is true so the newer vanilla PipboyScreenModel path cannot bypass the diagnostic. The renderer is also
+        // released on every Pip-Boy close, then recreated at depth 15 on the next open. This isolates the observed
+        // first-open-above/subsequent-open-below split from stale Interface3D registration state. Set this back to
+        // false immediately after the result is captured; the normal transparent kHUDGlass path remains intact.
+        constexpr bool kRedRTDepth15Diagnostic = true;
         constexpr auto kDisplayMeshPath = "Interface/GunModMenu/ModMenuRenderMesh.nif";
         // 0.0.70: BACK to the ModMenu display mesh. 0.0.69's switch to the vanilla preview's HUDGlassFlat:0
         // was OVER-mirroring: the engine auto-creates a display quad only for the ModMenu mesh name (0.0.66-68
@@ -642,8 +649,9 @@ namespace PipOS
             // HUDShadowFlat mask, PostEffect kHUDGlass(2) (was kModMenu 4), fullPremultAlpha=false (vanilla),
             // hideScreenWhenDisabled=true (vanilla). Deliberate deviation: useLongRangeCamera stays TRUE (our
             // character sits at Char3DDistance~200 game units; the item preview's short-range camera could clip it).
-            // RED-RT test REVERTED (it proved compositing works AND leaked into the vanilla preview's shared
-            // default RT -- the fullscreen red examine view): clear stays on, background back to transparent.
+            // The production RED-RT test remains reverted because it leaked into the vanilla preview's shared
+            // default RT. The guarded 0.0.78 branch below intentionally restores the historical red fields only
+            // for the depth-15 diagnostic authorized for this test build.
             // 0.0.70: the WORKING COMBINATION -- the 0.0.66-68 quad pipeline (ModMenuRenderMesh + kModMenu +
             // TF3DHUD alpha flags: FIELD-PROVEN to composite, it carried the red block) at the 0.0.69 depth
             // (kMessage 15, [3DDIAG]-proven to layer ABOVE the fullscreen menu). 0.0.69's extra mirroring of the
@@ -656,21 +664,32 @@ namespace PipOS
             g_renderer->Offscreen_SetDisplayMode(
                 RE::Interface3D::ScreenMode::kScreenAttached, kDisplayMeshGeometry, nullptr);
             g_renderer->MainScreen_EnableScreenAttached3DMasking(nullptr, nullptr);
-            // 0.0.71 THE MODEL-INTO-RT FIX (item-preview-path investigation): kHUDGlass, NOT kModMenu. Under
-            // tiled lighting the kModMenu DEFERRED composite (BSDFCompositeShader) samples per-tile light lists
-            // (t11/t12) that are never populated during an offscreen menu render -- the geometry contributes
-            // NOTHING to the RT (exact symptom: red clear-color composites, model never appears; TF3DHUD ships
-            // two render-boundary hooks solely to force tiled lighting OFF for its offscreen pass). The vanilla
-            // 'PipboyScreenModel' item preview avoids the whole problem by rendering FORWARD via kHUDGlass --
-            // no tile-list dependency, works with zero hooks. Adopt it (+ the alpha flags vanilla pairs with it);
-            // the display quad stays our proven auto-created ModMenu mesh (independent of postfx).
-            g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kHUDGlass);
-            g_renderer->useFullPremultAlpha = false;
-            g_renderer->hideScreenWhenDisabled = true;
+            if constexpr (kRedRTDepth15Diagnostic) {
+                // Keep the controlled A/B honest: these are the exact explicit 0.0.68 renderer writes whose
+                // field run was recorded by the following 0.0.69 commit as visible red at depth 7. Only
+                // Renderer::Create above differs, using the current depth 15.
+                g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kModMenu);
+                g_renderer->useFullPremultAlpha = true;
+            } else {
+                // 0.0.71 THE MODEL-INTO-RT FIX (item-preview-path investigation): kHUDGlass, NOT kModMenu. Under
+                // tiled lighting the kModMenu DEFERRED composite (BSDFCompositeShader) samples per-tile light
+                // lists that are never populated during an offscreen menu render, so geometry contributes no
+                // pixels. The vanilla item preview avoids that dependency by rendering forward via kHUDGlass.
+                g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kHUDGlass);
+                g_renderer->useFullPremultAlpha = false;
+                g_renderer->hideScreenWhenDisabled = true;
+            }
             g_renderer->customRenderTarget = -1;
             g_renderer->customSwapTarget = -1;
             g_renderer->Offscreen_SetClearRenderTarget(true);
-            g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 0.0f, 0.0f, 0.0f, 0.0f });
+            if constexpr (kRedRTDepth15Diagnostic) {
+                g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 1.0f, 0.0f, 0.0f, 1.0f });
+                logger::info(
+                    "[PipOS][3D] 0.0.78 RED-RT DEPTH-15 RECREATE DIAGNOSTIC active: owned renderer forced; "
+                    "expect opaque red in the PIP-OS figure slot if kMessage compositing works");
+            } else {
+                g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 0.0f, 0.0f, 0.0f, 0.0f });
+            }
 
             logger::info("[PipOS][3D] Interface3D renderer '{}' configured (offscreen RT={}x{})",
                 kRendererName,
@@ -1034,6 +1053,15 @@ namespace PipOS
             if (g_renderer) {
                 g_renderer->Offscreen_Set3D(nullptr);
                 if (g_visible || g_renderer->enabled) { g_renderer->Disable(); }
+                if constexpr (kRedRTDepth15Diagnostic) {
+                    // The 0.0.77 field run rendered above Scaleform only on the first open. Every later open
+                    // reused this renderer and rendered below after the clip quad became ready. Release the owned
+                    // renderer at close so the clipped quad is registered on a fresh depth-15 renderer next open.
+                    g_renderer->MainScreen_SetScreenAttached3D(nullptr);
+                    g_renderer->Release();
+                    g_renderer = nullptr;
+                    logger::info("[PipOS][3D] 0.0.78 diagnostic: owned renderer released; next open recreates depth 15");
+                }
             }
             g_visible = false;
             g_available.store(false);
@@ -1073,7 +1101,7 @@ namespace PipOS
             // note). Our own renderer path below remains the fallback when the vanilla one can't be resolved
             // (i.e. until the user has inspected one item this Pip-Boy session -- Begin3D stand-up removed per
             // audit H3).
-            if (auto* vr = AcquireVanillaRenderer()) {
+            if (auto* vr = kRedRTDepth15Diagnostic ? nullptr : AcquireVanillaRenderer()) {
                 // AUDIT H2: if the fallback path ran earlier this session, its renderer is still enabled with
                 // its own offscreen 3D -- tear that down before borrowing, or both composite at once.
                 if (g_renderer && (g_renderer->enabled || g_visible)) {
