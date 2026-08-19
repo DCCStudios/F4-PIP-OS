@@ -397,7 +397,10 @@ namespace PipOS
                 });
             }
 
-            int boundBones = 0, geoms = 0, sharedSkipped = 0, unresolved = 0, viaTree = 0;
+            // 0.0.76: source flattened tree -- needed to recover NULL bone slots by pointer identity (below).
+            auto* srcTree = a_source ? FindFlattenedBoneTree(a_source) : nullptr;
+
+            int boundBones = 0, geoms = 0, sharedSkipped = 0, unresolved = 0, viaTree = 0, nullFixed = 0, nullDropped = 0;
             ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
                 auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object));
                 if (!geometry) { return; }
@@ -410,7 +413,50 @@ namespace PipOS
                 for (std::uint32_t i = 0; i < skin->bones.size(); ++i) {
                     auto* srcBone = skin->bones[i];
                     const char* nm = srcBone ? srcBone->GetName().c_str() : nullptr;
-                    if (!nm || nm[0] == '\0') { ++unresolved; continue; }   // AUDIT F4: never look up empty names
+                    if (!nm || nm[0] == '\0') {
+                        // 0.0.76 NULL/UNNAMED BONE SLOTS (the field-proven 229: whole-tree search found ZERO of
+                        // them, so they are not elsewhere -- they are null). TF3DHUD's
+                        // ResolveNullSkinBonesFromFlattenedTree (Previewer.cpp:1296-1348) recovers identity via
+                        // POINTER IDENTITY: the slot's stale worldTransforms pointer still aims at a specific
+                        // FlattenedBone::world in the SOURCE skeleton's array, which names the bone. Map that
+                        // entry to the CLONE's same-index/same-name bone; unrecoverable slots get worldTransforms
+                        // NULLED (TF3DHUD line 1341) instead of left sampling the source skeleton -- 70% of the
+                        // palette pulling from the player's world position shredded the mesh across thousands of
+                        // units = zero coherent pixels.
+                        RE::NiTransform* stale = (!skin->worldTransforms.empty()) ? skin->worldTransforms[i] : nullptr;
+                        RE::NiAVObject* nb = nullptr;
+                        RE::NiTransform* nw = nullptr;
+                        if (stale && srcTree && srcTree->bone && flattened->bone) {
+                            for (std::int32_t k = 0; k < srcTree->boneCount; ++k) {
+                                if (stale == std::addressof(srcTree->bone[k].world)) {
+                                    if (k < flattened->boneCount) {
+                                        auto& cb = flattened->bone[k];   // exact clone => same bone order
+                                        nb = cb.node.get();
+                                        nw = std::addressof(cb.world);
+                                    }
+                                    if (!nw) {
+                                        const char* bn = srcTree->bone[k].name.c_str();
+                                        if (bn && bn[0] != '\0') {
+                                            if (auto* fb = FindFlattenedBoneByName(*flattened, std::string_view(bn))) {
+                                                nb = fb->node.get();
+                                                nw = std::addressof(fb->world);
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        if (nw) {
+                            if (nb) { skin->bones[i] = nb; }
+                            skin->worldTransforms[i] = nw;
+                            ++nullFixed; ++boundBones;
+                        } else {
+                            if (!skin->worldTransforms.empty()) { skin->worldTransforms[i] = nullptr; }
+                            ++nullDropped; ++unresolved;
+                        }
+                        continue;
+                    }
                     // 0.0.75: resolution order changed -- FLATTENED-ARRAY entry FIRST. The engine maintains pose
                     // in FlattenedBone::world (the array the flattened update walks); node->world on a flattened
                     // skeleton may never be written. Bind the skin transform to the ARRAY's world when the bone
@@ -443,8 +489,8 @@ namespace PipOS
                 ++geoms;
             });
             // AUDIT F3: honest field signal -- bones actually rebound, not just geometries touched.
-            logger::info("[PipOS][3D] skin rebind: {} bones rebound ({} via whole-tree search) across {} geometries ({} shared-with-source skipped, {} unresolved)",
-                boundBones, viaTree, geoms, sharedSkipped, unresolved);
+            logger::info("[PipOS][3D] skin rebind: {} bones rebound ({} via whole-tree, {} null-slots recovered by pointer identity, {} null-slots dropped) across {} geometries ({} shared skipped, {} unresolved)",
+                boundBones, viaTree, nullFixed, nullDropped, geoms, sharedSkipped, unresolved);
             return boundBones;
         }
 
