@@ -388,7 +388,6 @@ namespace PipOS
             // (kMessage 15, [3DDIAG]-proven to layer ABOVE the fullscreen menu). 0.0.69's extra mirroring of the
             // vanilla quad/material/mask is reverted -- it killed the engine-auto-created display quad entirely.
             g_renderer->MainScreen_SetBackgroundMode(RE::Interface3D::BackgroundMode::kLive);
-            g_renderer->useFullPremultAlpha = true;
             g_renderer->MainScreen_SetPostAA(true);
             g_renderer->Offscreen_Enable3D(true);
             g_renderer->Offscreen_SetUseLongRangeCamera(true);
@@ -396,7 +395,17 @@ namespace PipOS
             g_renderer->Offscreen_SetDisplayMode(
                 RE::Interface3D::ScreenMode::kScreenAttached, kDisplayMeshGeometry, nullptr);
             g_renderer->MainScreen_EnableScreenAttached3DMasking(nullptr, nullptr);
-            g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kModMenu);
+            // 0.0.71 THE MODEL-INTO-RT FIX (item-preview-path investigation): kHUDGlass, NOT kModMenu. Under
+            // tiled lighting the kModMenu DEFERRED composite (BSDFCompositeShader) samples per-tile light lists
+            // (t11/t12) that are never populated during an offscreen menu render -- the geometry contributes
+            // NOTHING to the RT (exact symptom: red clear-color composites, model never appears; TF3DHUD ships
+            // two render-boundary hooks solely to force tiled lighting OFF for its offscreen pass). The vanilla
+            // 'PipboyScreenModel' item preview avoids the whole problem by rendering FORWARD via kHUDGlass --
+            // no tile-list dependency, works with zero hooks. Adopt it (+ the alpha flags vanilla pairs with it);
+            // the display quad stays our proven auto-created ModMenu mesh (independent of postfx).
+            g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kHUDGlass);
+            g_renderer->useFullPremultAlpha = false;
+            g_renderer->hideScreenWhenDisabled = true;
             g_renderer->customRenderTarget = -1;
             g_renderer->customSwapTarget = -1;
             g_renderer->Offscreen_SetClearRenderTarget(true);
