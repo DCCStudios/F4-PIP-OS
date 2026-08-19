@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -32,10 +33,9 @@
 //   morph / head-part / cloth high-detail head reconstruction (Morph/PreviewHeadParts/PreviewCloth) -> the
 //   exact clone already carries the live baked body morphs + current head at third-person LOD; the
 //   frame-audit signature state machine (PreviewRebuilder.cpp) -> rebuild-on-open instead; the
-//   render-boundary commit + tiled-lighting deferred hooks (RenderPrepassesAndMenus / RenderSceneDeferred /
-//   composite-pass ctor) -> this fork ships no REL::ASM branch-gateway, so those function-entry hooks are
-//   not portable here. Possible consequence when enabled: under ENB tiled-lighting the offscreen composite
-//   may be mis-lit -- a VISUAL issue, never a crash.
+//   render-boundary commit hook (RenderPrepassesAndMenus) -> this fork's main-thread task commits the root before
+//   draw instead. 0.0.79 DOES port TF3DHUD's two safe CALL-SITE hooks for RenderSceneDeferred and the composite-
+//   pass ctor, with OG opcode guards, because kModMenu geometry otherwise selects unpopulated tiled-light lists.
 //
 // THREADING MODEL (audit FIX-FIRST): the write_call<5> RunActorUpdates hook (REL::ID(556439)+0x17) is NOT
 // reliably the main thread on this fork -- it fires >1x/frame on BSMTAManager / HighFPSPhysics worker
@@ -57,13 +57,12 @@ namespace PipOS
     namespace
     {
         constexpr auto kRendererName = "PipOS_Char3D";
-        // 0.0.78 TEST BUILD: reproduce the field-visible 0.0.68 opaque-red render-target setup while changing
-        // only its UI depth from kStandard3DModel (7) to kMessage (15). The owned renderer is forced while this
-        // is true so the newer vanilla PipboyScreenModel path cannot bypass the diagnostic. The renderer is also
-        // released on every Pip-Boy close, then recreated at depth 15 on the next open. This isolates the observed
-        // first-open-above/subsequent-open-below split from stale Interface3D registration state. Set this back to
-        // false immediately after the result is captured; the normal transparent kHUDGlass path remains intact.
-        constexpr bool kRedRTDepth15Diagnostic = true;
+        // 0.0.79: replace the field-proven 0.0.78 red clear with TF3DHUD's real character pass while preserving
+        // the two facts 0.0.78 established in game: kMessage depth keeps the quad above PIP-OS, and releasing the
+        // owned renderer on every close keeps that ordering stable across subsequent opens. This switch forces
+        // the owned renderer, transparent kModMenu output, TF3DHUD's deferred-render fixes, and its fresh-race-
+        // skeleton plus seeded equipment-clone construction path. The older whole-root clone remains a fallback.
+        constexpr bool kTF3DHUDCharacterPass = true;
         constexpr auto kDisplayMeshPath = "Interface/GunModMenu/ModMenuRenderMesh.nif";
         // 0.0.70: BACK to the ModMenu display mesh. 0.0.69's switch to the vanilla preview's HUDGlassFlat:0
         // was OVER-mirroring: the engine auto-creates a display quad only for the ModMenu mesh name (0.0.66-68
@@ -132,8 +131,28 @@ namespace PipOS
         using RunActorUpdates_t = void(void*, float, bool);
         RunActorUpdates_t* g_origRunActorUpdates{ nullptr };
 
+        using RenderSceneDeferred_t = void(
+            RE::NiCamera*, RE::BSShaderAccumulator*, RE::BSCullingProcess*, RE::ShadowSceneNode*,
+            std::int32_t, std::int32_t, bool, bool);
+        using BSRenderPassCtor_t = void(void*, void*, void*, void*, std::uint32_t, std::uint8_t, void*);
+        RenderSceneDeferred_t* g_origRenderSceneDeferred{ nullptr };
+        BSRenderPassCtor_t* g_origBSRenderPassCtor{ nullptr };
+        thread_local bool g_inPipOSDeferredRender{ false };
+        std::atomic<bool> g_loggedDeferredHook{ false };
+        std::atomic<bool> g_loggedCompositeHook{ false };
+
+        // TF3DHUD Address.cpp, OG 1.10.163. These are invoked only after both measured call sites pass their
+        // E8 opcode guards during Install, so an unexpected executable/runtime degrades to no character pass.
+        REL::Relocation<bool (*)()> g_qTiledLighting{ REL::ID(1154650) };
+        REL::Relocation<void (*)(bool)> g_setDoTiledLighting{ REL::ID(716351) };
+        REL::Relocation<RE::NiAVObject* (*)(
+            const RE::Actor*, RE::NiAVObject*, const RE::BGSBodyPartDefs::LIMB_ENUM*, bool)>
+            g_getActorBodyPart3D{ REL::ID(157573) };
+        REL::Relocation<RE::NiAVObject* (*)(RE::NiAVObject*)> g_convertNodeTree{ REL::ID(633230) };
+
         // Forward decls (definitions live further down, next to the contract push they wrap).
         void SchedulePushContract();
+        void SanitizeClone(RE::NiAVObject& a_root, RE::NiAVObject* a_source);
 
         // ------------------------------------------------------------------ traversal helpers
         void ForEachAVObject(RE::NiAVObject* a_object, const std::function<void(RE::NiAVObject&)>& a_fn)
@@ -501,6 +520,230 @@ namespace PipOS
             return boundBones;
         }
 
+        // ------------------------------------------------------- 0.0.79 TF3DHUD fresh-skeleton construction
+        // A whole live-player-root clone left hundreds of BSSkin palette entries unresolved. TF3DHUD avoids
+        // that failure class: it loads the race skeleton fresh, flattens it through the engine, then clones each
+        // biped part with NiCloningProcess mappings pre-seeded from source skin bones to the fresh skeleton.
+        using PreviewNodeMap = std::unordered_map<std::string, RE::NiAVObject*>;
+
+        void CollectPreviewNodes(RE::NiAVObject& a_root, PreviewNodeMap& a_nodes)
+        {
+            a_nodes.clear();
+            if (auto* flattened = FindFlattenedBoneTree(std::addressof(a_root));
+                flattened && flattened->bone && flattened->boneCount > 0 && flattened->boneCount <= 4096) {
+                for (std::int32_t i = 0; i < flattened->boneCount; ++i) {
+                    auto& entry = flattened->bone[i];
+                    const char* name = entry.name.c_str();
+                    if (name && name[0] != '\0' && entry.node) {
+                        a_nodes.try_emplace(name, entry.node.get());
+                    }
+                }
+            }
+            ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
+                const char* name = a_object.GetName().c_str();
+                if (name && name[0] != '\0') { a_nodes.try_emplace(name, std::addressof(a_object)); }
+            });
+        }
+
+        RE::NiNode* FindPreviewNode(const PreviewNodeMap& a_nodes, std::string_view a_name)
+        {
+            const auto it = a_nodes.find(std::string(a_name));
+            return it == a_nodes.end() || !it->second ? nullptr : netimmerse_cast<RE::NiNode*>(it->second);
+        }
+
+        RE::NiStringExtraData* FindStringExtraDataInTree(RE::NiAVObject& a_root, const RE::BSFixedString& a_name)
+        {
+            RE::NiStringExtraData* result = nullptr;
+            ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
+                if (!result) {
+                    result = netimmerse_cast<RE::NiStringExtraData*>(a_object.GetExtraData(a_name));
+                }
+            });
+            return result;
+        }
+
+        RE::NiPointer<RE::NiAVObject> CloneBipedPartToFreshSkeleton(
+            RE::NiAVObject& a_source, RE::NiAVObject& a_previewRoot, const PreviewNodeMap& a_previewNodes)
+        {
+            RE::NiCloningProcess cloneProcess;
+            cloneProcess.appendChar = '$';
+            cloneProcess.copyType = RE::NiCloningProcess::CopyType::kCopyExact;
+            cloneProcess.scale = { 1.0f, 1.0f, 1.0f };
+
+            // TF3DHUD PreviewClone::SeedSkinCloneMappings, the essential difference from the failed whole-root
+            // clone. Skin root and bone references are redirected during cloning, before stale raw pointers can
+            // enter the new BSSkin::Instance.
+            ForEachAVObject(std::addressof(a_source), [&](RE::NiAVObject& a_object) {
+                auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object));
+                auto* skin = geometry ? geometry->skinInstance.get() : nullptr;
+                if (!skin || skin->bones.size() > RE::BSSkin::kMaxExpectedBones) { return; }
+                if (skin->rootNode) { cloneProcess.cloneMap.emplace(skin->rootNode, std::addressof(a_previewRoot)); }
+                for (auto* sourceBone : skin->bones) {
+                    if (!sourceBone) { continue; }
+                    const char* name = sourceBone->GetName().c_str();
+                    if (!name || name[0] == '\0') { continue; }
+                    const auto it = a_previewNodes.find(name);
+                    if (it != a_previewNodes.end() && it->second) {
+                        cloneProcess.cloneMap.emplace(sourceBone, it->second);
+                    }
+                }
+            });
+
+            std::vector<std::pair<RE::NiAVObject*, RE::NiPointer<RE::NiTimeController>>> detached;
+            ForEachAVObject(std::addressof(a_source), [&](RE::NiAVObject& a_object) {
+                if (a_object.controllers) {
+                    detached.emplace_back(std::addressof(a_object), a_object.controllers);
+                    a_object.controllers.reset();
+                }
+            });
+            RE::NiObject* clone = a_source.CreateClone(cloneProcess);
+            a_source.ProcessClone(cloneProcess);
+            for (auto& [object, controller] : detached) {
+                if (object) { object->controllers = controller; }
+            }
+            return clone ? RE::NiPointer<RE::NiAVObject>(static_cast<RE::NiAVObject*>(clone)) : nullptr;
+        }
+
+        RE::NiPointer<RE::NiAVObject> LoadFreshRaceSkeleton(RE::PlayerCharacter& a_player)
+        {
+            auto* race = a_player.GetVisualsRace();
+            if (!race) {
+                if (auto* base = a_player.GetObjectReference()) {
+                    if (auto* npc = base->As<RE::TESNPC>()) { race = npc->GetFormRace(); }
+                }
+            }
+            if (!race) { logger::error("[PipOS][3D] TF3DHUD fresh skeleton: player race unavailable"); return nullptr; }
+
+            const auto sex = std::min<std::uint32_t>(static_cast<std::uint32_t>(a_player.GetSex()), 1);
+            const char* skeletonPath = race->skeletonModel[sex].GetModel();
+            if (!skeletonPath || skeletonPath[0] == '\0') { skeletonPath = race->skeletonModel[0].GetModel(); }
+            if (!skeletonPath || skeletonPath[0] == '\0') { skeletonPath = race->skeletonModel[1].GetModel(); }
+            if (!skeletonPath || skeletonPath[0] == '\0') {
+                logger::error("[PipOS][3D] TF3DHUD fresh skeleton: race skeleton path unavailable");
+                return nullptr;
+            }
+
+            RE::NiPointer<RE::NiNode> loadedRoot;
+            RE::BSModelDB::DBTraits::ArgsType args{};
+            args.loadLevel = 3;
+            args.prepareAfterLoad = true;
+            args.performProcess = true;
+            args.createFadeNode = true;
+            args.loadTextures = true;
+            const auto result = RE::BSModelDB::Demand(skeletonPath, std::addressof(loadedRoot), args);
+            if (result != RE::BSResource::ErrorCode::kNone || !loadedRoot) {
+                logger::error(std::format(
+                    "[PipOS][3D] TF3DHUD fresh skeleton: Demand('{}') failed ({})",
+                    skeletonPath, std::to_underlying(result)));
+                return nullptr;
+            }
+
+            auto previewRoot = CloneSubtree(*loadedRoot);
+            if (!previewRoot) { return nullptr; }
+            constexpr auto kRootPart = RE::BGSBodyPartDefs::LIMB_ENUM::kRoot;
+            auto* convertTarget = g_getActorBodyPart3D(
+                std::addressof(a_player), previewRoot.get(), std::addressof(kRootPart), false);
+            if (!convertTarget) {
+                logger::error("[PipOS][3D] TF3DHUD fresh skeleton: root body-part lookup failed");
+                return nullptr;
+            }
+            if (convertTarget != previewRoot.get()) { g_convertNodeTree(convertTarget); }
+            EngineCreateBoneMap(previewRoot.get());
+            auto* flattened = FindFlattenedBoneTree(previewRoot.get());
+            if (!flattened) {
+                logger::error("[PipOS][3D] TF3DHUD fresh skeleton: flatten produced no BSFlattenedBoneTree");
+                return nullptr;
+            }
+            EngineCreateBoneMap(flattened);
+            EngineCreateBoneMap(previewRoot.get());
+            logger::info("[PipOS][3D] TF3DHUD fresh skeleton loaded: '{}' ({} flattened bones)",
+                skeletonPath, flattened->boneCount);
+            return previewRoot;
+        }
+
+        int PopulateFreshSkeletonFromBiped(RE::NiAVObject& a_previewRoot, const RE::BipedAnim& a_biped)
+        {
+            PreviewNodeMap previewNodes;
+            CollectPreviewNodes(a_previewRoot, previewNodes);
+            if (previewNodes.empty()) { return 0; }
+
+            std::unordered_set<RE::NiAVObject*> seenSources;
+            int attached = 0;
+            for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
+                const auto slot = static_cast<RE::BIPED_OBJECT>(i);
+                const auto& sourceObject = a_biped.object[i];
+                auto* sourcePart = sourceObject.partClone.get();
+                if (!sourcePart || !seenSources.insert(sourcePart).second) { continue; }
+
+                auto clone = CloneBipedPartToFreshSkeleton(*sourcePart, a_previewRoot, previewNodes);
+                if (!clone) { continue; }
+
+                RE::NiNode* parent = nullptr;
+                const auto* sourceForm = sourceObject.parent.object;
+                if ((slot == RE::BIPED_OBJECT::kWeaponHand || slot == RE::BIPED_OBJECT::kWeaponStaff) &&
+                    sourceForm && sourceForm->Is(RE::ENUM_FORM_ID::kWEAP)) {
+                    parent = FindPreviewNode(previewNodes, "Weapon");
+                } else if (slot == RE::BIPED_OBJECT::kShield && sourceForm &&
+                           sourceForm->Is(RE::ENUM_FORM_ID::kWEAP)) {
+                    parent = FindPreviewNode(previewNodes, "WeaponLeft");
+                }
+                if (!parent) {
+                    if (auto* prn = FindStringExtraDataInTree(*sourcePart, RE::BSFixedString("Prn"));
+                        prn && !prn->GetValue().empty()) {
+                        parent = FindPreviewNode(previewNodes, prn->GetValue());
+                    }
+                }
+                if (!parent) {
+                    for (auto* sourceParent = sourcePart->parent; sourceParent && !parent;
+                         sourceParent = sourceParent->parent) {
+                        const char* name = sourceParent->GetName().c_str();
+                        if (name && name[0] != '\0') { parent = FindPreviewNode(previewNodes, name); }
+                    }
+                }
+                if (!parent) { parent = netimmerse_cast<RE::NiNode*>(std::addressof(a_previewRoot)); }
+                if (!parent) { continue; }
+
+                parent->AttachChild(clone.get(), false);
+                RE::bhkWorld::RemoveObjects(clone.get(), true, true);
+                ForEachAVObject(clone.get(), [](RE::NiAVObject& a_object) { a_object.controllers.reset(); });
+                // TF3DHUD extends its lookup after every attachment. Preserve existing skeleton entries as
+                // authoritative, but expose newly cloned helper/weapon nodes to later biped parts.
+                ForEachAVObject(clone.get(), [&](RE::NiAVObject& a_object) {
+                    const char* name = a_object.GetName().c_str();
+                    if (name && name[0] != '\0') {
+                        previewNodes.try_emplace(name, std::addressof(a_object));
+                    }
+                });
+                ++attached;
+            }
+
+            EngineCreateBoneMap(std::addressof(a_previewRoot));
+            if (auto* flattened = FindFlattenedBoneTree(std::addressof(a_previewRoot))) {
+                EngineCreateBoneMap(flattened);
+            }
+            EngineCreateBoneMap(std::addressof(a_previewRoot));
+            logger::info("[PipOS][3D] TF3DHUD equipment construction: {} unique biped parts attached", attached);
+            return attached;
+        }
+
+        RE::NiPointer<RE::NiAVObject> BuildFreshTF3DHUDCharacter(
+            RE::PlayerCharacter& a_player, RE::NiAVObject& a_liveSource)
+        {
+            const auto& biped = a_player.GetBiped(false);
+            if (!biped) {
+                logger::error("[PipOS][3D] TF3DHUD fresh character: third-person biped unavailable");
+                return nullptr;
+            }
+            auto previewRoot = LoadFreshRaceSkeleton(a_player);
+            if (!previewRoot) { return nullptr; }
+            if (PopulateFreshSkeletonFromBiped(*previewRoot, *biped) == 0) {
+                logger::error("[PipOS][3D] TF3DHUD fresh character: no biped parts attached");
+                return nullptr;
+            }
+            SanitizeClone(*previewRoot, std::addressof(a_liveSource));
+            return previewRoot;
+        }
+
         // ------------------------------------------------------------------ sanitise (PreviewRenderTree.cpp)
         // 0.0.73: a_source = the LIVE tree the clone came from (for the shared-skin guard); may be null.
         void SanitizeClone(RE::NiAVObject& a_root, RE::NiAVObject* a_source)
@@ -649,9 +892,9 @@ namespace PipOS
             // HUDShadowFlat mask, PostEffect kHUDGlass(2) (was kModMenu 4), fullPremultAlpha=false (vanilla),
             // hideScreenWhenDisabled=true (vanilla). Deliberate deviation: useLongRangeCamera stays TRUE (our
             // character sits at Char3DDistance~200 game units; the item preview's short-range camera could clip it).
-            // The production RED-RT test remains reverted because it leaked into the vanilla preview's shared
-            // default RT. The guarded 0.0.78 branch below intentionally restores the historical red fields only
-            // for the depth-15 diagnostic authorized for this test build.
+            // 0.0.78's red clear proved this quad and depth in game. 0.0.79 retains the same renderer family but
+            // restores a transparent target and ports TF3DHUD's deferred hooks so character geometry can replace
+            // the proof color without sacrificing the confirmed above-PIP-OS ordering.
             // 0.0.70: the WORKING COMBINATION -- the 0.0.66-68 quad pipeline (ModMenuRenderMesh + kModMenu +
             // TF3DHUD alpha flags: FIELD-PROVEN to composite, it carried the red block) at the 0.0.69 depth
             // (kMessage 15, [3DDIAG]-proven to layer ABOVE the fullscreen menu). 0.0.69's extra mirroring of the
@@ -664,10 +907,9 @@ namespace PipOS
             g_renderer->Offscreen_SetDisplayMode(
                 RE::Interface3D::ScreenMode::kScreenAttached, kDisplayMeshGeometry, nullptr);
             g_renderer->MainScreen_EnableScreenAttached3DMasking(nullptr, nullptr);
-            if constexpr (kRedRTDepth15Diagnostic) {
-                // Keep the controlled A/B honest: these are the exact explicit 0.0.68 renderer writes whose
-                // field run was recorded by the following 0.0.69 commit as visible red at depth 7. Only
-                // Renderer::Create above differs, using the current depth 15.
+            if constexpr (kTF3DHUDCharacterPass) {
+                // Exact TF3DHUD renderer path. Its deferred-render hooks installed below suppress tiled lighting
+                // only for this renderer and correct the BSDF composite flags, allowing geometry into the RT.
                 g_renderer->Offscreen_SetPostEffect(RE::Interface3D::PostEffect::kModMenu);
                 g_renderer->useFullPremultAlpha = true;
             } else {
@@ -682,11 +924,12 @@ namespace PipOS
             g_renderer->customRenderTarget = -1;
             g_renderer->customSwapTarget = -1;
             g_renderer->Offscreen_SetClearRenderTarget(true);
-            if constexpr (kRedRTDepth15Diagnostic) {
-                g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 1.0f, 0.0f, 0.0f, 1.0f });
+            if constexpr (kTF3DHUDCharacterPass) {
+                // Replace 0.0.78's opaque proof color with TF3DHUD's transparent character target.
+                g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 0.0f, 0.0f, 0.0f, 0.0f });
                 logger::info(
-                    "[PipOS][3D] 0.0.78 RED-RT DEPTH-15 RECREATE DIAGNOSTIC active: owned renderer forced; "
-                    "expect opaque red in the PIP-OS figure slot if kMessage compositing works");
+                    "[PipOS][3D] 0.0.79 TF3DHUD CHARACTER PASS active: transparent kModMenu RT, fresh "
+                    "race skeleton, seeded biped clones, depth 15, recreate-on-open");
             } else {
                 g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 0.0f, 0.0f, 0.0f, 0.0f });
             }
@@ -990,14 +1233,18 @@ namespace PipOS
                 3.0f);
         }
 
-        bool BuildPreview(RE::NiAVObject& a_source)
+        bool BuildPreview(RE::PlayerCharacter& a_player, RE::NiAVObject& a_source)
         {
-            auto clone = CloneSubtree(a_source);
+            auto clone = kTF3DHUDCharacterPass ? BuildFreshTF3DHUDCharacter(a_player, a_source) : nullptr;
+            if (!clone) {
+                logger::info("[PipOS][3D] TF3DHUD fresh construction unavailable; falling back to whole-root clone");
+                clone = CloneSubtree(a_source);
+                if (clone) { SanitizeClone(*clone, std::addressof(a_source)); }
+            }
             if (!clone) {
                 logger::error("[PipOS][3D] player biped clone failed");
                 return false;
             }
-            SanitizeClone(*clone, std::addressof(a_source));
             FrameClone(*clone);
             AttachToRenderer(*clone);
             g_previewRoot = clone;
@@ -1053,14 +1300,13 @@ namespace PipOS
             if (g_renderer) {
                 g_renderer->Offscreen_Set3D(nullptr);
                 if (g_visible || g_renderer->enabled) { g_renderer->Disable(); }
-                if constexpr (kRedRTDepth15Diagnostic) {
-                    // The 0.0.77 field run rendered above Scaleform only on the first open. Every later open
-                    // reused this renderer and rendered below after the clip quad became ready. Release the owned
-                    // renderer at close so the clipped quad is registered on a fresh depth-15 renderer next open.
+                if constexpr (kTF3DHUDCharacterPass) {
+                    // Preserve the 0.0.78 field-proven ordering fix: a reused renderer moved under Scaleform after
+                    // the first close. Recreate it at depth 15 each open while retaining the clipped display root.
                     g_renderer->MainScreen_SetScreenAttached3D(nullptr);
                     g_renderer->Release();
                     g_renderer = nullptr;
-                    logger::info("[PipOS][3D] 0.0.78 diagnostic: owned renderer released; next open recreates depth 15");
+                    logger::info("[PipOS][3D] 0.0.79 character renderer released; next open recreates depth 15");
                 }
             }
             g_visible = false;
@@ -1101,7 +1347,7 @@ namespace PipOS
             // note). Our own renderer path below remains the fallback when the vanilla one can't be resolved
             // (i.e. until the user has inspected one item this Pip-Boy session -- Begin3D stand-up removed per
             // audit H3).
-            if (auto* vr = kRedRTDepth15Diagnostic ? nullptr : AcquireVanillaRenderer()) {
+            if (auto* vr = kTF3DHUDCharacterPass ? nullptr : AcquireVanillaRenderer()) {
                 // AUDIT H2: if the fallback path ran earlier this session, its renderer is still enabled with
                 // its own offscreen 3D -- tear that down before borrowing, or both composite at once.
                 if (g_renderer && (g_renderer->enabled || g_visible)) {
@@ -1174,7 +1420,7 @@ namespace PipOS
             }
 
             if (!g_previewRoot || g_dirty || g_sourceRoot != source) {
-                if (!BuildPreview(*source)) { HideAndRelease(); return; }
+                if (!BuildPreview(*player, *source)) { HideAndRelease(); return; }
                 g_dirty = false;
             }
 
@@ -1270,6 +1516,97 @@ namespace PipOS
             // open regardless of bLive3D -- Tick() early-outs but this line still fires). Rate-limited inside.
             // 0.0.68: right-click moved to the UI input-receiver vfunc hook (GetAsyncKeyState was blind to it).
             if (g_pipboyOpen.load()) { RepushEquipmentPeriodic(); ReadDropLog(); DumpRendererDiag(); }
+        }
+
+        // ------------------------------------------------------ TF3DHUD deferred character-render hook pair
+        // kModMenu renders geometry through BSShaderUtil::RenderSceneDeferred. TF3DHUD proved that Interface3D's
+        // offscreen pass must temporarily disable tiled lighting and clear bit 0x20 from the composite pass flags;
+        // otherwise the shader selects a tiled variant whose t11/t12 light lists were never populated for this RT.
+        bool IsOurOffscreenRender(RE::ShadowSceneNode* a_shadowSceneNode)
+        {
+            return g_renderer && a_shadowSceneNode && a_shadowSceneNode == g_renderer->offscreenSSN.get();
+        }
+
+        void HookedRenderSceneDeferred(
+            RE::NiCamera* a_camera,
+            RE::BSShaderAccumulator* a_accumulator,
+            RE::BSCullingProcess* a_cullingProcess,
+            RE::ShadowSceneNode* a_shadowSceneNode,
+            std::int32_t a_target,
+            std::int32_t a_depth,
+            bool a_arg7,
+            bool a_arg8)
+        {
+            if (!g_origRenderSceneDeferred) { return; }
+            if (!IsOurOffscreenRender(a_shadowSceneNode)) {
+                g_origRenderSceneDeferred(
+                    a_camera, a_accumulator, a_cullingProcess, a_shadowSceneNode,
+                    a_target, a_depth, a_arg7, a_arg8);
+                return;
+            }
+
+            const bool oldTiledLighting = g_qTiledLighting();
+            const bool oldDeferredFlag = g_inPipOSDeferredRender;
+            g_inPipOSDeferredRender = true;
+            g_setDoTiledLighting(false);
+            if (!g_loggedDeferredHook.exchange(true)) {
+                logger::info("[PipOS][3D] TF3DHUD deferred hook engaged for PipOS_Char3D");
+            }
+            g_origRenderSceneDeferred(
+                a_camera, a_accumulator, a_cullingProcess, a_shadowSceneNode,
+                a_target, a_depth, a_arg7, a_arg8);
+            g_setDoTiledLighting(oldTiledLighting);
+            g_inPipOSDeferredRender = oldDeferredFlag;
+        }
+
+        void HookedCompositePassCtor(
+            void* a_renderPass,
+            void* a_shader,
+            void* a_property,
+            void* a_geometry,
+            std::uint32_t a_flags,
+            std::uint8_t a_pass,
+            void* a_lights)
+        {
+            if (!g_origBSRenderPassCtor) { return; }
+            if (g_inPipOSDeferredRender && a_flags == 0x68) {
+                a_flags = 0x48;
+                if (!g_loggedCompositeHook.exchange(true)) {
+                    logger::info("[PipOS][3D] TF3DHUD composite hook changed flags 0x68 -> 0x48");
+                }
+            }
+            g_origBSRenderPassCtor(
+                a_renderPass, a_shader, a_property, a_geometry, a_flags, a_pass, a_lights);
+        }
+
+        bool InstallTF3DHUDRenderHooks(REL::Trampoline& a_trampoline)
+        {
+            if constexpr (!kTF3DHUDCharacterPass) { return true; }
+
+            REL::Relocation<std::uintptr_t> drawModel{ REL::ID(917134) };
+            REL::Relocation<std::uintptr_t> renderSceneDeferred{ REL::ID(73644) };
+            const auto deferredCall = drawModel.address() + 0x51A;
+            const auto compositeCtorCall = renderSceneDeferred.address() + 0x158B;
+
+            // Both sites are measured OG CALL rel32 instructions. Validate all bytes before changing either site
+            // so a wrong executable cannot leave a half-installed render path.
+            const auto deferredOpcode = *reinterpret_cast<const std::uint8_t*>(deferredCall);
+            const auto compositeOpcode = *reinterpret_cast<const std::uint8_t*>(compositeCtorCall);
+            if (deferredOpcode != 0xE8 || compositeOpcode != 0xE8) {
+                logger::error(std::format(
+                    "[PipOS][3D] TF3DHUD render hooks refused: expected E8 calls, got {:02X}/{:02X}",
+                    deferredOpcode, compositeOpcode));
+                return false;
+            }
+
+            g_origRenderSceneDeferred = reinterpret_cast<RenderSceneDeferred_t*>(
+                a_trampoline.write_call<5>(deferredCall, &HookedRenderSceneDeferred));
+            g_origBSRenderPassCtor = reinterpret_cast<BSRenderPassCtor_t*>(
+                a_trampoline.write_call<5>(compositeCtorCall, &HookedCompositePassCtor));
+            logger::info(
+                "[PipOS][3D] TF3DHUD deferred hooks installed @ REL::ID(917134)+0x51A and "
+                "REL::ID(73644)+0x158B");
+            return g_origRenderSceneDeferred && g_origBSRenderPassCtor;
         }
 
         // WORKER-THREAD-SAFE hook body: on this fork RunActorUpdates fires on BSMTAManager / HighFPSPhysics
@@ -1402,9 +1739,15 @@ namespace PipOS
         // -- only ever reached when the user has opted in.
 #pragma warning(push)
 #pragma warning(disable: 4996)  // AllocTrampoline is deprecated in favor of F4SE::Init({.trampoline=true}),
-        F4SE::AllocTrampoline(64);  // but PipOS's Init requests none; allocate lazily only when opted in.
+        F4SE::AllocTrampoline(128);  // enough for the frame hook plus TF3DHUD's two guarded call-site hooks.
 #pragma warning(pop)
         auto& trampoline = REL::GetTrampoline();
+
+        if (!InstallTF3DHUDRenderHooks(trampoline)) {
+            logger::error("[PipOS][3D] TF3DHUD character pass disabled because its render hooks were not safe to install");
+            g_failed.store(true);
+            return false;
+        }
 
         // RunActorUpdates call site (OG 1.10.163): REL::ID(556439)+0x17 -- the same frame hook Full Body
         // Awareness uses with this fork; write_call<5> is battle-tested here (no hand-rolled branch gateway).
