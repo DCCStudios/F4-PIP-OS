@@ -282,6 +282,78 @@ namespace PipOS
             func(a_object);
         }
 
+        // ------------------------------------------------------- 0.0.75 CONSENSUS BATCH (4-agent TF3DHUD sweep)
+        // Engine segment enabler (TF3DHUD Address.h:244/EnableAllSegments {246125}): FO4 body meshes carry
+        // BSDismemberSkinInstance per-segment disable COUNTS the engine toggles constantly; a clone inherits
+        // them, and a disabled segment renders NOTHING while node culling/fade all read clean. Force-enable all.
+        void EngineEnableAllSegments(RE::BSGeometrySegmentData* a_data)
+        {
+            static REL::Relocation<void (*)(RE::BSGeometrySegmentData*)> func{ REL::ID(246125) };
+            func(a_data);
+        }
+
+        // Shader-alpha restore (TF3DHUD PreviewRenderTree.cpp:169-183): a cloned BSShaderProperty with
+        // alpha <= 0 renders FULLY TRANSPARENT with an otherwise perfect pipeline. Force back to 1.
+        int RestoreShaderAlpha(RE::NiAVObject& a_root)
+        {
+            int fixed = 0;
+            ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
+                auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object));
+                if (!geometry) { return; }
+                for (auto& property : geometry->properties) {
+                    if (auto* shaderProperty = netimmerse_cast<RE::BSShaderProperty*>(property.get())) {
+                        if (shaderProperty->alpha <= 0.0f) { shaderProperty->alpha = 1.0f; ++fixed; }
+                    }
+                }
+            });
+            return fixed;
+        }
+
+        // Pose copy (agents 3+4 consensus, the top zero-pixels suspect): an actor's POSE lives authoritatively
+        // in BSFlattenedBoneTree::bone[].local (raw heap array the flattened update walks -- NODE locals are
+        // ignored). TF3DHUD NEVER trusts a cloned flattened tree; if our clone's bone[] came through stale or
+        // identity, every bone sits at the origin and the skinned body collapses to a sub-pixel speck = the
+        // exact symptom. Copy the SOURCE tree's bone locals (the live captured pose) into the CLONE's array by
+        // name, writing the ARRAY entries directly, then the flush Update recomputes bone worlds.
+        int CopyFlattenedPose(RE::NiAVObject& a_root, RE::NiAVObject* a_source)
+        {
+            if (!a_source) { return -1; }
+            auto* dst = FindFlattenedBoneTree(std::addressof(a_root));
+            auto* src = FindFlattenedBoneTree(a_source);
+            if (!dst || !src || !dst->bone || !src->bone) { return -1; }
+            if (dst->boneCount <= 0 || dst->boneCount > 4096) { return -1; }
+            int copied = 0;
+            for (std::int32_t i = 0; i < dst->boneCount; ++i) {
+                auto& db = dst->bone[i];
+                const char* nm = db.name.c_str();
+                if (!nm || nm[0] == '\0') { continue; }
+                if (auto* sb = FindFlattenedBoneByName(*src, std::string_view(nm))) {
+                    db.local = sb->local;
+                    db.world = sb->world;   // seed; the flush Update re-derives from local anyway
+                    ++copied;
+                }
+            }
+            return copied;
+        }
+
+        // One-shot pose probe: logs a known bone's world position after framing. If it is not near the framed
+        // origin (|x|,|z| small, y ~ +distance), the flattened tree is not updating and the fresh-skeleton
+        // rebuild (banked TF3DHUD recipe) is the required next step.
+        void LogPoseProbe(RE::NiAVObject& a_root)
+        {
+            auto* flattened = FindFlattenedBoneTree(std::addressof(a_root));
+            if (!flattened) { logger::info("[PipOS][3D] pose probe: no flattened tree"); return; }
+            const char* probes[] = { "Chest", "Root", "COM" };
+            for (const char* p : probes) {
+                if (auto* fb = FindFlattenedBoneByName(*flattened, std::string_view(p))) {
+                    logger::info("[PipOS][3D] pose probe: bone '{}' world=({:.1f},{:.1f},{:.1f}) node={}",
+                        p, fb->world.translate.x, fb->world.translate.y, fb->world.translate.z, fb->node != nullptr);
+                    return;
+                }
+            }
+            logger::info("[PipOS][3D] pose probe: no probe bone found (Chest/Root/COM)");
+        }
+
         // 0.0.74: whole-tree name search -- the FINAL bone-resolution fallback. 0.0.73's field counters
         // (102 rebound / 229 UNRESOLVED) proved most skin bones are NOT in the flattened tree: weapon nodes,
         // attach points and helper bones are ordinary NiNodes elsewhere in the skeleton. TF3DHUD resolves
@@ -339,26 +411,31 @@ namespace PipOS
                     auto* srcBone = skin->bones[i];
                     const char* nm = srcBone ? srcBone->GetName().c_str() : nullptr;
                     if (!nm || nm[0] == '\0') { ++unresolved; continue; }   // AUDIT F4: never look up empty names
-                    RE::NiAVObject* dstBone = flattened->GetObjectByName(srcBone->GetName());
-                    if (!dstBone) {
-                        // AUDIT F3: same linear FlattenedBone fallback the framing helper already uses.
-                        if (auto* fb = FindFlattenedBoneByName(*flattened, std::string_view(nm))) {
-                            dstBone = fb->node.get();
-                        }
+                    // 0.0.75: resolution order changed -- FLATTENED-ARRAY entry FIRST. The engine maintains pose
+                    // in FlattenedBone::world (the array the flattened update walks); node->world on a flattened
+                    // skeleton may never be written. Bind the skin transform to the ARRAY's world when the bone
+                    // is a flattened bone; node->world only for ordinary nodes found by the whole-tree search.
+                    RE::NiAVObject* dstBone = nullptr;
+                    RE::NiTransform* dstWorld = nullptr;
+                    if (auto* fb = FindFlattenedBoneByName(*flattened, std::string_view(nm))) {
+                        dstBone = fb->node.get();
+                        dstWorld = std::addressof(fb->world);
+                    } else if (auto* byName = flattened->GetObjectByName(srcBone->GetName())) {
+                        dstBone = byName;
+                        dstWorld = std::addressof(byName->world);
+                    } else if (auto* wt = FindNodeByNameRecursive(std::addressof(a_root), srcBone->GetName())) {
+                        // 0.0.74: whole-tree fallback -- ordinary nodes (weapon/attach/helper bones) outside the
+                        // flattened tree; their node->world IS maintained by root.Update().
+                        dstBone = wt;
+                        dstWorld = std::addressof(wt->world);
+                        ++viaTree;
                     }
-                    if (!dstBone) {
-                        // 0.0.74: FINAL fallback -- the whole clone tree. 0.0.73 field counters (229/331
-                        // unresolved) proved most skin bones live OUTSIDE the flattened tree as ordinary nodes
-                        // (weapon/attach/helper bones); TF3DHUD's CollectNamedNodes map covers exactly these.
-                        if (auto* wt = FindNodeByNameRecursive(std::addressof(a_root), srcBone->GetName())) {
-                            dstBone = wt; ++viaTree;
-                        }
-                    }
-                    if (dstBone) { skin->bones[i] = dstBone; ++boundBones; }
+                    if (dstBone || dstWorld) { if (dstBone) { skin->bones[i] = dstBone; } ++boundBones; }
                     else { ++unresolved; }
                     if (!skin->worldTransforms.empty()) {
-                        auto* t = dstBone ? dstBone : skin->bones[i];
-                        skin->worldTransforms[i] = t ? std::addressof(t->world) : nullptr;
+                        if (dstWorld) { skin->worldTransforms[i] = dstWorld; }
+                        else if (auto* t = skin->bones[i]) { skin->worldTransforms[i] = std::addressof(t->world); }
+                        else { skin->worldTransforms[i] = nullptr; }
                     }
                 }
                 skin->rootNode = std::addressof(a_root);
@@ -395,6 +472,25 @@ namespace PipOS
             // Update() propagates the corrected tree (matches TF3DHUD's order).
             const int repaired = RepairShaderFadeNodes(a_root, nullptr);
             logger::info("[PipOS][3D] fade-node repair: re-owned {} shader properties to the clone", repaired);
+
+            // 0.0.75 consensus batch (4-agent TF3DHUD sweep), each independently logged:
+            // (1) detach live havok/cloth references TF3DHUD strips at every level (robustness);
+            try { RE::bhkWorld::RemoveObjects(std::addressof(a_root), true, true); } catch (...) {}
+            // (2) POSE COPY -- source flattened bone[].local -> clone's array by name (top zero-pixels suspect:
+            //     stale/identity clone pose collapses the skinned body to a sub-pixel speck);
+            const int posed = CopyFlattenedPose(a_root, a_source);
+            logger::info("[PipOS][3D] pose copy: {} flattened bone locals copied from the source", posed);
+            // (3) shader-alpha restore (alpha<=0 clone materials render fully transparent);
+            const int alphaFixed = RestoreShaderAlpha(a_root);
+            logger::info("[PipOS][3D] shader alpha: {} properties restored from <=0 to 1", alphaFixed);
+            // (4) dismember segments: force-enable all (inherited disable counts hide segments invisibly).
+            int segData = 0;
+            ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
+                if (auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object))) {
+                    if (auto* segments = geometry->GetSegmentData()) { EngineEnableAllSegments(segments); ++segData; }
+                }
+            });
+            logger::info("[PipOS][3D] segments: EnableAllSegments on {} geometries", segData);
 
             // 0.0.73: rebind skinned geometry to the clone's own skeleton, also before the flush Update (matching
             // TF3DHUD's order: RebindPreviewSkinInstances precedes the final Update). Logs its own counts.
@@ -880,6 +976,9 @@ namespace PipOS
                 auto* vr = pm ? RE::Interface3D::Renderer::GetByName(pm->inv3DModelManager.str3DRendererName) : nullptr;
                 if (vr && g_previewRoot && vr->offscreenElement.get() == g_previewRoot.get()) {
                     vr->Offscreen_Set3D(nullptr);
+                    // 0.0.75: also clear the light list we injected so the manager rebuilds its own state.
+                    vr->offscreenLights.clear();
+                    vr->needsLightSetupOffscreen = true;
                     if (g_weEnabledVanilla && vr->enabled) { vr->Disable(); }
                     logger::info("[PipOS][3D] vanilla renderer slot returned (enable restored={})", g_weEnabledVanilla);
                 }
@@ -954,7 +1053,18 @@ namespace PipOS
                 auto* cur = vr->offscreenElement.get();
                 if (cur == nullptr && g_previewRoot) {
                     vr->Offscreen_Set3D(g_previewRoot.get());
-                    if (!g_usingVanilla) { logger::info("[PipOS][3D] clone attached to vanilla renderer '{}' (enabled={})", vr->name.c_str(), vr->enabled); }
+                    // 0.0.75 (agent-2 gap): TF3DHUD configures offscreen lights on EVERY attach; our vanilla
+                    // path never lit the scene -- an unlit model over a transparent background is invisible.
+                    // Same fixed fill the own-renderer path uses; cleared again when the slot is returned.
+                    vr->offscreenLights.clear();
+                    vr->needsLightSetupOffscreen = true;
+                    vr->Offscreen_AddLight(
+                        RE::NiPoint3{ 50.0f, 0.0f, 50.0f },
+                        RE::NiColor{ 0.841f, 0.758f, 0.785f },
+                        RE::NiColor{ 1000.0f, 0.0f, 0.0f },
+                        3.0f);
+                    if (!g_usingVanilla) { logger::info("[PipOS][3D] clone attached to vanilla renderer '{}' (enabled={}) + offscreen light configured", vr->name.c_str(), vr->enabled); }
+                    LogPoseProbe(*g_previewRoot);   // 0.0.75: decisive framing/pose telemetry (once per attach)
                     g_usingVanilla = true;
                 }
                 const bool slotIsOurs = g_previewRoot && vr->offscreenElement.get() == g_previewRoot.get();
