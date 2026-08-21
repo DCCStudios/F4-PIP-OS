@@ -98,6 +98,9 @@ package
       private var _curTab:int = -1;
       private var _showVaultBoy:Boolean = true;
       private var _lastData:Pipboy_DataObj;
+      private var _radCur:Number = 0;
+      private var _radMax:Number = 1;
+      private var _radPoll:int = 0;
       private var _dbg:Debug;
       private var _panels:Array = [];
 
@@ -362,8 +365,22 @@ package
       {
          super.onPipboyChangeEvent(param1);
          if (!this._lifeEvt) { this._lifeEvt = true; Theme.life("ST.e" + param1.DataObj.CurrentTab); }   // first data event + tab at that moment
+         this.applyData(param1.DataObj);
+      }
+
+      // The stock shell occasionally completes a repaired STATUS page load without delivering its first
+      // PipboyChangeEvent. Chrome's shell medic calls this public, idempotent entry point on that exact path.
+      public function PipOSForceRefresh(d:Pipboy_DataObj):void
+      {
+         Theme.life("ST.f" + (d != null ? d.CurrentTab : 9));
+         this.applyData(d);
+      }
+
+      private function applyData(d:Pipboy_DataObj):void
+      {
+         if (d == null) { return; }
          this.ensureText(); if (!this._textBuilt) { return; }
-         var d:Pipboy_DataObj = param1.DataObj; this._lastData = d; if (this._dbg != null) { this._dbg.change(); this._dbg.pageTab(d.CurrentPage, d.CurrentTab); }
+         this._lastData = d; if (this._dbg != null) { this._dbg.change(); this._dbg.pageTab(d.CurrentPage, d.CurrentTab); }
          this._curTab = d.CurrentTab; this.updateSubtabs();
          // 0.0.50 PBT COMPAT: CurrentTab >= 3 = a PipboyTabs-injected tab (MAGAZINES/NEEDS/DISEASE here). PBT's
          // own clip overlays the page for it, so hide ALL our content (subtab strip stays) and render nothing --
@@ -413,13 +430,14 @@ package
       // UPDATE-ONLY STATUS render: meters/tiles/limbs/effects text + all Shape graphics (no field ops).
       private function renderStatus(d:Pipboy_DataObj):void
       {
+         this.pullRadiation();
          var P:Number = Theme.PAD;
          // ----- meters -----
          var mg:* = this._meters.graphics; mg.clear();
-         var mCur:Array = [d.CurrHP, d.CurrAP, 0];
-         var mMax:Array = [d.MaxHP, d.MaxAP, 0];
+         var mCur:Array = [d.CurrHP, d.CurrAP, this._radCur];
+         var mMax:Array = [d.MaxHP, d.MaxAP, this._radMax];
          var mCol:Array = [Theme.PHOS, Theme.SEL, Theme.CRIT];
-         var mStr:Array = [Math.round(d.CurrHP) + " / " + Math.round(d.MaxHP), Math.round(d.CurrAP) + " / " + Math.round(d.MaxAP), "0"];
+         var mStr:Array = [Math.round(d.CurrHP) + " / " + Math.round(d.MaxHP), Math.round(d.CurrAP) + " / " + Math.round(d.MaxAP), Math.round(this._radCur) + " / " + Math.round(this._radMax)];
          for (var mi:int = 0; mi < 3; mi++) {
             var my0:Number = Theme.BY + mi * METER_PITCH;
             mg.beginFill(Theme.PANEL, 0.5); mg.drawRoundRect(Theme.CX, my0, LEFTW, METER_H, 6, 6); mg.endFill();
@@ -509,7 +527,34 @@ package
       private function doToggleFigure():void { this._showVaultBoy = !this._showVaultBoy; this._vbtn.ButtonText = this._showVaultBoy ? "CHARACTER" : "VAULT BOY"; this.sfx("UIMenuPrevNext"); if (this._lastData != null && this._curTab == 0) { this.renderStatus(this._lastData); } }
       private function onLimbClick(e:MouseEvent):void { this.doStim(); }
 
-      private function onPageStage(e:Event):void { Theme.life("ST.s"); this.ensureText(); if (this._vb != null) { this._vb.begin(); } if (stage != null) { stage.addEventListener(KeyboardEvent.KEY_DOWN, this.onKey); stage.addEventListener(MouseEvent.MOUSE_DOWN, this.onClickProbe); } }
+      private function pullRadiation():Boolean
+      {
+         var nextCur:Number = this._radCur, nextMax:Number = this._radMax;
+         try {
+            if (stage != null && stage.numChildren > 0) {
+               var root:* = stage.getChildAt(0);
+               if (root != null && root.PipOS_rads != null) { nextCur = Math.max(0, Number(root.PipOS_rads)); }
+               if (root != null && root.PipOS_radsMax != null) { nextMax = Math.max(1, Number(root.PipOS_radsMax)); }
+            }
+         } catch (er:*) {}
+         if (isNaN(nextCur)) { nextCur = 0; }
+         if (isNaN(nextMax) || nextMax < 1) { nextMax = 1; }
+         if (nextCur == this._radCur && nextMax == this._radMax) { return false; }
+         this._radCur = nextCur; this._radMax = nextMax;
+         return true;
+      }
+
+      private function onRadFrame(e:Event):void
+      {
+         if (++this._radPoll < 10) { return; }
+         this._radPoll = 0;
+         if (this.pullRadiation() && this._lastData != null && this._curTab == 0) {
+            this.renderStatus(this._lastData);
+            SetIsDirty();
+         }
+      }
+
+      private function onPageStage(e:Event):void { Theme.life("ST.s"); this.ensureText(); if (this._vb != null) { this._vb.begin(); } addEventListener(Event.ENTER_FRAME, this.onRadFrame); if (stage != null) { stage.addEventListener(KeyboardEvent.KEY_DOWN, this.onKey); stage.addEventListener(MouseEvent.MOUSE_DOWN, this.onClickProbe); } }
       // 0.0.58 CLICK FORENSICS: sub-tab buttons report as unclickable in game; log the first few stage-level click
       // targets into the life trail so the next log names whatever display object is actually swallowing the clicks.
       private var _probeN:int = 0;
@@ -521,7 +566,7 @@ package
          try { nm = (e.target != null && e.target.name != null) ? String(e.target.name) : String(e.target); } catch (ep:*) {}
          Theme.life("CK." + nm);
       }
-      private function onPageUnstage(e:Event):void { if (stage != null) { stage.removeEventListener(KeyboardEvent.KEY_DOWN, this.onKey); stage.removeEventListener(MouseEvent.MOUSE_DOWN, this.onClickProbe); } }
+      private function onPageUnstage(e:Event):void { removeEventListener(Event.ENTER_FRAME, this.onRadFrame); if (stage != null) { stage.removeEventListener(KeyboardEvent.KEY_DOWN, this.onKey); stage.removeEventListener(MouseEvent.MOUSE_DOWN, this.onClickProbe); } }
 
       private function onKey(e:KeyboardEvent):void {
          if (this._dbg != null) {

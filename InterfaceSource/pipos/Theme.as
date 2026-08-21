@@ -223,7 +223,7 @@ package pipos
       // Vector marker glyphs (font-independent). Favorite = 5-point star; legendary = 4-point sparkle.
       public static function star(g:Graphics, cx:Number, cy:Number, r:Number, color:uint):void
       {
-         g.lineStyle();   // G1: no stroke -> no diagonal streak between successive glyphs
+         g.lineStyle(0, 0, 0);   // explicitly disable GFx's retained stroke pen
          g.beginFill(color, 1);
          for (var i:int = 0; i < 10; i++)
          {
@@ -236,7 +236,7 @@ package pipos
       }
       public static function sparkle(g:Graphics, cx:Number, cy:Number, r:Number, color:uint):void
       {
-         g.lineStyle();   // G1: fill-only glyph
+         g.lineStyle(0, 0, 0);
          g.beginFill(color, 1);
          g.moveTo(cx, cy - r); g.lineTo(cx + r * 0.28, cy - r * 0.28);
          g.lineTo(cx + r, cy); g.lineTo(cx + r * 0.28, cy + r * 0.28);
@@ -244,40 +244,39 @@ package pipos
          g.lineTo(cx - r, cy); g.lineTo(cx - r * 0.28, cy - r * 0.28);
          g.endFill();
       }
-      // 0.0.60 LEGENDARY MARKER: hollow diamond with a center dot -- a clearly different SILHOUETTE from the
-      // favorite star (field feedback: the 4-point sparkle still read as "another star" at 5-6px). Fill-only.
+      // LEGENDARY MARKER: a compact target distinct from the favorite star. Use drawCircle-only geometry here:
+      // the former diamond's moveTo/lineTo fill path was field-confirmed as another source of GFx diagonal fans.
       public static function legendaryMark(g:Graphics, cx:Number, cy:Number, r:Number, color:uint):void
       {
-         g.lineStyle();
-         g.beginFill(color, 1);
-         // outer rhombus
-         g.moveTo(cx, cy - r); g.lineTo(cx + r * 0.7, cy); g.lineTo(cx, cy + r); g.lineTo(cx - r * 0.7, cy);
-         g.endFill();
-         // punch the middle back out (darker inner rhombus) then a bright center dot
-         g.beginFill(0x0A140A, 1);
-         g.moveTo(cx, cy - r * 0.55); g.lineTo(cx + r * 0.38, cy); g.lineTo(cx, cy + r * 0.55); g.lineTo(cx - r * 0.38, cy);
-         g.endFill();
-         g.beginFill(color, 1); g.drawCircle(cx, cy, r * 0.18); g.endFill();
+         g.beginFill(color, 1); g.drawCircle(cx, cy, r); g.endFill();
+         g.beginFill(0x0A140A, 1); g.drawCircle(cx, cy, r * 0.55); g.endFill();
+         g.beginFill(color, 1); g.drawCircle(cx, cy, r * 0.20); g.endFill();
       }
 
       // Mockup .panel: translucent dark fill, rounded 8px, hairline edge, + 4 corner accent ticks.
       public static function panel(g:Graphics, x:Number, y:Number, w:Number, h:Number, borderAlpha:Number = 0.38):void
       {
-         g.beginFill(PANEL, 0.82);
+         // Retain panel geometry for GFx hit testing while leaving world
+         // dimming to Chrome's one full-frame, user-adjustable veil.
+         g.lineStyle(0, 0, 0);
+         g.beginFill(PANEL, 0.0);
          g.drawRoundRect(x, y, w, h, 8, 8);
          g.endFill();
-         g.lineStyle(1, LINE, borderAlpha);
-         g.drawRoundRect(x + 0.5, y + 0.5, w - 1, h - 1, 8, 8);
-         g.lineStyle();
+         // GFx intermittently drops the closing/right segment of stroked round-rect paths. Four filled
+         // edge rectangles are deterministic in-game and keep every panel fully enclosed.
+         frameRect(g, x + 0.5, y + 0.5, w - 1, h - 1, LINE, borderAlpha);
          // corner accent ticks: SUBTLE (mockup .panel is a plain rounded border; keep only a faint CRT hint).
          // 0.0.41: shortened 9->5 and lightened (was borderAlpha+0.3 capped .8, ~0.68) to sit close to the mockup.
          var t:Number = 5;
-         g.lineStyle(1, PHOS, Math.min(0.4, borderAlpha));
-         g.moveTo(x + 4, y + 4 + t); g.lineTo(x + 4, y + 4); g.lineTo(x + 4 + t, y + 4);
-         g.moveTo(x + w - 4 - t, y + 4); g.lineTo(x + w - 4, y + 4); g.lineTo(x + w - 4, y + 4 + t);
-         g.moveTo(x + 4, y + h - 4 - t); g.lineTo(x + 4, y + h - 4); g.lineTo(x + 4 + t, y + h - 4);
-         g.moveTo(x + w - 4 - t, y + h - 4); g.lineTo(x + w - 4, y + h - 4); g.lineTo(x + w - 4, y + h - 4 - t);
-         g.lineStyle();
+         var a:Number = Math.min(0.4, borderAlpha);
+         fillLine(g, x + 4, y + 4 + t, x + 4, y + 4, PHOS, a);
+         fillLine(g, x + 4, y + 4, x + 4 + t, y + 4, PHOS, a);
+         fillLine(g, x + w - 4 - t, y + 4, x + w - 4, y + 4, PHOS, a);
+         fillLine(g, x + w - 4, y + 4, x + w - 4, y + 4 + t, PHOS, a);
+         fillLine(g, x + 4, y + h - 4 - t, x + 4, y + h - 4, PHOS, a);
+         fillLine(g, x + 4, y + h - 4, x + 4 + t, y + h - 4, PHOS, a);
+         fillLine(g, x + w - 4 - t, y + h - 4, x + w - 4, y + h - 4, PHOS, a);
+         fillLine(g, x + w - 4, y + h - 4, x + w - 4, y + h - 4 - t, PHOS, a);
       }
 
       // Draw a panel AND register its rect (for the round-7 DEBUG clearance overlay). Pages collect
@@ -313,7 +312,7 @@ package pipos
          var vv:TextField = mk(c, 12, color, true, "right"); vv.y = y; setText(vv, valStr); vv.x = x + w - vv.width;
          var by:Number = y + 20;
          var g:* = c.graphics;
-         g.lineStyle(1, color, 0.5); g.drawRoundRect(x, by, w, 10, 3, 3); g.lineStyle();
+         frameRect(g, x, by, w, 10, color, 0.5);
          g.beginFill(0x000000, 0.4); g.drawRoundRect(x + 1, by + 1, w - 2, 8, 2, 2); g.endFill();
          if (frac < 0) { frac = 0; } if (frac > 1) { frac = 1; }
          g.beginFill(color, 0.9); g.drawRoundRect(x + 1, by + 1, (w - 2) * frac, 8, 2, 2); g.endFill();
@@ -329,7 +328,7 @@ package pipos
          var iconW:Number = (iconFn != null) ? 20 : 0;
          var w:Number = pad + iconW + lw + vT.width + pad;
          var g:* = c.graphics;
-         g.lineStyle(1, LINE, 0.4); g.drawRoundRect(x, y, w, ih, 6, 6); g.lineStyle();
+         frameRect(g, x, y, w, ih, LINE, 0.4);
          var cx:Number = x + pad;
          if (iconFn != null) { iconFn(g, cx, y + 4, 14, PHOS); cx += iconW; }
          if (lT != null) { lT.x = cx; lT.y = y + 4; cx += lw; }
@@ -347,7 +346,7 @@ package pipos
          var kw:Number = Math.max(22, key.length * 9 + 10);
          kT.width = kw; kT.height = 20; kT.x = x; kT.y = y + 3; setText(kT, key);
          var g:* = c.graphics;
-         g.lineStyle(1, LINE, 0.5); g.drawRoundRect(x, y, kw, 24, 5, 5); g.lineStyle();
+         frameRect(g, x, y, kw, 24, LINE, 0.5);
          var lT:TextField = mk(c, 12, PHOS, true); lT.x = x + kw + 7; lT.y = y + 4;
          var lf:TextFormat = lT.defaultTextFormat; lf.letterSpacing = 0.8; lT.defaultTextFormat = lf; setText(lT, label);
          return kw + 7 + lT.width;
@@ -356,10 +355,12 @@ package pipos
       // Small vector glyphs / icons (drawn, no bitmaps, font-independent).
       public static function diamond(g:Graphics, cx:Number, cy:Number, r:Number, color:uint):void
       {
+         g.lineStyle(0, 0, 0);
          g.beginFill(color, 1); g.moveTo(cx, cy - r); g.lineTo(cx + r, cy); g.lineTo(cx, cy + r); g.lineTo(cx - r, cy); g.endFill();
       }
       public static function caret(g:Graphics, cx:Number, cy:Number, up:Boolean, color:uint):void
       {
+         g.lineStyle(0, 0, 0);
          g.beginFill(color, 1);
          if (up) { g.moveTo(cx, cy - 3); g.lineTo(cx + 4, cy + 3); g.lineTo(cx - 4, cy + 3); }
          else    { g.moveTo(cx, cy + 3); g.lineTo(cx + 4, cy - 3); g.lineTo(cx - 4, cy - 3); }
@@ -369,34 +370,28 @@ package pipos
       public static function iconCaps(g:Graphics, x:Number, y:Number, s:Number, color:uint):void
       {
          var r:Number = s / 2;
-         g.lineStyle(1.4, color, 1); g.drawCircle(x + r, y + r, r);
-         g.moveTo(x + r + r * 0.5, y + r * 0.55); g.curveTo(x + r * 0.35, y + r * 0.2, x + r * 0.35, y + r);
-         g.curveTo(x + r * 0.35, y + s - r * 0.2, x + r + r * 0.5, y + s - r * 0.55);
-         g.lineStyle();
+         circleLine(g, x + r, y + r, r, color, 1, 1.4, 16);
+         fillLine(g, x + r * 1.5, y + r * 0.55, x + r * 0.72, y + r * 0.35, color, 1, 1.4);
+         fillLine(g, x + r * 0.72, y + r * 0.35, x + r * 0.68, y + r * 1.65, color, 1, 1.4);
+         fillLine(g, x + r * 0.68, y + r * 1.65, x + r * 1.5, y + r * 1.45, color, 1, 1.4);
       }
       // Weight icon: backpack silhouette.
       public static function iconWeight(g:Graphics, x:Number, y:Number, s:Number, color:uint):void
       {
-         g.lineStyle(1.4, color, 1);
-         g.drawRoundRect(x + 1, y + 3, s - 2, s - 3, 3, 3);           // body
-         g.moveTo(x + s * 0.35, y + 3); g.curveTo(x + s / 2, y - 2, x + s * 0.65, y + 3);  // top handle
-         g.moveTo(x + s * 0.28, y + s * 0.55); g.lineTo(x + s * 0.72, y + s * 0.55);        // pocket line
-         g.lineStyle();
+         frameRect(g, x + 1, y + 3, s - 2, s - 3, color, 1, 1.4);
+         fillLine(g, x + s * 0.35, y + 3, x + s * 0.43, y, color, 1, 1.4);
+         fillLine(g, x + s * 0.43, y, x + s * 0.57, y, color, 1, 1.4);
+         fillLine(g, x + s * 0.57, y, x + s * 0.65, y + 3, color, 1, 1.4);
+         fillLine(g, x + s * 0.28, y + s * 0.55, x + s * 0.72, y + s * 0.55, color, 1, 1.4);
       }
 
       // Corner-bracket accent used on active panels/cards.
       public static function brackets(g:Graphics, x:Number, y:Number, w:Number, h:Number, len:Number, color:uint, alpha:Number):void
       {
-         g.lineStyle(1.5, color, alpha);
-         // TL
-         g.moveTo(x, y + len); g.lineTo(x, y); g.lineTo(x + len, y);
-         // TR
-         g.moveTo(x + w - len, y); g.lineTo(x + w, y); g.lineTo(x + w, y + len);
-         // BL
-         g.moveTo(x, y + h - len); g.lineTo(x, y + h); g.lineTo(x + len, y + h);
-         // BR
-         g.moveTo(x + w - len, y + h); g.lineTo(x + w, y + h); g.lineTo(x + w, y + h - len);
-         g.lineStyle();
+         fillLine(g, x, y + len, x, y, color, alpha, 1.5); fillLine(g, x, y, x + len, y, color, alpha, 1.5);
+         fillLine(g, x + w - len, y, x + w, y, color, alpha, 1.5); fillLine(g, x + w, y, x + w, y + len, color, alpha, 1.5);
+         fillLine(g, x, y + h - len, x, y + h, color, alpha, 1.5); fillLine(g, x, y + h, x + len, y + h, color, alpha, 1.5);
+         fillLine(g, x + w - len, y + h, x + w, y + h, color, alpha, 1.5); fillLine(g, x + w, y + h, x + w, y + h - len, color, alpha, 1.5);
       }
 
       // 0.0.58 ARTIFACT-PROOF RECT OUTLINE: four FILLED 1px rects instead of a lineStyle stroke. In-game GFx
@@ -405,12 +400,17 @@ package pipos
       // touch the line-pen path, so this cannot stray. Use on any REDRAWN-per-render outline.
       public static function frameRect(g:Graphics, x:Number, y:Number, w:Number, h:Number, color:uint, alpha:Number, th:Number = 1):void
       {
+         // GFx retains the previous line pen across unrelated paths. A fill does not implicitly disable that
+         // pen, so drawRect can otherwise stroke from its stale moveTo origin and emit the huge diagonal fans
+         // seen in-game. Belt both sides so callers cannot leak a stroke into or out of this helper.
+         g.lineStyle(0, 0, 0);
          g.beginFill(color, alpha);
          g.drawRect(x, y, w, th);                 // top
          g.drawRect(x, y + h - th, w, th);        // bottom
          g.drawRect(x, y + th, th, h - 2 * th);   // left
          g.drawRect(x + w - th, y + th, th, h - 2 * th);   // right
          g.endFill();
+         g.lineStyle(0, 0, 0);
       }
 
       // 0.0.59 ARTIFACT-PROOF DIAGONAL: a FILLED thin quad between two points instead of a lineStyle stroke.
@@ -423,11 +423,24 @@ package pipos
          var len:Number = Math.sqrt(dx * dx + dy * dy);
          if (len < 0.01) { return; }
          var nx:Number = (-dy / len) * (th / 2), ny:Number = (dx / len) * (th / 2);
-         g.lineStyle();   // belt: guarantee NO stroke is active for this path
+         g.lineStyle(0, 0, 0);   // explicit transparent stroke defeats GFx retained-pen state
          g.beginFill(color, alpha);
          g.moveTo(x0 + nx, y0 + ny); g.lineTo(x1 + nx, y1 + ny);
          g.lineTo(x1 - nx, y1 - ny); g.lineTo(x0 - nx, y0 - ny);
          g.endFill();
+      }
+
+      // Fill-only segmented circle for shared/repainted Graphics objects.
+      public static function circleLine(g:Graphics, cx:Number, cy:Number, r:Number, color:uint, alpha:Number = 1, th:Number = 1, segments:int = 20):void
+      {
+         if (segments < 8) { segments = 8; }
+         var px:Number = cx + r, py:Number = cy;
+         for (var i:int = 1; i <= segments; i++) {
+            var a:Number = (Math.PI * 2 * i) / segments;
+            var nx:Number = cx + Math.cos(a) * r, ny:Number = cy + Math.sin(a) * r;
+            fillLine(g, px, py, nx, ny, color, alpha, th);
+            px = nx; py = ny;
+         }
       }
 
       // 0.0.59: display-sanitize an externally-supplied tab label (PipboyTabs inis can carry glyphs outside the
@@ -461,7 +474,7 @@ package pipos
             var e:Object = entries[i];
             var kt:TextField = mk(bar, 11, PHOS_BRIGHT, true); kt.x = x + pad; kt.y = 2; setText(kt, String(e.key));
             var bw:Number = kt.width + pad * 2;
-            g.lineStyle(1, LINE, 0.45); g.drawRoundRect(x, 0, bw, boxH, 3, 3); g.lineStyle();
+            frameRect(g, x, 0, bw, boxH, LINE, 0.45);
             var lt:TextField = mk(bar, 11, PHOS_DIM, true); lt.x = x + bw + gap; lt.y = 2; setText(lt, String(e.label));
             x = lt.x + lt.width + space;
          }

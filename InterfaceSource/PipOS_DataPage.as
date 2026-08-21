@@ -246,11 +246,28 @@ package
          if (!routed) { BGSExternalInterface.call(this.codeObj,"onNewTab",i); }
       }
 
+      private var _lifeEvt:Boolean = false;
       override protected function onPipboyChangeEvent(param1:PipboyChangeEvent):void
       {
          super.onPipboyChangeEvent(param1);
+         if (!this._lifeEvt) { this._lifeEvt = true; Theme.life("DA.e" + param1.DataObj.CurrentTab); }
+         this.applyData(param1.DataObj);
+      }
+
+      // The stock shell can stage a repaired DATA page without delivering its first PipboyChangeEvent. Chrome's
+      // shell medic calls this public, idempotent entry point immediately after the page is attached, matching
+      // the field-proven STATUS recovery path. Without it, the page constructor runs but QuestsList is never read.
+      public function PipOSForceRefresh(d:Pipboy_DataObj):void
+      {
+         Theme.life("DA.f" + (d != null ? d.CurrentTab : 9));
+         this.applyData(d);
+      }
+
+      private function applyData(d:Pipboy_DataObj):void
+      {
+         if (d == null) { return; }
          this.ensureText(); if (!this._textBuilt) { return; }
-         var d:Pipboy_DataObj = param1.DataObj; this._lastData = d; if (this._dbg != null) { this._dbg.change(); this._dbg.pageTab(d.CurrentPage, d.CurrentTab); } this._curTab = d.CurrentTab; this.updateSubtabs();
+         this._lastData = d; if (this._dbg != null) { this._dbg.change(); this._dbg.pageTab(d.CurrentPage, d.CurrentTab); } this._curTab = d.CurrentTab; this.updateSubtabs();
          // 0.0.50 PBT COMPAT: CurrentTab >= 3 = a PipboyTabs-injected tab (AFFINITY/CHALLENGES here); its clip
          // overlays the page, so hide ALL our content (subtab strip stays) and render nothing.
          var pbtOn:Boolean = (this._curTab >= 3);

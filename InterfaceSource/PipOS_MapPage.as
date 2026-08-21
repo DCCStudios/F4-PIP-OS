@@ -20,9 +20,11 @@ package
       private var _subtabs:Sprite;
       private var _region:TextField;
       private var _grid:TextField;
+      private var _mapName:TextField;
       // (legend is drawn as vectors in drawLegend)
       private var _mapArea:Sprite;   // engine draws here after RegisterMap; also our marker overlay
       private var _markers:Sprite;
+      private var _legend:Sprite;
       private var _curTab:int = -1;
       private var _lastData:Pipboy_DataObj;
       private var _registered:Boolean = false;
@@ -66,11 +68,22 @@ package
 
       private function buildChrome():void
       {
-         this._title = Theme.tf(22, Theme.PHOS_BRIGHT, true); this._title.x = Theme.CX; this._title.y = Theme.TITLE_Y; Theme.setText(this._title, "MAP"); addChild(this._title);
+         this._title = Theme.tf(22, Theme.PHOS_BRIGHT, true); this._title.x = Theme.CX; this._title.y = Theme.TITLE_Y; Theme.setText(this._title, "MAP"); addChild(this._title); this._title.visible = false;
          this._subtabs = new Sprite(); this._subtabs.y = Theme.SUB_Y; addChild(this._subtabs);
          var g:* = this.graphics;
          Theme.panelR(g, this._panels, this.MAP_X, this.MAP_Y, this.MAP_W, this.MAP_H, 0.5);
          Theme.brackets(g, this.MAP_X, this.MAP_Y, this.MAP_W, this.MAP_H, 18, Theme.PHOS, 0.7);
+         // Mockup map telemetry plates. They remain above the engine map surface and use fixed geometry so
+         // location-name refreshes never resize a text-bearing field during an input dispatch.
+         g.lineStyle(0, 0, 0); g.beginFill(Theme.PANEL, 0.78);
+         g.drawRoundRect(this.MAP_X + 8, this.MAP_Y + 8, 220, 24, 5, 5);
+         g.drawRoundRect(this.MAP_X + this.MAP_W - 130, this.MAP_Y + 8, 118, 24, 5, 5);
+         g.endFill();
+         Theme.frameRect(g, this.MAP_X + 8, this.MAP_Y + 8, 220, 24, Theme.PHOS, 0.42);
+         Theme.frameRect(g, this.MAP_X + this.MAP_W - 130, this.MAP_Y + 8, 118, 24, Theme.PHOS, 0.42);
+         g.lineStyle(0, 0, 0); g.beginFill(Theme.PANEL, 0.78);
+         g.drawRoundRect(Theme.INFO_R - 180, Theme.TITLE_Y, 180, 24, 5, 5);
+         g.endFill(); Theme.frameRect(g, Theme.INFO_R - 180, Theme.TITLE_Y, 180, 24, Theme.PHOS, 0.38);
 
          this._mapArea = new Sprite(); this._mapArea.x = this.MAP_X; this._mapArea.y = this.MAP_Y; addChild(this._mapArea);
          this._mapArea.name = "MapArea_mc";
@@ -79,9 +92,15 @@ package
          hit.addEventListener(MouseEvent.CLICK, this.onMapClick); this._mapArea.addChild(hit);
          this._markers = new Sprite(); this._mapArea.addChild(this._markers);
 
-         this._region = Theme.tf(14, Theme.PHOS, false, "right"); this._region.y = Theme.TITLE_Y + 3; Theme.setText(this._region, "COMMONWEALTH");
-         addChild(this._region); this._region.x = Theme.INFO_R - this._region.width;
-         this._grid = Theme.tf(12, Theme.PHOS_DIM, false); this._grid.x = this.MAP_X + Theme.PAD; this._grid.y = this.MAP_Y + Theme.PAD; Theme.setText(this._grid, "GRID -"); addChild(this._grid);
+         this._region = Theme.tf(12, Theme.PHOS, true, "right"); addChild(this._region);
+         this._region.autoSize = "none"; this._region.width = 180; this._region.height = 22;
+         this._region.x = Theme.INFO_R - 180; this._region.y = Theme.TITLE_Y + 3; Theme.setText(this._region, "REGION  COMMONWEALTH");
+         this._grid = Theme.tf(11, Theme.PHOS_DIM, false); addChild(this._grid);
+         this._grid.autoSize = "none"; this._grid.width = 210; this._grid.height = 20;
+         this._grid.x = this.MAP_X + 16; this._grid.y = this.MAP_Y + 12; Theme.setText(this._grid, "GRID -");
+         this._mapName = Theme.tf(10, Theme.PHOS_BRIGHT, true, "right"); addChild(this._mapName);
+         this._mapName.autoSize = "none"; this._mapName.width = 104; this._mapName.height = 18;
+         this._mapName.x = this.MAP_X + this.MAP_W - 122; this._mapName.y = this.MAP_Y + 13; Theme.setText(this._mapName, "COMMONWEALTH");
          this.drawLegend();
          addEventListener(KeyboardEvent.KEY_DOWN, this.onKey);
       }
@@ -89,13 +108,14 @@ package
       // Vector legend (glyphs ▲◆●✚ are outside the embedded Basic-Latin range, so draw them).
       private function drawLegend():void
       {
-         var lg:Sprite = new Sprite(); lg.x = this.MAP_X + Theme.PAD; lg.y = this.MAP_Y + this.MAP_H - Theme.PAD - 12; addChild(lg);
-         var g:* = lg.graphics; var x:Number = 0;
-         var items:Array = [["player", Theme.PHOS_BRIGHT, 4], ["quest", Theme.WARN, 3], ["location", Theme.PHOS, 3], ["custom", Theme.SEL, 3]];
+         this._legend = new Sprite(); this._legend.x = this.MAP_X + 10; this._legend.y = this.MAP_Y + this.MAP_H - 36; addChild(this._legend);
+         var g:* = this._legend.graphics; var x:Number = 12;
+         g.lineStyle(0, 0, 0); g.beginFill(Theme.PANEL, 0.82); g.drawRoundRect(0,0,286,26,5,5); g.endFill(); Theme.frameRect(g, 0, 0, 286, 26, Theme.PHOS, 0.38);
+         var items:Array = [["PLAYER", Theme.PHOS_BRIGHT, 4], ["QUEST TARGET", Theme.WARN, 3], ["LOCATION", Theme.PHOS, 3]];
          for each (var it:Array in items)
          {
             g.beginFill(uint(it[1]), 0.9); g.drawCircle(x + 4, 8, Number(it[2])); g.endFill();
-            var t:TextField = Theme.tf(11, Theme.PHOS_DIM, false); t.x = x + 12; t.y = 0; Theme.setText(t, String(it[0])); lg.addChild(t);
+            var t:TextField = Theme.tf(10, Theme.PHOS_DIM, false); t.x = x + 12; t.y = 3; Theme.setText(t, String(it[0])); this._legend.addChild(t);
             x += 12 + t.width + 16;
          }
       }
@@ -113,7 +133,11 @@ package
             var hit:Sprite = new Sprite(); hit.graphics.beginFill(0,0); hit.graphics.drawRect(x-4,-2,t.width+8,22); hit.graphics.endFill();
             hit.name = "h"+i; hit.buttonMode = true; hit.addEventListener(MouseEvent.MOUSE_DOWN, this.onSubtabClick);
             this._subtabs.addChild(hit); this._subtabs.addChild(t);
-            if (on) { this._subtabs.graphics.beginFill(Theme.PHOS,0.9); this._subtabs.graphics.drawRect(x-4,20,t.width+8,2); this._subtabs.graphics.endFill(); }
+            if (on) {
+               var cx:Number = x + t.width / 2; this._subtabs.graphics.beginFill(Theme.SEL,0.95);
+               this._subtabs.graphics.drawCircle(cx-7,22,1.4); this._subtabs.graphics.drawCircle(cx,22,1.4); this._subtabs.graphics.drawCircle(cx+7,22,1.4);
+               this._subtabs.graphics.endFill();
+            }
             x += t.width + 26;
          }
       }
@@ -123,7 +147,15 @@ package
       {
          var d:Pipboy_DataObj = param1.DataObj; this._lastData = d; this._curTab = d.CurrentTab; this.buildSubtabs();
          Theme.setText(this._title, (this._curTab == 1) ? "LOCAL MAP" : "WORLD MAP");
-         if (d.CurrLocationName != null && d.CurrLocationName.length > 0) { Theme.setText(this._region, d.CurrLocationName.toUpperCase()); this._region.x = Theme.INFO_R - this._region.width; Theme.setText(this._grid, "GRID · " + d.CurrLocationName.toUpperCase()); }
+         Theme.setText(this._mapName, (this._curTab == 1) ? "LOCAL" : "COMMONWEALTH");
+         if (d.CurrLocationName != null && d.CurrLocationName.length > 0) {
+            var location:String = d.CurrLocationName.toUpperCase();
+            Theme.setText(this._region, "REGION  " + location);
+            Theme.setText(this._grid, "GRID C-4 · " + location);
+         } else {
+            Theme.setText(this._region, "REGION  COMMONWEALTH");
+            Theme.setText(this._grid, "GRID -");
+         }
          this.renderMarkers(d);
          SetIsDirty();
       }

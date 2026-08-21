@@ -1,15 +1,23 @@
 #include "PCH.h"
+#include "CharacterAnimation.h"
 #include "CharacterCapture.h"
 #include "PipboyBridge.h"
 #include "RE_BSSkin.h"   // 0.0.73: full BSSkin::Instance layout (TF3DHUD, offset-asserted) -- the fork only forward-declares it
+#include "RE_Face.h"
 #include "Settings.h"
 #include "Scaleform/G/GFx_ASMovieRootBase.h"
+#include "REL/ASM.h"
+#include "RE/P/PowerArmor.h"
+#include "RE/A/AIProcess.h"
+#include "RE/T/TESEquipEvent.h"
 
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <limits>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -83,6 +91,9 @@ namespace PipOS
         constexpr float kVanillaDisplayTop = 79.875f;
         constexpr float kVanillaDisplayRight = 148.125f;
         constexpr float kVanillaDisplayBottom = -79.875f;
+        // Page visibility fallback: retain the live preview and its animation graph, but place the model far
+        // outside the offscreen camera whenever Inventory is inactive. The configured X value is never mutated.
+        constexpr float kNonInventoryModelOffsetX = 10000.0f;
 
         // Centered display-plane sub-rect (left<=0, right>=0, top>=0, bottom<=0). Used for both the full-frame
         // extents and the clipped figure-slot window.
@@ -110,16 +121,53 @@ namespace PipOS
         std::atomic<bool> g_dirty{ true };          // rebuild requested (set on menu open / after release)
         std::atomic<bool> g_taskInFlight{ false };  // collapses worker-thread hook multiplicity -> 1 pass queued
         std::atomic<bool> g_failed{ false };        // hard-disable for the rest of the session on any failure
+        std::atomic<bool> g_inventoryPageActive{ false }; // unknown pages start safely offscreen; never gates construction
+        std::atomic<bool> g_pageProbeInFlight{ false };
+        std::atomic<bool> g_rendererRecreateRequested{ false };
+        std::atomic<bool> g_equipmentSettleRequested{ false };
 
         // ---- MAIN-THREAD-ONLY scene state (only ever touched inside RunCaptureTask / teardown tasks, which
         //      F4SE drains serially on the game main thread -- so no lock is required) ----
         bool g_visible{ false };
         RE::Interface3D::Renderer* g_renderer{ nullptr };
         RE::NiPointer<RE::NiAVObject> g_previewRoot;
+        RE::NiPointer<RE::BSFaceGenNiNode> g_previewFaceNode;
         RE::NiPointer<RE::NiAVObject> g_displayRoot;
         const RE::NiAVObject* g_sourceRoot{ nullptr };  // detect a player-3D swap -> rebuild
+        std::uint64_t g_sourceBipedSignature{ 0 };      // diagnose Pip-Boy's temporary selected-item biped swaps
+        std::uint64_t g_sourceVisualSignature{ 0 };
+        std::uint64_t g_equipmentCandidateSignature{ 0 };
+        std::uint32_t g_equipmentStablePasses{ 0 };
+        std::atomic_bool g_loggedTransientBipedPreview{ false };
         RE::NiTransform g_baseTransform;                // framed transform; breathing is added on top
         float g_idleTime{ 0.0f };
+        std::recursive_mutex g_sceneLock;
+
+        struct PlacementSnapshot
+        {
+            float scale{ -1.0f };
+            float fov{ -1.0f };
+            float yaw{ -999.0f };
+            float pitch{ -999.0f };
+            float roll{ -999.0f };
+            float distance{ -1.0f };
+            int target{ -1 };
+            float clipLeft{ -1.0f };
+            float clipTop{ -1.0f };
+            float clipRight{ -1.0f };
+            float clipBottom{ -1.0f };
+            float screenX{ -999.0f };
+            float screenY{ -999.0f };
+            float keyIntensity{ -1.0f };
+            float fillIntensity{ -1.0f };
+            float rimIntensity{ -1.0f };
+            std::uint32_t slotMask{ 0 };
+            bool antiAliasing{ false };
+            bool cloth{ false };
+            bool hologram{ false };
+            bool inventoryPageActive{ true };
+        };
+        PlacementSnapshot g_livePlacement;
 
         // Display-mesh clip-rect state (TF3DHUD Renderer.cpp). g_privateDisplayRendererData owns the rebuilt
         // BSGraphics::TriShape we substitute for the vanilla quad; g_appliedDisplayBounds caches the last
@@ -127,19 +175,28 @@ namespace PipOS
         RE::BSGraphics::TriShape* g_privateDisplayRendererData{ nullptr };
         DisplayBounds g_appliedDisplayBounds{};
         bool g_displayClipApplied{ false };
+        bool g_displayAttached{ false };
 
         using RunActorUpdates_t = void(void*, float, bool);
         RunActorUpdates_t* g_origRunActorUpdates{ nullptr };
+        using Update3DModel_t = void(RE::AIProcess*, RE::Actor*, bool);
+        Update3DModel_t* g_origUpdate3DModel{ nullptr };
+        REL::Relocation<RE::BSTEventSource<RE::TESEquipEvent>*> g_equipEventSource{ REL::ID(485633) };
 
         using RenderSceneDeferred_t = void(
             RE::NiCamera*, RE::BSShaderAccumulator*, RE::BSCullingProcess*, RE::ShadowSceneNode*,
             std::int32_t, std::int32_t, bool, bool);
         using BSRenderPassCtor_t = void(void*, void*, void*, void*, std::uint32_t, std::uint8_t, void*);
+        using RenderPrepassesAndMenus_t = void(RE::Interface3D::Renderer*);
+        using ProcessGraphEvent_t = std::uint32_t(RE::BSAnimationGraphManager*, const RE::BSFixedString&);
         RenderSceneDeferred_t* g_origRenderSceneDeferred{ nullptr };
         BSRenderPassCtor_t* g_origBSRenderPassCtor{ nullptr };
+        RenderPrepassesAndMenus_t* g_origRenderPrepassesAndMenus{ nullptr };
+        ProcessGraphEvent_t* g_origProcessGraphEvent{ nullptr };
         thread_local bool g_inPipOSDeferredRender{ false };
         std::atomic<bool> g_loggedDeferredHook{ false };
         std::atomic<bool> g_loggedCompositeHook{ false };
+        std::atomic<bool> g_loggedLivePoseSync{ false };
 
         // TF3DHUD Address.cpp, OG 1.10.163. These are invoked only after both measured call sites pass their
         // E8 opcode guards during Install, so an unexpected executable/runtime degrades to no character pass.
@@ -149,10 +206,109 @@ namespace PipOS
             const RE::Actor*, RE::NiAVObject*, const RE::BGSBodyPartDefs::LIMB_ENUM*, bool)>
             g_getActorBodyPart3D{ REL::ID(157573) };
         REL::Relocation<RE::NiAVObject* (*)(RE::NiAVObject*)> g_convertNodeTree{ REL::ID(633230) };
+        REL::Relocation<void (*)(void*, RE::NiAVObject*, bool)> g_fixFaceGenHeadSkinInstances{
+            REL::ID(1131949)
+        };
+        REL::Relocation<void (*)(RE::TESNPC*, RE::NiColorA&, void*, bool, bool)> g_calculateBodyTintColor{
+            REL::ID(134537)
+        };
+        REL::Relocation<void (*)(RE::NiAVObject*, const RE::NiColorA&)> g_updateBodyTintColorsOnScene{
+            REL::ID(49935)
+        };
+        REL::Relocation<void (*)(void*, bool)> g_updateAllChildrenMorphData{ REL::ID(213436) };
+        REL::Relocation<RE::NiExtraData* (*)(
+            RE::NiAVObject&, const char*, const RE::NiTransform&, RE::NiAVObject*)>
+            g_createClothFor3D{ REL::ID(1322043) };
+        REL::Relocation<void (*)(RE::NiExtraData*, bool)> g_setClothSettle{ REL::ID(638869) };
+        REL::Relocation<void (*)(RE::NiExtraData*, void*)> g_setClothWorld{ REL::ID(19064) };
 
         // Forward decls (definitions live further down, next to the contract push they wrap).
         void SchedulePushContract();
+        void ScheduleInventoryPageProbe();
         void SanitizeClone(RE::NiAVObject& a_root, RE::NiAVObject* a_source);
+        void RunCaptureTask(float a_delta);
+
+        void QueueCapturePass(float a_delta)
+        {
+            bool expected = false;
+            if (!g_taskInFlight.compare_exchange_strong(expected, true)) { return; }
+            auto* task = F4SE::GetTaskInterface();
+            if (!task) { g_taskInFlight.store(false); return; }
+            task->AddTask([a_delta]() { RunCaptureTask(a_delta); });
+        }
+
+        std::int32_t MakeRel32Displacement(std::uintptr_t a_sourceNext, std::uintptr_t a_destination)
+        {
+            const auto displacement = static_cast<std::int64_t>(a_destination) -
+                                      static_cast<std::int64_t>(a_sourceNext);
+            if (displacement < (std::numeric_limits<std::int32_t>::min)() ||
+                displacement > (std::numeric_limits<std::int32_t>::max)()) {
+                logger::error("[PipOS][3D] branch gateway rel32 displacement out of range");
+                return 0;
+            }
+            return static_cast<std::int32_t>(displacement);
+        }
+
+        void WriteBranch5(std::uintptr_t a_source, std::uintptr_t a_destination)
+        {
+            auto& trampoline = REL::GetTrampoline();
+            const auto branch = trampoline.allocate_branch5(a_destination);
+            const REL::ASM::JMP5 assembly{
+                MakeRel32Displacement(a_source + sizeof(REL::ASM::JMP5), branch)
+            };
+            REL::WriteSafeData(a_source, assembly);
+        }
+
+        bool ReadExistingBranchTarget(
+            std::uintptr_t a_targetAddress, const std::byte* a_targetBytes, std::uintptr_t& a_branchTarget)
+        {
+            if (a_targetBytes[0] == std::byte{ 0xE9 }) {
+                std::int32_t displacement = 0;
+                std::memcpy(std::addressof(displacement), a_targetBytes + 1, sizeof(displacement));
+                a_branchTarget = a_targetAddress + sizeof(REL::ASM::JMP5) + displacement;
+                return a_branchTarget != 0;
+            }
+            if (a_targetBytes[0] == std::byte{ 0xFF } && a_targetBytes[1] == std::byte{ 0x25 }) {
+                std::int32_t displacement = 0;
+                std::memcpy(std::addressof(displacement), a_targetBytes + 2, sizeof(displacement));
+                const auto indirectAddress = a_targetAddress + sizeof(REL::ASM::JMP6) + displacement;
+                std::memcpy(std::addressof(a_branchTarget),
+                    reinterpret_cast<const void*>(indirectAddress), sizeof(a_branchTarget));
+                return a_branchTarget != 0;
+            }
+            return false;
+        }
+
+        template <class T>
+        T CreateBranchGateway5(
+            const char* a_name, REL::Relocation<std::uintptr_t>& a_target, void* a_hook)
+        {
+            constexpr std::size_t kPrologueSize = 5;
+            const auto targetAddress = a_target.address();
+            const auto* targetBytes = reinterpret_cast<const std::byte*>(targetAddress);
+            auto& trampoline = REL::GetTrampoline();
+
+            std::uintptr_t existingBranchTarget = 0;
+            if (ReadExistingBranchTarget(targetAddress, targetBytes, existingBranchTarget)) {
+                auto* gateway = trampoline.allocate<REL::ASM::JMP14>(existingBranchTarget);
+                WriteBranch5(targetAddress, reinterpret_cast<std::uintptr_t>(a_hook));
+                logger::info("[PipOS][3D] {} chained through existing branch {:X}", a_name, existingBranchTarget);
+                return reinterpret_cast<T>(gateway);
+            }
+            if (targetBytes[0] == std::byte{ 0xE8 }) {
+                logger::error(std::format("[PipOS][3D] {} gateway refused unexpected CALL prologue", a_name));
+                return nullptr;
+            }
+
+            auto* gateway = static_cast<std::byte*>(
+                trampoline.allocate(kPrologueSize + sizeof(REL::ASM::JMP14)));
+            std::memcpy(gateway, targetBytes, kPrologueSize);
+            const REL::ASM::JMP14 jumpBack{ targetAddress + kPrologueSize };
+            std::memcpy(gateway + kPrologueSize, std::addressof(jumpBack), sizeof(jumpBack));
+            WriteBranch5(targetAddress, reinterpret_cast<std::uintptr_t>(a_hook));
+            logger::info("[PipOS][3D] {} branch gateway installed @ {:X}", a_name, targetAddress);
+            return reinterpret_cast<T>(gateway);
+        }
 
         // ------------------------------------------------------------------ traversal helpers
         void ForEachAVObject(RE::NiAVObject* a_object, const std::function<void(RE::NiAVObject&)>& a_fn)
@@ -426,7 +582,8 @@ namespace PipOS
             // 0.0.76: source flattened tree -- needed to recover NULL bone slots by pointer identity (below).
             auto* srcTree = a_source ? FindFlattenedBoneTree(a_source) : nullptr;
 
-            int boundBones = 0, geoms = 0, sharedSkipped = 0, unresolved = 0, viaTree = 0, nullFixed = 0, nullDropped = 0;
+            int boundBones = 0, geoms = 0, sharedSkipped = 0, unresolved = 0, viaTree = 0;
+            int nullFixedDest = 0, nullFixedSource = 0, nullDropped = 0;
             ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
                 auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object));
                 if (!geometry) { return; }
@@ -452,31 +609,39 @@ namespace PipOS
                         RE::NiTransform* stale = (!skin->worldTransforms.empty()) ? skin->worldTransforms[i] : nullptr;
                         RE::NiAVObject* nb = nullptr;
                         RE::NiTransform* nw = nullptr;
-                        if (stale && srcTree && srcTree->bone && flattened->bone) {
-                            for (std::int32_t k = 0; k < srcTree->boneCount; ++k) {
-                                if (stale == std::addressof(srcTree->bone[k].world)) {
-                                    if (k < flattened->boneCount) {
-                                        auto& cb = flattened->bone[k];   // exact clone => same bone order
-                                        nb = cb.node.get();
-                                        nw = std::addressof(cb.world);
-                                    }
-                                    if (!nw) {
-                                        const char* bn = srcTree->bone[k].name.c_str();
-                                        if (bn && bn[0] != '\0') {
-                                            if (auto* fb = FindFlattenedBoneByName(*flattened, std::string_view(bn))) {
-                                                nb = fb->node.get();
-                                                nw = std::addressof(fb->world);
-                                            }
-                                        }
-                                    }
+                        // TF3DHUD's seeded clone mapping makes skin->rootNode point at the FRESH skeleton before
+                        // the clone is processed. Therefore a null bone's worldTransforms slot can already point
+                        // into the DESTINATION flattened array. 0.0.79 searched only the live source array and
+                        // dropped all 229 such slots. Match the destination first, exactly like TF3DHUD's
+                        // ResolveNullSkinBonesFromFlattenedTree, then retain source matching for fallback clones.
+                        if (stale && flattened->bone) {
+                            for (std::int32_t k = 0; k < flattened->boneCount; ++k) {
+                                if (stale == std::addressof(flattened->bone[k].world)) {
+                                    nb = flattened->bone[k].node.get();
+                                    nw = std::addressof(flattened->bone[k].world);
+                                    ++nullFixedDest;
                                     break;
                                 }
+                            }
+                        }
+                        if (!nw && stale && srcTree && srcTree->bone && flattened->bone) {
+                            for (std::int32_t k = 0; k < srcTree->boneCount; ++k) {
+                                if (stale != std::addressof(srcTree->bone[k].world)) { continue; }
+                                const char* bn = srcTree->bone[k].name.c_str();
+                                if (bn && bn[0] != '\0') {
+                                    if (auto* fb = FindFlattenedBoneByName(*flattened, std::string_view(bn))) {
+                                        nb = fb->node.get();
+                                        nw = std::addressof(fb->world);
+                                    }
+                                }
+                                if (nw) { ++nullFixedSource; }
+                                break;
                             }
                         }
                         if (nw) {
                             if (nb) { skin->bones[i] = nb; }
                             skin->worldTransforms[i] = nw;
-                            ++nullFixed; ++boundBones;
+                            ++boundBones;
                         } else {
                             if (!skin->worldTransforms.empty()) { skin->worldTransforms[i] = nullptr; }
                             ++nullDropped; ++unresolved;
@@ -515,8 +680,8 @@ namespace PipOS
                 ++geoms;
             });
             // AUDIT F3: honest field signal -- bones actually rebound, not just geometries touched.
-            logger::info("[PipOS][3D] skin rebind: {} bones rebound ({} via whole-tree, {} null-slots recovered by pointer identity, {} null-slots dropped) across {} geometries ({} shared skipped, {} unresolved)",
-                boundBones, viaTree, nullFixed, nullDropped, geoms, sharedSkipped, unresolved);
+            logger::info("[PipOS][3D] skin rebind: {} bones rebound ({} via whole-tree, {} null-slots recovered from destination, {} from source, {} dropped) across {} geometries ({} shared skipped, {} unresolved)",
+                boundBones, viaTree, nullFixedDest, nullFixedSource, nullDropped, geoms, sharedSkipped, unresolved);
             return boundBones;
         }
 
@@ -551,6 +716,77 @@ namespace PipOS
             return it == a_nodes.end() || !it->second ? nullptr : netimmerse_cast<RE::NiNode*>(it->second);
         }
 
+        RE::NiNode* FindRightHandWeaponNode(RE::NiAVObject& a_previewRoot, const PreviewNodeMap& a_nodes)
+        {
+            // BSFlattenedBoneTree does not represent its logical bone hierarchy through NiNode::children.
+            // Resolve the authoritative skeleton entry directly, then verify its flattened parent chain reaches
+            // RArm_Hand. This prevents an equipment clone's duplicate Weapon node from winning name lookup while
+            // still honoring the hierarchy that the behavior graph actually animates.
+            auto* flattened = FindFlattenedBoneTree(std::addressof(a_previewRoot));
+            auto* weaponBone = flattened ? FindFlattenedBoneByName(*flattened, "Weapon") : nullptr;
+            if (!flattened || !weaponBone || !weaponBone->node) { return nullptr; }
+
+            auto parentIndex = weaponBone->parent;
+            bool belowRightHand = false;
+            const char* immediateParent = "<none>";
+            for (std::int32_t depth = 0;
+                 parentIndex >= 0 && parentIndex < flattened->boneCount && depth < flattened->boneCount;
+                 ++depth) {
+                auto& ancestor = flattened->bone[parentIndex];
+                const char* ancestorName = ancestor.name.c_str();
+                if (depth == 0 && ancestorName && ancestorName[0] != '\0') { immediateParent = ancestorName; }
+                if (ancestorName && std::string_view(ancestorName) == "RArm_Hand") {
+                    belowRightHand = true;
+                    break;
+                }
+                parentIndex = ancestor.parent;
+            }
+            if (!belowRightHand) {
+                logger::error(std::format(
+                    "[PipOS][3D] flattened Weapon bone rejected: immediateParent='{}' does not descend from RArm_Hand",
+                    immediateParent));
+                return nullptr;
+            }
+
+            auto* weaponNode = weaponBone->node.get();
+            if (!weaponNode || FindPreviewNode(a_nodes, "Weapon") != weaponNode) {
+                logger::error("[PipOS][3D] flattened Weapon bone rejected: authoritative node-map mismatch");
+                return nullptr;
+            }
+            logger::info(
+                "[PipOS][3D] flattened Weapon bone resolved: bone='Weapon' immediateParent='{}' ancestor='RArm_Hand'",
+                immediateParent);
+            return weaponNode;
+        }
+
+        RE::NiNode* EnsureRightHandWeaponNode(RE::NiAVObject& a_previewRoot, PreviewNodeMap& a_nodes)
+        {
+            if (auto* existing = FindRightHandWeaponNode(a_previewRoot, a_nodes)) { return existing; }
+
+            // The field race skeleton has RArm_Hand but no authored Weapon entry. Refusing the equipment made
+            // every slot-41 firearm disappear. Add the missing conventional child explicitly so the weapon mesh
+            // has the requested hierarchy and follows the authoritative animated right-hand node.
+            auto* rightHand = FindPreviewNode(a_nodes, "RArm_Hand");
+            if (!rightHand) {
+                logger::error("[PipOS][3D] synthetic Weapon node failed: RArm_Hand is missing");
+                return nullptr;
+            }
+
+            auto weaponNode = RE::make_nismart<RE::NiNode>(0);
+            weaponNode->name = RE::BSFixedString("Weapon");
+            weaponNode->SetLocalTransform(RE::NiTransform::IDENTITY);
+            weaponNode->fadeAmount = 1.0f;
+            rightHand->AttachChild(weaponNode.get(), false);
+            auto* result = weaponNode.get();
+            a_nodes.insert_or_assign("Weapon", result);
+
+            RE::NiUpdateData updateData{};
+            a_previewRoot.Update(updateData);
+            logger::info(
+                "[PipOS][3D] synthetic Weapon node created: parent='RArm_Hand' local=(0,0,0) scale=1");
+            return result;
+        }
+
         RE::NiStringExtraData* FindStringExtraDataInTree(RE::NiAVObject& a_root, const RE::BSFixedString& a_name)
         {
             RE::NiStringExtraData* result = nullptr;
@@ -560,6 +796,22 @@ namespace PipOS
                 }
             });
             return result;
+        }
+
+        [[nodiscard]] bool IsEngineWeaponAttachSlot(const RE::BIPED_OBJECT a_slot)
+        {
+            // Fallout 4 assigns weapon models to runtime biped slots 32-39 and 41-43. Guns use slot 41,
+            // which the earlier reduced port missed and consequently attached at the preview root.
+            const auto slot = std::to_underlying(a_slot);
+            return slot >= 32 && (slot <= 39 || (slot >= 41 && slot <= 43));
+        }
+
+        void AttachChildLikeEngine(RE::NiAVObject& a_child, RE::NiNode& a_parent)
+        {
+            if (a_child.parent == std::addressof(a_parent)) { return; }
+            RE::NiPointer<RE::NiAVObject> keepAlive(std::addressof(a_child));
+            if (auto* oldParent = a_child.parent) { oldParent->DetachChild(std::addressof(a_child)); }
+            a_parent.AttachChild(keepAlive.get(), true);
         }
 
         RE::NiPointer<RE::NiAVObject> CloneBipedPartToFreshSkeleton(
@@ -604,6 +856,43 @@ namespace PipOS
             return clone ? RE::NiPointer<RE::NiAVObject>(static_cast<RE::NiAVObject*>(clone)) : nullptr;
         }
 
+        [[nodiscard]] RE::NiTransform SeedLiveWeaponLocal(RE::PlayerCharacter& a_player)
+        {
+            if (const auto& biped = a_player.GetBiped(false); biped) {
+                for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
+                    const auto& object = biped->object[i];
+                    if (!object.parent.object || !object.parent.object->Is(RE::ENUM_FORM_ID::kWEAP) ||
+                        !object.partClone) {
+                        continue;
+                    }
+                    for (auto* parent = object.partClone->parent; parent; parent = parent->parent) {
+                        const char* name = parent->GetName().c_str();
+                        if (name && std::string_view(name) == "Weapon") {
+                            return parent->GetLocalTransform();
+                        }
+                    }
+                }
+            }
+            return RE::NiTransform::IDENTITY;
+        }
+
+        [[nodiscard]] bool FindSourceWeaponLocal(
+            const RE::NiAVObject& a_sourcePart, RE::NiTransform& a_out)
+        {
+            // The engine-built partClone is the authoritative source for this exact weapon instance. Its nearest
+            // Weapon ancestor owns the hand-space transform that BipedAnim normally supplies before the geometry
+            // reaches Scb. Resolve it before cloning so a weapon swap cannot accidentally reuse another biped
+            // object's transform or whatever live pose happened to exist when the menu opened.
+            for (auto* parent = a_sourcePart.parent; parent; parent = parent->parent) {
+                const char* name = parent->GetName().c_str();
+                if (name && std::string_view(name) == "Weapon") {
+                    a_out = parent->GetLocalTransform();
+                    return true;
+                }
+            }
+            return false;
+        }
+
         RE::NiPointer<RE::NiAVObject> LoadFreshRaceSkeleton(RE::PlayerCharacter& a_player)
         {
             auto* race = a_player.GetVisualsRace();
@@ -640,6 +929,23 @@ namespace PipOS
 
             auto previewRoot = CloneSubtree(*loadedRoot);
             if (!previewRoot) { return nullptr; }
+            // This field race skeleton omits the conventional right-hand Weapon node. Add it before the actor
+            // skeleton is flattened so it becomes an authoritative flattened bone and the private behavior
+            // graph can update it. Adding an ordinary wrapper after flattening left it outside the graph; copying
+            // a live pose onto the weapon clone then aligned only the first open.
+            if (!previewRoot->GetObjectByName(RE::BSFixedString("Weapon"))) {
+                auto* handObject = previewRoot->GetObjectByName(RE::BSFixedString("RArm_Hand"));
+                auto* hand = handObject ? handObject->IsNode() : nullptr;
+                if (hand) {
+                    auto weaponNode = RE::make_nismart<RE::NiNode>(0);
+                    weaponNode->name = RE::BSFixedString("Weapon");
+                    weaponNode->SetLocalTransform(SeedLiveWeaponLocal(a_player));
+                    weaponNode->fadeAmount = 1.0f;
+                    hand->AttachChild(weaponNode.get(), false);
+                    logger::info(
+                        "[PipOS][3D] authored missing Weapon node before skeleton flatten: parent='RArm_Hand'");
+                }
+            }
             constexpr auto kRootPart = RE::BGSBodyPartDefs::LIMB_ENUM::kRoot;
             auto* convertTarget = g_getActorBodyPart3D(
                 std::addressof(a_player), previewRoot.get(), std::addressof(kRootPart), false);
@@ -656,12 +962,49 @@ namespace PipOS
             }
             EngineCreateBoneMap(flattened);
             EngineCreateBoneMap(previewRoot.get());
+            if (auto* weaponBone = FindFlattenedBoneByName(*flattened, "Weapon")) {
+                logger::info(
+                    "[PipOS][3D] flattened Weapon bone published: node={} parentIndex={}",
+                    weaponBone->node != nullptr, weaponBone->parent);
+            } else {
+                logger::error("[PipOS][3D] pre-flatten Weapon node was not published into flattened bones");
+            }
             logger::info("[PipOS][3D] TF3DHUD fresh skeleton loaded: '{}' ({} flattened bones)",
                 skeletonPath, flattened->boneCount);
             return previewRoot;
         }
 
-        int PopulateFreshSkeletonFromBiped(RE::NiAVObject& a_previewRoot, const RE::BipedAnim& a_biped)
+        void* GetPlayerClothWorld(RE::PlayerCharacter& a_player)
+        {
+            auto* cell = a_player.GetParentCell();
+            auto* havokWorld = cell ? cell->GetbhkWorld() : nullptr;
+            return havokWorld ?
+                *reinterpret_cast<void**>(reinterpret_cast<std::byte*>(havokWorld) + 0x148) : nullptr;
+        }
+
+        std::uint32_t InitializePreviewCloth(
+            RE::PlayerCharacter& a_player, RE::NiAVObject& a_object,
+            RE::NiAVObject& a_previewRoot, const char* a_modelPath)
+        {
+            auto* settings = Settings::GetSingleton();
+            if (!settings || !settings->Char3DCloth() || !a_modelPath || a_modelPath[0] == '\0') { return 0; }
+            const RE::BSFixedString clothExtraName("CED");
+            auto* clothWorld = GetPlayerClothWorld(a_player);
+            std::uint32_t initialized = 0;
+            ForEachAVObject(std::addressof(a_object), [&](RE::NiAVObject& candidate) {
+                if (!candidate.GetExtraData(clothExtraName)) { return; }
+                auto* runtime = g_createClothFor3D(
+                    candidate, a_modelPath, a_previewRoot.GetWorldTransform(), std::addressof(a_previewRoot));
+                if (!runtime) { return; }
+                g_setClothSettle(runtime, true);
+                if (clothWorld) { g_setClothWorld(runtime, clothWorld); }
+                ++initialized;
+            });
+            return initialized;
+        }
+
+        int PopulateFreshSkeletonFromBiped(
+            RE::PlayerCharacter& a_player, RE::NiAVObject& a_previewRoot, const RE::BipedAnim& a_biped)
         {
             PreviewNodeMap previewNodes;
             CollectPreviewNodes(a_previewRoot, previewNodes);
@@ -670,6 +1013,8 @@ namespace PipOS
             std::unordered_set<RE::NiAVObject*> seenSources;
             int attached = 0;
             for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
+                auto* settings = Settings::GetSingleton();
+                if (i < 32 && settings && (settings->Char3DSlotMask() & (1u << i)) == 0) { continue; }
                 const auto slot = static_cast<RE::BIPED_OBJECT>(i);
                 const auto& sourceObject = a_biped.object[i];
                 auto* sourcePart = sourceObject.partClone.get();
@@ -680,17 +1025,52 @@ namespace PipOS
 
                 RE::NiNode* parent = nullptr;
                 const auto* sourceForm = sourceObject.parent.object;
-                if ((slot == RE::BIPED_OBJECT::kWeaponHand || slot == RE::BIPED_OBJECT::kWeaponStaff) &&
-                    sourceForm && sourceForm->Is(RE::ENUM_FORM_ID::kWEAP)) {
-                    parent = FindPreviewNode(previewNodes, "Weapon");
-                } else if (slot == RE::BIPED_OBJECT::kShield && sourceForm &&
-                           sourceForm->Is(RE::ENUM_FORM_ID::kWEAP)) {
+                const bool isWeaponAttach = IsEngineWeaponAttachSlot(slot) && sourceForm &&
+                    sourceForm->Is(RE::ENUM_FORM_ID::kWEAP);
+                const bool hadInternalWeapon =
+                    clone->GetObjectByName(RE::BSFixedString("Weapon")) != nullptr;
+                const bool weaponRootWasCulled = clone->GetAppCulled();
+                RE::NiTransform promotedWeaponLocal = RE::NiTransform::IDENTITY;
+                const bool haveSourceWeaponLocal = isWeaponAttach &&
+                    FindSourceWeaponLocal(*sourcePart, promotedWeaponLocal);
+                const char* promotedTransformSource = haveSourceWeaponLocal ?
+                    "source-weapon-ancestor" : "live-weapon-fallback";
+                // Match TF3DHUD and BipedAnim::AttachToParent exactly. A weapon partClone is already an
+                // engine-assembled hierarchy, normally including its own Weapon node beneath a Prn-selected
+                // RArm_Hand root. Wrapping that complete hierarchy in a second synthetic Weapon node makes the
+                // mesh disappear after the private graph publishes its pose. Fixed special cases come first,
+                // then the partClone's Prn, then the skeleton Weapon fallback only when Prn is absent/unusable.
+                if (slot == RE::BIPED_OBJECT::kWeaponHand && sourceForm &&
+                    sourceForm->Is(RE::ENUM_FORM_ID::kLIGH)) {
+                    parent = EnsureRightHandWeaponNode(a_previewRoot, previewNodes);
+                } else if (slot == RE::BIPED_OBJECT::kWeaponStaff) {
+                    parent = EnsureRightHandWeaponNode(a_previewRoot, previewNodes);
+                } else if (slot == RE::BIPED_OBJECT::kShield && isWeaponAttach) {
                     parent = FindPreviewNode(previewNodes, "WeaponLeft");
                 }
+                bool promotedWeaponRoot = false;
+                std::string prnName;
                 if (!parent) {
                     if (auto* prn = FindStringExtraDataInTree(*sourcePart, RE::BSFixedString("Prn"));
                         prn && !prn->GetValue().empty()) {
+                        prnName = prn->GetValue().c_str();
                         parent = FindPreviewNode(previewNodes, prn->GetValue());
+                    }
+                }
+                if (!parent) {
+                    // BipedAnim::AttachToParent falls back to WeaponUtils::GetWeaponBoneName for all
+                    // runtime weapon slots when the model has no usable Prn extra data.
+                    if (isWeaponAttach) {
+                        parent = FindPreviewNode(previewNodes, "Weapon");
+                        if (!parent && slot != RE::BIPED_OBJECT::kShield) {
+                            // The field race skeleton has no authored Weapon bone, and 0.0.102 proves the tested
+                            // partClones have no internal Weapon node either. Make the assembled clone root itself
+                            // the Weapon child of the existing animated RArm_Hand. This avoids a synthetic wrapper
+                            // that is absent from the flattened animation tree while preserving the requested
+                            // RArm_Hand -> Weapon -> geometry hierarchy.
+                            parent = FindPreviewNode(previewNodes, "RArm_Hand");
+                            promotedWeaponRoot = parent != nullptr;
+                        }
                     }
                 }
                 if (!parent) {
@@ -703,7 +1083,61 @@ namespace PipOS
                 if (!parent) { parent = netimmerse_cast<RE::NiNode*>(std::addressof(a_previewRoot)); }
                 if (!parent) { continue; }
 
+                if (isWeaponAttach) {
+                    // Opening the Pip-Boy culls the live weapon. The partClone inherits that root flag, so clear
+                    // only the attachment root. Child visibility remains untouched for receiver/mod geometry.
+                    clone->SetAppCulled(false);
+                    clone->fadeAmount = 1.0f;
+                    if (promotedWeaponRoot) {
+                        // The clone root is being promoted from assembled geometry to the actual Weapon child of
+                        // RArm_Hand. Therefore it must inherit the source Weapon ancestor's hand-space local, not
+                        // the partClone root's usually-identity local. Prefer the exact source assembly; retain the
+                        // older live-biped resolver only as a guarded compatibility fallback.
+                        if (!haveSourceWeaponLocal) {
+                            promotedWeaponLocal = SeedLiveWeaponLocal(a_player);
+                        }
+                        clone->SetLocalTransform(promotedWeaponLocal);
+                        clone->name = RE::BSFixedString("Weapon");
+                    }
+                }
                 parent->AttachChild(clone.get(), false);
+                if (IsEngineWeaponAttachSlot(slot)) {
+                    // Match BipedAnim::AttachToParent's weapon post-layout when a separate preview Weapon parent
+                    // exists. When the clone itself was promoted to Weapon, Scb must remain beneath that clone;
+                    // reparenting it to RArm_Hand bypasses the hand-space Weapon transform and visibly splits or
+                    // rotates the mesh away from the hands.
+                    if (auto* scb = clone->GetObjectByName(RE::BSFixedString("Scb"));
+                        scb && scb != clone.get() && !promotedWeaponRoot) {
+                        const auto before = scb->GetLocalTransform();
+                        AttachChildLikeEngine(*scb, *parent);
+                        logger::info(
+                            "[PipOS][3D] weapon attach: slot={} form={:08X} parent='{}' boneParent='{}' Scb local=({:.2f},{:.2f},{:.2f}) scale={:.3f}",
+                            i, sourceForm ? sourceForm->GetFormID() : 0,
+                            parent->GetName().c_str() ? parent->GetName().c_str() : "<unnamed>",
+                            parent->parent && parent->parent->GetName().c_str() ?
+                                parent->parent->GetName().c_str() : "<none>",
+                            before.translate.x, before.translate.y, before.translate.z, before.scale);
+                    } else {
+                        const auto local = clone->GetLocalTransform();
+                        float pitch = 0.0f;
+                        float roll = 0.0f;
+                        float yaw = 0.0f;
+                        local.rotate.ToEulerAnglesXYZ(pitch, roll, yaw);
+                        logger::info(
+                            "[PipOS][3D] weapon attach: slot={} form={:08X} parent='{}' Prn='{}' internalWeapon={} promotedRoot={} rootWasCulled={} transformSource='{}' ScbRetained={}; root local=({:.2f},{:.2f},{:.2f}) rotDeg=({:.1f},{:.1f},{:.1f}) scale={:.3f}",
+                            i, sourceForm ? sourceForm->GetFormID() : 0,
+                            parent->GetName().c_str() ? parent->GetName().c_str() : "<unnamed>",
+                            prnName.empty() ? "<none>" : prnName,
+                            hadInternalWeapon,
+                            promotedWeaponRoot,
+                            weaponRootWasCulled,
+                            promotedWeaponRoot ? promotedTransformSource : "existing-preview-parent",
+                            promotedWeaponRoot && clone->GetObjectByName(RE::BSFixedString("Scb")) != nullptr,
+                            local.translate.x, local.translate.y, local.translate.z,
+                            pitch * 180.0f / kPi, roll * 180.0f / kPi, yaw * 180.0f / kPi,
+                            local.scale);
+                    }
+                }
                 RE::bhkWorld::RemoveObjects(clone.get(), true, true);
                 ForEachAVObject(clone.get(), [](RE::NiAVObject& a_object) { a_object.controllers.reset(); });
                 // TF3DHUD extends its lookup after every attachment. Preserve existing skeleton entries as
@@ -714,6 +1148,8 @@ namespace PipOS
                         previewNodes.try_emplace(name, std::addressof(a_object));
                     }
                 });
+                const char* modelPath = sourceObject.part ? sourceObject.part->GetModel() : nullptr;
+                (void)InitializePreviewCloth(a_player, *clone, a_previewRoot, modelPath);
                 ++attached;
             }
 
@@ -726,6 +1162,184 @@ namespace PipOS
             return attached;
         }
 
+        std::uint64_t BuildBipedSignature(const RE::BipedAnim& a_biped)
+        {
+            // TF3DHUD maintains a richer audited signature. These ownership pointers are sufficient for PIP-OS's
+            // rebuild-on-change model: every equipped part replacement changes at least partClone, parent form,
+            // armor addon, or model. FNV-1a keeps the comparison deterministic and allocation-free per pass.
+            std::uint64_t hash = 1469598103934665603ull;
+            auto mix = [&](const void* a_value) {
+                hash ^= reinterpret_cast<std::uintptr_t>(a_value);
+                hash *= 1099511628211ull;
+            };
+            for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
+                const auto& object = a_biped.object[i];
+                mix(object.partClone.get());
+                mix(object.parent.object);
+                mix(object.armorAddon);
+                mix(object.part);
+            }
+            return hash;
+        }
+
+        [[nodiscard]] bool HasPendingBipedModelHandles(
+            const RE::BipedAnim& a_biped, std::int32_t& a_pendingSlot)
+        {
+            // A populated handle with no clone, or any populated buffered object, means LoadBipedParts is
+            // between ownership states. Cloning at this point produces the familiar missing-head/limb build.
+            for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
+                const auto& object = a_biped.object[i];
+                if (object.handleList.head && !object.partClone) {
+                    a_pendingSlot = i;
+                    return true;
+                }
+                const auto& buffered = a_biped.bufferedObjects[i];
+                if (buffered.parent.object || buffered.parent.instanceData || buffered.modExtra ||
+                    buffered.armorAddon || buffered.part || buffered.partClone ||
+                    buffered.objectGraphManager || buffered.hitEffect) {
+                    a_pendingSlot = i;
+                    return true;
+                }
+            }
+            a_pendingSlot = -1;
+            return false;
+        }
+
+        std::uint64_t BuildVisualSignature(RE::PlayerCharacter& a_player)
+        {
+            std::uint64_t hash = 1469598103934665603ull;
+            const auto mix = [&](std::uintptr_t value) {
+                hash ^= value;
+                hash *= 1099511628211ull;
+            };
+            mix(reinterpret_cast<std::uintptr_t>(a_player.GetVisualsRace()));
+            mix(static_cast<std::uintptr_t>(a_player.GetSex()));
+            mix(reinterpret_cast<std::uintptr_t>(a_player.GetFaceNodeSkinned()));
+            // Do not fold BipedAnim into this signature. While Pip-Boy inventory is open, the engine reuses
+            // the player's third-person biped for the selected-item preview. That temporary model is not the
+            // equipped loadout and must never replace the character captured at menu-open time.
+            // The live third-person root owns the same BipedAnim geometry. Traversing every geometry here would
+            // reintroduce the selected-item preview through rendererData/skinInstance pointer changes even though
+            // the explicit biped signature above is excluded. Race, sex, face node, and NPC head/morph state are
+            // the stable appearance signals; equipment changes arrive through TESEquipEvent.
+            auto* base = a_player.GetObjectReference();
+            auto* npc = base ? base->As<RE::TESNPC>() : nullptr;
+            if (npc) {
+                mix(reinterpret_cast<std::uintptr_t>(npc->GetRootFaceNPC()));
+                mix(reinterpret_cast<std::uintptr_t>(npc->headParts));
+                mix(static_cast<std::uintptr_t>(npc->numHeadParts));
+                for (std::int32_t i = 0; npc->headParts && i < npc->numHeadParts; ++i) {
+                    mix(reinterpret_cast<std::uintptr_t>(npc->headParts[i]));
+                }
+                std::uint32_t bits = 0;
+                std::memcpy(std::addressof(bits), std::addressof(npc->morphWeight.x), sizeof(bits)); mix(bits);
+                std::memcpy(std::addressof(bits), std::addressof(npc->morphWeight.y), sizeof(bits)); mix(bits);
+                std::memcpy(std::addressof(bits), std::addressof(npc->morphWeight.z), sizeof(bits)); mix(bits);
+            }
+            return hash;
+        }
+
+        bool AttachFreshFaceGenHead(RE::PlayerCharacter& a_player, RE::NiAVObject& a_previewRoot)
+        {
+            // TF3DHUD does not expect FaceGen to arrive through BipedAnim. It clones the live skinned face node
+            // separately, seeds its skin mappings to the fresh skeleton, then invokes the same engine skin-fix
+            // helper used by AttachHeadHelper. 0.0.79 omitted this entire path, matching the missing head in game.
+            auto* liveFaceOpaque = a_player.GetFaceNodeSkinned();
+            auto* liveFace = reinterpret_cast<RE::NiAVObject*>(liveFaceOpaque);
+            if (!liveFace) {
+                if (auto* liveRoot = a_player.Get3D(false)) {
+                    liveFace = liveRoot->GetObjectByName(RE::BSFixedString("BSFaceGenNiNodeSkinned"));
+                }
+            }
+            if (!liveFace) {
+                logger::error("[PipOS][3D] TF3DHUD head construction: live FaceGen node unavailable");
+                return false;
+            }
+
+            PreviewNodeMap previewNodes;
+            CollectPreviewNodes(a_previewRoot, previewNodes);
+            auto faceClone = CloneBipedPartToFreshSkeleton(*liveFace, a_previewRoot, previewNodes);
+            if (!faceClone) {
+                logger::error("[PipOS][3D] TF3DHUD head construction: FaceGen clone failed");
+                return false;
+            }
+            auto* actorRoot = netimmerse_cast<RE::NiNode*>(std::addressof(a_previewRoot));
+            if (!actorRoot) {
+                logger::error("[PipOS][3D] TF3DHUD head construction: preview root is not a NiNode");
+                return false;
+            }
+
+            RE::bhkWorld::RemoveObjects(faceClone.get(), true, true);
+            ForEachAVObject(faceClone.get(), [](RE::NiAVObject& a_object) { a_object.controllers.reset(); });
+            actorRoot->AttachChild(faceClone.get(), false);
+            g_fixFaceGenHeadSkinInstances(faceClone.get(), std::addressof(a_previewRoot), true);
+            g_previewFaceNode = static_cast<RE::BSFaceGenNiNode*>(faceClone.get());
+            logger::info("[PipOS][3D] TF3DHUD head construction: live FaceGen clone attached + skins fixed");
+            return true;
+        }
+
+        RE::BSFaceGenAnimationData* GetLiveFaceAnimationData(RE::PlayerCharacter& a_player)
+        {
+            auto* liveFace = reinterpret_cast<RE::BSFaceGenNiNode*>(a_player.GetFaceNodeSkinned());
+            if (liveFace && liveFace->animationData) { return liveFace->animationData; }
+            auto* middleHigh = a_player.currentProcess ? a_player.currentProcess->middleHigh : nullptr;
+            return middleHigh ? reinterpret_cast<RE::BSFaceGenAnimationData*>(middleHigh->faceAnimationData) : nullptr;
+        }
+
+        void SyncPreviewFacialExpression(RE::PlayerCharacter& a_player)
+        {
+            auto* settings = Settings::GetSingleton();
+            if (!settings || !settings->Char3DFaceMorphs() || !g_previewFaceNode) { return; }
+            auto* liveData = GetLiveFaceAnimationData(a_player);
+            auto* previewData = g_previewFaceNode->animationData;
+            if (liveData && previewData && liveData != previewData) {
+                previewData->currentExpression = liveData->currentExpression;
+                previewData->modifierExpression = liveData->modifierExpression;
+                previewData->baseExpression = liveData->baseExpression;
+                previewData->morphsDirty = true;
+                previewData->forceMorphUpdate = true;
+            }
+            g_previewFaceNode->faceGenFlags &= static_cast<std::uint16_t>(~0x4u);
+            g_updateAllChildrenMorphData(g_previewFaceNode.get(), true);
+        }
+
+        void InitializePreviewHairCloth(RE::PlayerCharacter& a_player, RE::NiAVObject& a_previewRoot)
+        {
+            auto* settings = Settings::GetSingleton();
+            auto* base = a_player.GetObjectReference();
+            auto* npc = base ? base->As<RE::TESNPC>() : nullptr;
+            if (!settings || !settings->Char3DCloth() || !npc || !g_previewFaceNode ||
+                !npc->headParts || npc->numHeadParts <= 0) {
+                return;
+            }
+            std::uint32_t initialized = 0;
+            std::function<void(RE::BGSHeadPart*)> visit = [&](RE::BGSHeadPart* part) {
+                if (!part) { return; }
+                if (*part->type == RE::BGSHeadPart::HeadPartType::kHair && !part->formEditorID.empty()) {
+                    if (auto* object = g_previewFaceNode->GetObjectByName(part->formEditorID)) {
+                        initialized += InitializePreviewCloth(
+                            a_player, *object, a_previewRoot, part->GetModel());
+                    }
+                }
+                for (auto* extra : part->extraParts) { visit(extra); }
+            };
+            for (std::int32_t i = 0; i < npc->numHeadParts; ++i) { visit(npc->headParts[i]); }
+            logger::info("[PipOS][3D] preview hair cloth initialized: {} objects", initialized);
+        }
+
+        void ApplyFreshBodyTint(RE::PlayerCharacter& a_player, RE::NiAVObject& a_previewRoot)
+        {
+            auto* playerBase = a_player.GetObjectReference();
+            auto* npc = playerBase ? playerBase->As<RE::TESNPC>() : nullptr;
+            if (!npc) { return; }
+            RE::NiColorA bodyTint{ 0.0f, 0.0f, 0.0f, 0.0f };
+            g_calculateBodyTintColor(npc, bodyTint, nullptr, true, false);
+            bodyTint.a = 1.0f;
+            g_updateBodyTintColorsOnScene(std::addressof(a_previewRoot), bodyTint);
+            RestoreShaderAlpha(a_previewRoot);
+            logger::info("[PipOS][3D] TF3DHUD body tint applied");
+        }
+
         RE::NiPointer<RE::NiAVObject> BuildFreshTF3DHUDCharacter(
             RE::PlayerCharacter& a_player, RE::NiAVObject& a_liveSource)
         {
@@ -736,11 +1350,14 @@ namespace PipOS
             }
             auto previewRoot = LoadFreshRaceSkeleton(a_player);
             if (!previewRoot) { return nullptr; }
-            if (PopulateFreshSkeletonFromBiped(*previewRoot, *biped) == 0) {
+            if (PopulateFreshSkeletonFromBiped(a_player, *previewRoot, *biped) == 0) {
                 logger::error("[PipOS][3D] TF3DHUD fresh character: no biped parts attached");
                 return nullptr;
             }
+            (void)AttachFreshFaceGenHead(a_player, *previewRoot);
+            InitializePreviewHairCloth(a_player, *previewRoot);
             SanitizeClone(*previewRoot, std::addressof(a_liveSource));
+            ApplyFreshBodyTint(a_player, *previewRoot);
             return previewRoot;
         }
 
@@ -805,13 +1422,16 @@ namespace PipOS
             auto* settings = Settings::GetSingleton();
             const float scale = settings ? settings->Char3DScale() : 0.45f;
             const float yaw = settings ? settings->Char3DYaw() : 160.0f;
+            const float pitch = settings ? settings->Char3DPitch() : 0.0f;
+            const float roll = settings ? settings->Char3DRoll() : 0.0f;
             float distance = settings ? settings->Char3DDistance() : 200.0f;
             if (a_distanceCap > 0.0f && distance > a_distanceCap) { distance = a_distanceCap; }
             const int target = settings ? settings->Char3DTarget() : 1;
 
             RE::NiTransform transform = RE::NiTransform::IDENTITY;
             transform.scale = scale;
-            transform.rotate.FromEulerAnglesXYZ(0.0f, 0.0f, yaw * kPi / 180.0f);
+            transform.rotate.FromEulerAnglesXYZ(
+                pitch * kPi / 180.0f, roll * kPi / 180.0f, yaw * kPi / 180.0f);
             a_root.SetLocalTransform(transform);
 
             RE::NiUpdateData updateData{};
@@ -826,10 +1446,42 @@ namespace PipOS
             }
             auto centered = a_root.GetLocalTransform();
             centered.translate = { -targetWorld.x, -targetWorld.y + distance, -targetWorld.z };
+            // Translation-only placement lives in model space. Unlike moving/resizing the compositor quad,
+            // this cannot change UV scale or stretch the rendered character.
+            centered.translate.x += settings ? settings->Char3DScreenX() : 0.0f;
+            if (!g_inventoryPageActive.load()) { centered.translate.x += kNonInventoryModelOffsetX; }
+            centered.translate.z += settings ? settings->Char3DScreenY() : 0.0f;
             a_root.SetLocalTransform(centered);
             a_root.Update(updateData);
 
             g_baseTransform = centered;
+        }
+
+        // TF3DHUD PreviewFraming parity: after the private graph moves the selected bone, translate the
+        // preview root back toward the configured screen anchor. Axis switches allow deliberate partial follow.
+        void ApplyTargetFollow(RE::NiAVObject& a_root)
+        {
+            auto* settings = Settings::GetSingleton();
+            if (!settings || !settings->Char3DFollow() ||
+                (!settings->Char3DFollowX() && !settings->Char3DFollowY() && !settings->Char3DFollowZ())) {
+                return;
+            }
+
+            RE::NiPoint3 targetWorld;
+            if (!TryGetFramingTargetWorld(a_root, settings->Char3DTarget(), targetWorld)) { return; }
+
+            auto transform = a_root.GetLocalTransform();
+            if (settings->Char3DFollowX()) {
+                const float pageOffset = g_inventoryPageActive.load() ? 0.0f : kNonInventoryModelOffsetX;
+                transform.translate.x += settings->Char3DScreenX() + pageOffset - targetWorld.x;
+            }
+            if (settings->Char3DFollowY()) { transform.translate.y += settings->Char3DDistance() - targetWorld.y; }
+            if (settings->Char3DFollowZ()) {
+                transform.translate.z += settings->Char3DScreenY() - targetWorld.z;
+            }
+            a_root.SetLocalTransform(transform);
+            RE::NiUpdateData updateData{};
+            a_root.Update(updateData);
         }
 
         // ------------------------------------------------------------------ procedural idle (breathing)
@@ -850,10 +1502,24 @@ namespace PipOS
             a_root.Update(updateData);
         }
 
+        void SynchronizeLivePose(RE::NiAVObject& a_previewRoot, RE::NiAVObject& a_liveSource)
+        {
+            // Full TF3DHUD owns a private animation graph. PIP-OS already has the live player's authoritative
+            // third-person flattened pose available each frame, so mirror those locals into the independent
+            // preview skeleton before its Update. This provides live body animation without sharing graph or
+            // skeleton ownership, and preserves the fresh-skeleton skin bindings established at construction.
+            const int copied = CopyFlattenedPose(a_previewRoot, std::addressof(a_liveSource));
+            if (copied > 0 && !g_loggedLivePoseSync.exchange(true)) {
+                logger::info("[PipOS][3D] live pose synchronization active: {} flattened bone locals per pass", copied);
+            }
+            if (g_previewFaceNode) { g_updateAllChildrenMorphData(g_previewFaceNode.get(), true); }
+        }
+
         // ------------------------------------------------------------------ renderer (Renderer.cpp)
         bool ConfigureRenderer()
         {
             if (g_renderer) { return true; }
+            g_displayAttached = false;
 
             auto* settings = Settings::GetSingleton();
             const float fov = settings ? settings->Char3DFov() : 70.0f;
@@ -900,7 +1566,8 @@ namespace PipOS
             // (kMessage 15, [3DDIAG]-proven to layer ABOVE the fullscreen menu). 0.0.69's extra mirroring of the
             // vanilla quad/material/mask is reverted -- it killed the engine-auto-created display quad entirely.
             g_renderer->MainScreen_SetBackgroundMode(RE::Interface3D::BackgroundMode::kLive);
-            g_renderer->MainScreen_SetPostAA(true);
+            // Interface3D's setter takes the engine's disable-AA policy, matching TF3DHUD's inversion.
+            g_renderer->MainScreen_SetPostAA(!(settings && settings->Char3DAntiAliasing()));
             g_renderer->Offscreen_Enable3D(true);
             g_renderer->Offscreen_SetUseLongRangeCamera(true);
             g_renderer->Offscreen_SetRenderTargetSize(RE::Interface3D::OffscreenMenuSize::kFullFrame);
@@ -928,7 +1595,8 @@ namespace PipOS
                 // Replace 0.0.78's opaque proof color with TF3DHUD's transparent character target.
                 g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 0.0f, 0.0f, 0.0f, 0.0f });
                 logger::info(
-                    "[PipOS][3D] 0.0.79 TF3DHUD CHARACTER PASS active: transparent kModMenu RT, fresh "
+                    "[PipOS][3D] 0.0.109 ATTACHMENT AND STATUS PASS active: private behavior graph, source Weapon ancestor transform, retained Scb hierarchy, live radiation bridge, instant event consumption, "
+                    "three-point lighting, transparent kModMenu RT, fresh "
                     "race skeleton, seeded biped clones, depth 15, recreate-on-open");
             } else {
                 g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 0.0f, 0.0f, 0.0f, 0.0f });
@@ -1177,6 +1845,15 @@ namespace PipOS
                 bounds.left, bounds.top, bounds.right, bounds.bottom);
         }
 
+        void AttachClippedDisplayRoot()
+        {
+            if (!g_renderer || !g_displayRoot || !g_displayClipApplied || g_displayAttached) { return; }
+            g_renderer->MainScreen_SetScreenAttached3D(g_displayRoot.get());
+            g_renderer->MainScreen_RegisterGeometryRequiringFullViewport(g_displayRoot.get());
+            g_displayAttached = true;
+            logger::info("[PipOS][3D] clipped display root attached");
+        }
+
         void EnsureDisplayRoot()
         {
             if (g_displayRoot) { return; }
@@ -1206,35 +1883,123 @@ namespace PipOS
             g_displayRoot = display;
         }
 
+        void ConfigureThreePointLights(RE::Interface3D::Renderer& a_renderer)
+        {
+            auto* settings = Settings::GetSingleton();
+            const float keyIntensity = settings ? settings->Char3DKeyIntensity() : 3.4f;
+            const float fillIntensity = settings ? settings->Char3DFillIntensity() : 1.55f;
+            const float rimIntensity = settings ? settings->Char3DRimIntensity() : 2.15f;
+            const bool hologram = settings && settings->Char3DHologram();
+            a_renderer.offscreenLights.clear();
+            a_renderer.needsLightSetupOffscreen = true;
+
+            // Key: warm, strong, high/front-left. Fill: cooler and softer from the opposite side.
+            // Rim: pale green from behind/above to separate the silhouette from PIP-OS's dark background.
+            a_renderer.Offscreen_AddLight(
+                RE::NiPoint3{ 80.0f, -45.0f, 105.0f },
+                RE::NiColor{ 1.00f, 0.82f, 0.68f },
+                RE::NiColor{ 1200.0f, 0.0f, 0.0f },
+                keyIntensity);
+            a_renderer.Offscreen_AddLight(
+                RE::NiPoint3{ -75.0f, -20.0f, 45.0f },
+                RE::NiColor{ 0.48f, 0.66f, 1.00f },
+                RE::NiColor{ 1000.0f, 0.0f, 0.0f },
+                fillIntensity);
+            a_renderer.Offscreen_AddLight(
+                RE::NiPoint3{ 20.0f, 100.0f, 115.0f },
+                hologram ? RE::NiColor{ 0.25f, 1.00f, 0.38f } : RE::NiColor{ 0.58f, 1.00f, 0.76f },
+                RE::NiColor{ 1400.0f, 0.0f, 0.0f },
+                hologram ? std::max(rimIntensity, 5.5f) : rimIntensity);
+            logger::info("[PipOS][3D] three-point lighting configured: key={} fill={} rim={} hologram={}",
+                keyIntensity, fillIntensity, hologram ? std::max(rimIntensity, 5.5f) : rimIntensity, hologram);
+        }
+
+        void RefreshLivePlacement()
+        {
+            auto* settings = Settings::GetSingleton();
+            if (!settings || !g_previewRoot) { return; }
+
+            const PlacementSnapshot current{
+                settings->Char3DScale(), settings->Char3DFov(), settings->Char3DYaw(),
+                settings->Char3DPitch(), settings->Char3DRoll(),
+                settings->Char3DDistance(), settings->Char3DTarget(),
+                settings->Char3DClipLeft(), settings->Char3DClipTop(),
+                settings->Char3DClipRight(), settings->Char3DClipBottom(),
+                settings->Char3DScreenX(), settings->Char3DScreenY(),
+                settings->Char3DKeyIntensity(), settings->Char3DFillIntensity(),
+                settings->Char3DRimIntensity(), settings->Char3DSlotMask(),
+                settings->Char3DAntiAliasing(), settings->Char3DCloth(), settings->Char3DHologram(),
+                g_inventoryPageActive.load()
+            };
+            const bool framingChanged = current.scale != g_livePlacement.scale ||
+                current.yaw != g_livePlacement.yaw || current.pitch != g_livePlacement.pitch ||
+                current.roll != g_livePlacement.roll || current.distance != g_livePlacement.distance ||
+                current.target != g_livePlacement.target || current.screenX != g_livePlacement.screenX ||
+                current.screenY != g_livePlacement.screenY ||
+                current.inventoryPageActive != g_livePlacement.inventoryPageActive;
+            const bool clipChanged = current.clipLeft != g_livePlacement.clipLeft ||
+                current.clipTop != g_livePlacement.clipTop || current.clipRight != g_livePlacement.clipRight ||
+                current.clipBottom != g_livePlacement.clipBottom;
+            const bool lightingChanged = current.keyIntensity != g_livePlacement.keyIntensity ||
+                current.fillIntensity != g_livePlacement.fillIntensity ||
+                current.rimIntensity != g_livePlacement.rimIntensity ||
+                current.hologram != g_livePlacement.hologram;
+            const bool rebuildChanged = current.slotMask != g_livePlacement.slotMask ||
+                current.cloth != g_livePlacement.cloth;
+            const bool fovChanged = current.fov != g_livePlacement.fov;
+            const bool aaChanged = current.antiAliasing != g_livePlacement.antiAliasing;
+
+            if (framingChanged) {
+                FrameClone(*g_previewRoot);
+                logger::info("[PipOS][3D] live framing applied: scale={} yaw={} pitch={} roll={} distance={} target={}",
+                    current.scale, current.yaw, current.pitch, current.roll, current.distance, current.target);
+                if (current.inventoryPageActive != g_livePlacement.inventoryPageActive) {
+                    logger::info("[PipOS][3D] inventory page placement: inventory={} modelOffsetX={}",
+                        current.inventoryPageActive,
+                        current.inventoryPageActive ? 0.0f : kNonInventoryModelOffsetX);
+                }
+            }
+            if (clipChanged && g_displayRoot && !DisplayClipRectCopyPending()) {
+                ApplyDisplayClipRect();
+            }
+            if (lightingChanged && g_renderer) { ConfigureThreePointLights(*g_renderer); }
+            if (aaChanged && g_renderer) { g_renderer->MainScreen_SetPostAA(!current.antiAliasing); }
+            // The camera FOV is immutable after Interface3D::Create. Request a main-thread renderer recreation,
+            // but only after the initial snapshot has been populated.
+            if (fovChanged && g_livePlacement.fov >= 0.0f) {
+                g_rendererRecreateRequested.store(true);
+                QueueCapturePass(1.0f / 60.0f);
+            }
+            if (rebuildChanged && g_livePlacement.scale >= 0.0f) {
+                g_dirty.store(true);
+                QueueCapturePass(1.0f / 60.0f);
+            }
+            g_livePlacement = current;
+        }
+
         void AttachToRenderer(RE::NiAVObject& a_previewRoot)
         {
             if (!g_renderer) { return; }
 
             EnsureDisplayRoot();
             if (g_displayRoot) {
-                // Reshape the quad into the figure-slot window before attaching (deferred a frame by Tick if
-                // the buffers are still uploading). D3D resource creation -> main-thread task only, which is
-                // where this whole call chain runs.
+                // Never expose the stock full-frame quad. Its GPU buffers can still be uploading on first load;
+                // attaching before clipping succeeds made the first open larger than every retained-root reopen.
                 if (!DisplayClipRectCopyPending()) { ApplyDisplayClipRect(); }
-                g_renderer->MainScreen_SetScreenAttached3D(g_displayRoot.get());
-                g_renderer->MainScreen_RegisterGeometryRequiringFullViewport(g_displayRoot.get());
+                AttachClippedDisplayRoot();
             }
 
             g_forceUpgradeTextures(std::addressof(a_previewRoot), false, false);
             g_renderer->Offscreen_Set3D(std::addressof(a_previewRoot));
 
-            // Single front directional-ish fill (Lights.cpp DefaultLights). 3rd NiColor.r encodes distance.
-            g_renderer->offscreenLights.clear();
-            g_renderer->needsLightSetupOffscreen = true;
-            g_renderer->Offscreen_AddLight(
-                RE::NiPoint3{ 50.0f, 0.0f, 50.0f },
-                RE::NiColor{ 0.841f, 0.758f, 0.785f },
-                RE::NiColor{ 1000.0f, 0.0f, 0.0f },
-                3.0f);
+            ConfigureThreePointLights(*g_renderer);
         }
 
         bool BuildPreview(RE::PlayerCharacter& a_player, RE::NiAVObject& a_source)
         {
+            CharacterAnimation::Reset();
+            g_livePlacement = {};
+            g_previewFaceNode.reset();
             auto clone = kTF3DHUDCharacterPass ? BuildFreshTF3DHUDCharacter(a_player, a_source) : nullptr;
             if (!clone) {
                 logger::info("[PipOS][3D] TF3DHUD fresh construction unavailable; falling back to whole-root clone");
@@ -1249,6 +2014,10 @@ namespace PipOS
             AttachToRenderer(*clone);
             g_previewRoot = clone;
             g_sourceRoot = std::addressof(a_source);
+            if (const auto& biped = a_player.GetBiped(false); biped) {
+                g_sourceBipedSignature = BuildBipedSignature(*biped);
+            }
+            g_sourceVisualSignature = BuildVisualSignature(a_player);
             logger::info("[PipOS][3D] preview built + attached to offscreen renderer");
             return true;
         }
@@ -1281,6 +2050,8 @@ namespace PipOS
 
         void HideAndRelease()
         {
+            std::scoped_lock lock(g_sceneLock);
+            CharacterAnimation::Reset();
             if (g_usingVanilla) {
                 // Give the borrowed slot back iff it still holds OUR clone, and restore the disabled state we
                 // found it in (tracked symmetric enable, audit H1). Never Release/End3D -- the manager owns it.
@@ -1304,15 +2075,23 @@ namespace PipOS
                     // Preserve the 0.0.78 field-proven ordering fix: a reused renderer moved under Scaleform after
                     // the first close. Recreate it at depth 15 each open while retaining the clipped display root.
                     g_renderer->MainScreen_SetScreenAttached3D(nullptr);
+                    g_displayAttached = false;
                     g_renderer->Release();
                     g_renderer = nullptr;
-                    logger::info("[PipOS][3D] 0.0.79 character renderer released; next open recreates depth 15");
+                    logger::info("[PipOS][3D] 0.0.84 character renderer released; next open recreates depth 15");
                 }
             }
             g_visible = false;
             g_available.store(false);
             g_previewRoot.reset();
+            g_previewFaceNode.reset();
             g_sourceRoot = nullptr;
+            g_sourceBipedSignature = 0;
+            g_sourceVisualSignature = 0;
+            g_equipmentSettleRequested.store(false);
+            g_equipmentCandidateSignature = 0;
+            g_equipmentStablePasses = 0;
+            g_livePlacement = {};
             g_dirty = true;
         }
 
@@ -1324,14 +2103,29 @@ namespace PipOS
             return menu.get() != nullptr;
         }
 
+        [[nodiscard]] bool ShouldDrawCharacter(RE::PlayerCharacter& a_player)
+        {
+            auto* settings = Settings::GetSingleton();
+            return !(settings && settings->Char3DHidePowerArmor() &&
+                RE::PowerArmor::ActorInPowerArmor(a_player));
+        }
+
         // Frame tick -- runs ONLY on the game main thread, inside RunCaptureTask (an F4SE task). All scene-graph
         // and D3D mutation happens here; the worker-thread hook never reaches this.
         void Tick(float a_delta)
         {
+            std::scoped_lock lock(g_sceneLock);
             if (g_failed.load()) { return; }
 
             auto* settings = Settings::GetSingleton();
-            const bool wantShow = settings && settings->Live3D() && PipboyOpen();
+            const bool menuOpen = PipboyOpen();
+            const bool live3DEnabled = settings && settings->Live3D();
+            // 0.0.82 recovery: do not make character startup depend on asynchronous Scaleform page state.
+            // RunActorUpdates can yield only one capture pass while the paused Pip-Boy is open; both 0.0.80 and
+            // 0.0.81 consumed that pass before CurrentPage was ready and remained available:false forever.
+            // Restore the field-proven 0.0.79 gate first. Page-specific visibility needs an event-driven main-
+            // thread wakeup and must never again be allowed to block initial character construction.
+            const bool wantShow = live3DEnabled && menuOpen;
             if (!wantShow) {
                 if (g_available.load() || g_visible || g_previewRoot) { HideAndRelease(); }
                 return;
@@ -1342,6 +2136,75 @@ namespace PipOS
 
             auto* source = player->Get3D(false);  // third-person root (carries worn armor + weapon)
             if (!source) { HideAndRelease(); return; }
+
+            if (const auto& biped = player->GetBiped(false); biped) {
+                std::int32_t pendingSlot = -1;
+                if (HasPendingBipedModelHandles(*biped, pendingSlot)) {
+                    // Keep the last complete preview alive while the engine finishes the replacement. The
+                    // render-boundary signature audit queues another pass, so this does not strand the update.
+                    static std::int32_t s_lastPendingSlot = -1;
+                    if (s_lastPendingSlot != pendingSlot) {
+                        s_lastPendingSlot = pendingSlot;
+                        logger::info("[PipOS][3D] deferred preview rebuild: biped slot {} is still loading", pendingSlot);
+                    }
+                    QueueCapturePass(a_delta);
+                    return;
+                }
+            }
+
+            // TESEquipEvent is emitted before every participating biped clone is guaranteed to be published.
+            // Require three consecutive complete passes with the same ownership signature before replacing a
+            // working preview. This keeps armor equips from settling on the partial 2/3/4-part snapshots seen
+            // in the 0.0.104 log, while menu-open construction remains immediate.
+            if (const auto& biped = player->GetBiped(false);
+                biped && g_previewRoot && g_equipmentSettleRequested.load()) {
+                const auto signature = BuildBipedSignature(*biped);
+                if (signature != g_equipmentCandidateSignature) {
+                    g_equipmentCandidateSignature = signature;
+                    g_equipmentStablePasses = 1;
+                } else {
+                    ++g_equipmentStablePasses;
+                }
+                if (g_equipmentStablePasses < 3) {
+                    QueueCapturePass(a_delta);
+                    return;
+                }
+                g_equipmentSettleRequested.store(false);
+                g_equipmentStablePasses = 0;
+                logger::info(
+                    "[PipOS][3D] equipment biped stabilized: signature={:016X}; rebuilding preview",
+                    signature);
+            }
+
+            if (const auto& biped = player->GetBiped(false); biped && g_previewRoot) {
+                const auto currentSignature = BuildBipedSignature(*biped);
+                if (currentSignature != g_sourceBipedSignature) {
+                    if (!g_loggedTransientBipedPreview.exchange(true)) {
+                        logger::info(
+                            "[PipOS][3D] ignored transient Pip-Boy biped preview change; retaining the "
+                            "menu-open equipped loadout");
+                    }
+                }
+            }
+
+            if (g_rendererRecreateRequested.exchange(false) && g_renderer) {
+                // Interface3D stores FOV at construction. Recreate only the renderer, retaining the complete
+                // preview tree and display mesh so the FOV slider remains live without a menu reopen.
+                g_renderer->Offscreen_Set3D(nullptr);
+                g_renderer->MainScreen_SetScreenAttached3D(nullptr);
+                g_displayAttached = false;
+                if (g_renderer->enabled) { g_renderer->Disable(); }
+                g_renderer->Release();
+                g_renderer = nullptr;
+                g_visible = false;
+                if (!ConfigureRenderer()) {
+                    logger::error("[PipOS][3D] live FOV renderer recreation failed");
+                    HideAndRelease();
+                    return;
+                }
+                if (g_previewRoot) { AttachToRenderer(*g_previewRoot); }
+                logger::info("[PipOS][3D] renderer recreated for live FOV={}", settings->Char3DFov());
+            }
 
             // 0.0.72 VANILLA-FIRST: borrow the PipboyScreenModel offscreen slot (see AcquireVanillaRenderer
             // note). Our own renderer path below remains the fallback when the vanilla one can't be resolved
@@ -1376,14 +2239,8 @@ namespace PipOS
                     // 0.0.75 (agent-2 gap): TF3DHUD configures offscreen lights on EVERY attach; our vanilla
                     // path never lit the scene -- an unlit model over a transparent background is invisible.
                     // Same fixed fill the own-renderer path uses; cleared again when the slot is returned.
-                    vr->offscreenLights.clear();
-                    vr->needsLightSetupOffscreen = true;
-                    vr->Offscreen_AddLight(
-                        RE::NiPoint3{ 50.0f, 0.0f, 50.0f },
-                        RE::NiColor{ 0.841f, 0.758f, 0.785f },
-                        RE::NiColor{ 1000.0f, 0.0f, 0.0f },
-                        3.0f);
-                    if (!g_usingVanilla) { logger::info("[PipOS][3D] clone attached to vanilla renderer '{}' (enabled={}) + offscreen light configured", vr->name.c_str(), vr->enabled); }
+                    ConfigureThreePointLights(*vr);
+                    if (!g_usingVanilla) { logger::info("[PipOS][3D] clone attached to vanilla renderer '{}' (enabled={}) + three-point lighting", vr->name.c_str(), vr->enabled); }
                     LogPoseProbe(*g_previewRoot);   // 0.0.75: decisive framing/pose telemetry (once per attach)
                     g_usingVanilla = true;
                 }
@@ -1398,9 +2255,17 @@ namespace PipOS
                         g_weEnabledVanilla = true;
                         logger::info("[PipOS][3D] vanilla renderer enabled for the character (will restore on close)");
                     }
-                    ApplyIdle(*g_previewRoot, a_delta);
-                    g_visible = true;
-                    g_available.store(true);   // AS hides the Vault Boy only while our figure actually shows
+                    RefreshLivePlacement();
+                    const bool shouldDraw = ShouldDrawCharacter(*player);
+                    g_previewRoot->SetAppCulled(!shouldDraw);
+                    if (shouldDraw) {
+                        CharacterAnimation::Update(*player, *g_previewRoot, a_delta);
+                        ApplyTargetFollow(*g_previewRoot);
+                        SyncPreviewFacialExpression(*player);
+                    }
+                    g_visible = true; // renderer ownership state; app-cull controls the power-armor option
+                    g_available.store(shouldDraw && g_inventoryPageActive.load());
+                    // AS hides Vault Boy only while our figure is actually on the Inventory page.
                 } else {
                     // AUDIT M2: while yielding to a live item preview, do NOT report available (the AS side keeps
                     // the Vault Boy) and skip idle work on the detached clone.
@@ -1424,20 +2289,25 @@ namespace PipOS
                 g_dirty = false;
             }
 
-            if (g_previewRoot) { ApplyIdle(*g_previewRoot, a_delta); }
+            if (g_previewRoot) { RefreshLivePlacement(); }
 
             // Re-apply the figure-slot window each pass (main-thread task). SameDisplayBounds makes an
             // unchanged window a no-op, so this only rebuilds the quad when (a) the initial build deferred it
             // because the buffers were still uploading, or (b) the user retuned a clipRect slider -- letting a
             // reopened Pip-Boy pick up new placement values without a game restart.
             if (g_displayRoot && !DisplayClipRectCopyPending()) { ApplyDisplayClipRect(); }
+            AttachClippedDisplayRoot();
 
             if (!g_visible) {
                 g_renderer->Enable(false);
                 g_visible = true;
                 logger::info("[PipOS][3D] offscreen renderer enabled");
             }
-            g_available.store(true);
+            const bool shouldDraw = ShouldDrawCharacter(*player);
+            g_previewRoot->SetAppCulled(!shouldDraw);
+            // Do not hide the fallback Vault Boy until the compositor surface is actually attached. On the first
+            // menu open the fresh display mesh can still be uploading even though the character RT is ready.
+            g_available.store(shouldDraw && g_inventoryPageActive.load() && g_displayAttached);
         }
 
         // 0.0.68 GROUND-TRUTH RENDERER DIFF. The red-RT test proved our fully-configured renderer NEVER
@@ -1579,6 +2449,53 @@ namespace PipOS
                 a_renderPass, a_shader, a_property, a_geometry, a_flags, a_pass, a_lights);
         }
 
+        void HookedRenderPrepassesAndMenus(RE::Interface3D::Renderer* a_renderer)
+        {
+            if (a_renderer && g_pipboyOpen.load() && !g_failed.load()) {
+                // UI state is read only by a queued UI task. The renderer path consumes the resulting atomic,
+                // so character construction never waits for Scaleform's asynchronous CurrentPage property.
+                ScheduleInventoryPageProbe();
+                std::scoped_lock lock(g_sceneLock);
+                if (a_renderer == g_renderer && g_previewRoot &&
+                    a_renderer->offscreenElement.get() == g_previewRoot.get()) {
+                    // A paused Pip-Boy may not run the actor-update hook again after the first deferred clip
+                    // attempt. Queue a main-thread retry from each render boundary until the display quad attaches.
+                    if (!g_displayAttached) { QueueCapturePass(1.0f / 60.0f); }
+                    RefreshLivePlacement();
+                    if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                        const auto visualSignature = BuildVisualSignature(*player);
+                        if (visualSignature != g_sourceVisualSignature) {
+                            g_dirty.store(true);
+                            QueueCapturePass(1.0f / 60.0f);
+                        }
+                        const bool shouldDraw = ShouldDrawCharacter(*player);
+                        g_previewRoot->SetAppCulled(!shouldDraw);
+                        const bool renderAvailable = shouldDraw && g_inventoryPageActive.load() && g_displayAttached;
+                        const bool wasAvailable = g_available.exchange(renderAvailable);
+                        if (wasAvailable != renderAvailable) { SchedulePushContract(); }
+
+                        const auto* timer = RE::BSTimer::GetSingleton();
+                        if (shouldDraw) {
+                            CharacterAnimation::Update(
+                                *player, *g_previewRoot, timer ? timer->delta : (1.0f / 60.0f));
+                            ApplyTargetFollow(*g_previewRoot);
+                            SyncPreviewFacialExpression(*player);
+                        }
+                    }
+                }
+            }
+
+            if (g_origRenderPrepassesAndMenus) { g_origRenderPrepassesAndMenus(a_renderer); }
+        }
+
+        std::uint32_t HookedProcessGraphEvent(
+            RE::BSAnimationGraphManager* a_manager, const RE::BSFixedString& a_eventName)
+        {
+            const auto result = g_origProcessGraphEvent ? g_origProcessGraphEvent(a_manager, a_eventName) : 0;
+            CharacterAnimation::ObserveGraphRequest(a_manager, a_eventName.c_str(), result);
+            return result;
+        }
+
         bool InstallTF3DHUDRenderHooks(REL::Trampoline& a_trampoline)
         {
             if constexpr (!kTF3DHUDCharacterPass) { return true; }
@@ -1603,10 +2520,70 @@ namespace PipOS
                 a_trampoline.write_call<5>(deferredCall, &HookedRenderSceneDeferred));
             g_origBSRenderPassCtor = reinterpret_cast<BSRenderPassCtor_t*>(
                 a_trampoline.write_call<5>(compositeCtorCall, &HookedCompositePassCtor));
+            REL::Relocation<std::uintptr_t> renderPrepassesAndMenus{ REL::ID(1189309) };
+            g_origRenderPrepassesAndMenus = CreateBranchGateway5<RenderPrepassesAndMenus_t*>(
+                "Interface3D::Renderer::RenderPrepassesAndMenus", renderPrepassesAndMenus,
+                reinterpret_cast<void*>(&HookedRenderPrepassesAndMenus));
+            REL::Relocation<std::uintptr_t> processGraphEvent{ REL::ID(1199489) };
+            g_origProcessGraphEvent = CreateBranchGateway5<ProcessGraphEvent_t*>(
+                "BSAnimationGraphManager::ProcessGraphEvent", processGraphEvent,
+                reinterpret_cast<void*>(&HookedProcessGraphEvent));
             logger::info(
                 "[PipOS][3D] TF3DHUD deferred hooks installed @ REL::ID(917134)+0x51A and "
-                "REL::ID(73644)+0x158B");
-            return g_origRenderSceneDeferred && g_origBSRenderPassCtor;
+                "REL::ID(73644)+0x158B; graph hooks @ REL::ID(1189309)/REL::ID(1199489)");
+            return g_origRenderSceneDeferred && g_origBSRenderPassCtor && g_origRenderPrepassesAndMenus &&
+                g_origProcessGraphEvent;
+        }
+
+        void RequestVisualRebuild()
+        {
+            g_dirty.store(true);
+            if (g_pipboyOpen.load()) { QueueCapturePass(1.0f / 60.0f); }
+        }
+
+        void RequestEquipmentRebuild()
+        {
+            g_equipmentCandidateSignature = 0;
+            g_equipmentStablePasses = 0;
+            g_equipmentSettleRequested.store(true);
+            RequestVisualRebuild();
+        }
+
+        void HookedUpdate3DModel(RE::AIProcess* a_process, RE::Actor* a_actor, bool a_queued)
+        {
+            if (g_origUpdate3DModel) { g_origUpdate3DModel(a_process, a_actor, a_queued); }
+            // Pip-Boy item inspection calls Update3DModel on the player after replacing biped slot 41 with the
+            // selected list item's preview model. Treating that as equipment is what put a Cryolator-shaped model
+            // into a 10mm ready pose. Real loadout changes have their own TESEquipEvent watcher below.
+            if (a_actor && a_actor->IsPlayerRef() && !g_pipboyOpen.load()) { RequestVisualRebuild(); }
+        }
+
+        class EquipWatcher final : public RE::BSTEventSink<RE::TESEquipEvent>
+        {
+        public:
+            RE::BSEventNotifyControl ProcessEvent(
+                const RE::TESEquipEvent& a_event,
+                RE::BSTEventSource<RE::TESEquipEvent>*) override
+            {
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                if (!player || a_event.actor.get() != player) { return RE::BSEventNotifyControl::kContinue; }
+                auto* form = RE::TESForm::GetFormByID(a_event.baseObject);
+                if (form && form->Is(RE::ENUM_FORM_ID::kARMO, RE::ENUM_FORM_ID::kWEAP)) {
+                    RequestEquipmentRebuild();
+                }
+                return RE::BSEventNotifyControl::kContinue;
+            }
+        };
+
+        void RegisterEquipWatcher()
+        {
+            static EquipWatcher watcher;
+            if (auto* source = g_equipEventSource.get()) {
+                source->RegisterSink(std::addressof(watcher));
+                logger::info("[PipOS][3D] equipment event watcher registered");
+            } else {
+                logger::info("[PipOS][3D] equipment event watcher unavailable");
+            }
         }
 
         // WORKER-THREAD-SAFE hook body: on this fork RunActorUpdates fires on BSMTAManager / HighFPSPhysics
@@ -1624,14 +2601,7 @@ namespace PipOS
             // live and may need teardown. Avoids queuing a perpetual no-op task while the menu is closed.
             if (!g_pipboyOpen.load() && !g_available.load()) { return; }
 
-            bool expected = false;
-            if (!g_taskInFlight.compare_exchange_strong(expected, true)) {
-                return;  // a pass is already queued/running -- collapse this worker-thread fire
-            }
-            auto* task = F4SE::GetTaskInterface();
-            if (!task) { g_taskInFlight.store(false); return; }
-            const float delta = a_delta;
-            task->AddTask([delta]() { RunCaptureTask(delta); });
+            QueueCapturePass(a_delta);
         }
 
         // ------------------------------------------------------------------ DLL<->AS3 contract push
@@ -1681,6 +2651,50 @@ namespace PipOS
             });
         }
 
+        void ScheduleInventoryPageProbe()
+        {
+            bool expected = false;
+            if (!g_pageProbeInFlight.compare_exchange_strong(expected, true)) { return; }
+            auto* task = F4SE::GetTaskInterface();
+            if (!task) { g_pageProbeInFlight.store(false); return; }
+            task->AddUITask([]() {
+                g_pageProbeInFlight.store(false);
+                auto* ui = RE::UI::GetSingleton();
+                auto menu = ui ? ui->GetMenu(RE::BSFixedString(kPipboyMenu.data())) : nullptr;
+                auto* view = menu ? menu->uiMovie.get() : nullptr;
+                if (!view) { return; }
+
+                bool inventory = false;
+                const char* source = nullptr;
+                double pageNumber = -1.0;
+
+                // The custom Inventory page publishes its real ADDED_TO_STAGE / REMOVED_FROM_STAGE lifecycle on
+                // root1. This is authoritative: the stock shell's DataObj is private/unreadable on this setup.
+                Scaleform::GFx::Value explicitPage;
+                if (view->GetVariable(
+                        std::addressof(explicitPage), "root1.PipOS_inventoryPageActive") &&
+                    explicitPage.IsBoolean()) {
+                    inventory = explicitPage.GetBoolean();
+                    source = "inventory-page-lifecycle";
+                } else {
+                    Scaleform::GFx::Value page;
+                    if (!view->GetVariable(std::addressof(page), "root1.Menu_mc.DataObj.CurrentPage") ||
+                        !page.IsNumber()) {
+                        return;
+                    }
+                    pageNumber = page.GetNumber();
+                    inventory = static_cast<std::int32_t>(pageNumber) == 1;
+                    source = "shell-dataobj";
+                }
+                const bool previous = g_inventoryPageActive.exchange(inventory);
+                if (previous != inventory) {
+                    logger::info("[PipOS][3D] page visibility changed: source={} CurrentPage={} inventory={}",
+                        source, pageNumber, inventory);
+                    QueueCapturePass(1.0f / 60.0f);
+                }
+            });
+        }
+
         class Char3DMenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
         {
         public:
@@ -1691,12 +2705,19 @@ namespace PipOS
                 if (a_event.menuName == kPipboyMenu.data()) {
                     if (a_event.opening) {
                         g_pipboyOpen.store(true);
+                        g_loggedTransientBipedPreview.store(false);
+                        // Page state can be asynchronous, but it no longer gates preview construction. Start the
+                        // live model offscreen until Scaleform positively identifies Inventory, avoiding a flash
+                        // of the character when PIP-OS opens on STATUS, DATA, MAP, or RADIO.
+                        g_inventoryPageActive.store(false);
                         g_dirty.store(true);  // rebuild with the equipment worn at this open
                         // Initial push (available:false until the clone actually builds in RunCaptureTask,
                         // which re-pushes available:true on the transition). Keeps absent-member -> fallback.
                         SchedulePushContract();
+                        ScheduleInventoryPageProbe();
                     } else {
                         g_pipboyOpen.store(false);
+                        g_inventoryPageActive.store(false);
                         // Teardown must be single-threaded like the build: run HideAndRelease on the main
                         // thread via AddTask (renderer Disable / Offscreen_Set3D(nullptr) / NiPointer release
                         // are all D3D/scene lifecycle). Then re-push the contract (now available:false).
@@ -1739,12 +2760,22 @@ namespace PipOS
         // -- only ever reached when the user has opted in.
 #pragma warning(push)
 #pragma warning(disable: 4996)  // AllocTrampoline is deprecated in favor of F4SE::Init({.trampoline=true}),
-        F4SE::AllocTrampoline(128);  // enough for the frame hook plus TF3DHUD's two guarded call-site hooks.
+        F4SE::AllocTrampoline(512);  // frame/call-site hooks plus render/update branch gateways and islands.
 #pragma warning(pop)
         auto& trampoline = REL::GetTrampoline();
 
         if (!InstallTF3DHUDRenderHooks(trampoline)) {
             logger::error("[PipOS][3D] TF3DHUD character pass disabled because its render hooks were not safe to install");
+            g_failed.store(true);
+            return false;
+        }
+
+        REL::Relocation<std::uintptr_t> update3DModel{ REL::ID(986782) };
+        g_origUpdate3DModel = CreateBranchGateway5<Update3DModel_t*>(
+            "AIProcess::Update3DModel", update3DModel,
+            reinterpret_cast<void*>(&HookedUpdate3DModel));
+        if (!g_origUpdate3DModel) {
+            logger::error("[PipOS][3D] Update3DModel hook could not be installed safely");
             g_failed.store(true);
             return false;
         }
@@ -1759,6 +2790,7 @@ namespace PipOS
             target);
 
         RegisterContractSink();
+        RegisterEquipWatcher();
         if (auto* settings = Settings::GetSingleton()) {
             logger::info("[PipOS][3D] capture hook armed (renderer='{}', fov={}, scale={}, yaw={}); bLive3D toggles at runtime",
                 kRendererName, settings->Char3DFov(), settings->Char3DScale(), settings->Char3DYaw());

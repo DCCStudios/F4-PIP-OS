@@ -341,6 +341,11 @@ namespace PipOS
 
             // weapon
             double        dmg{ 0.0 }, firerate{ 0.0 }, rpm{ 0.0 }, range{ 0.0 };
+            bool          haveEnergyDmg{ false }; double energyDmg{ 0.0 };
+            bool          haveRadDmg{ false };    double radDmg{ 0.0 };
+            bool          havePoisonDmg{ false }; double poisonDmg{ 0.0 };
+            std::uint32_t projectileCount{ 1 };
+            bool          thrown{ false };
             bool          haveAcc{ false };  double acc{ 0.0 };
             bool          haveAmmo{ false }; std::uint32_t ammoFormID{ 0 };
             char          ammoName[128]{};
@@ -361,6 +366,34 @@ namespace PipOS
             bool          haveEffect{ false };
             char          effect[128]{};
         };
+
+        [[nodiscard]] bool ReadWeaponDisplayStatsSEH(
+            const RE::BGSObjectInstanceT<RE::TESObjectWEAP>& a_weapon,
+            RE::TESObjectWEAP& a_base,
+            const RE::TESObjectWEAP::InstanceData& a_data,
+            RE::PlayerCharacter* a_player,
+            ItemRawPOD& a_out) noexcept
+        {
+            __try {
+                // These are the exact formulas used to populate the vanilla item card. Keep them in a small
+                // SEH leaf because third-party instance data can be malformed and the inventory bridge must
+                // skip back to its guarded raw fallback rather than take down the menu.
+                a_out.dmg = static_cast<double>(
+                    RE::CombatFormulas::GetWeaponDisplayDamage(a_weapon, a_data.ammo, 1.0f));
+                a_out.firerate = static_cast<double>(
+                    RE::CombatFormulas::GetWeaponDisplayRateOfFire(a_base, std::addressof(a_data)));
+                a_out.rpm = a_out.firerate * 6.0;
+                a_out.range = static_cast<double>(RE::CombatFormulas::GetWeaponDisplayRange(a_weapon));
+                if (a_player) {
+                    a_out.acc = static_cast<double>(
+                        RE::CombatFormulas::GetWeaponDisplayAccuracy(a_weapon, a_player));
+                    a_out.haveAcc = true;
+                }
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
 
         // POD-only C-string copy (no std::string) so it is safe to call from inside the SEH leaf.
         inline void CopyCStr(char* a_dst, std::size_t a_cap, const char* a_src) noexcept
@@ -481,9 +514,8 @@ namespace PipOS
                     const auto& wd = (a_inst != nullptr)
                         ? *static_cast<const RE::TESObjectWEAP::InstanceData*>(a_inst)
                         : weap->weaponData;
-                    // WEAPON STAT MAPPING (all plain member reads off TESObjectWEAP::Data, no engine calls;
-                    // these are the UNMODDED authored base values -- per-instance mod deltas are intentionally
-                    // NOT applied, see "HONEST SCOPE" above -- and the AS card rounds each to an integer):
+                    // Guarded raw fallbacks. PushItemStatsNow replaces these with CombatFormulas' vanilla
+                    // display values after this SEH-contained extraction succeeds.
                     //   dmg  = attackDamage (0x132) -- authored base ballistic damage per shot. The vanilla
                     //          card's headline DAMAGE; InvPage presents ENERGY as 0.35x of this.
                     //   firerate = 10 * speed / attackDelaySec -- the vanilla Pip-Boy "FIRE RATE" derived stat,
@@ -501,6 +533,43 @@ namespace PipOS
                     //   acc   = aim-cone proxy (below) -- 100 - minConeDegrees*40, clamped 0-100. Lower cone =>
                     //          tighter => higher acc. A DLL-derived stand-in for the engine's exact accuracy stat.
                     a_out.dmg = static_cast<double>(wd.attackDamage);
+                    // Preserve the resolved instance's authored typed damage instead of fabricating the
+                    // ENERGY/RAD/POISON card values from physical damage. Receiver and ammo OMOD deltas have
+                    // already been applied to wd by ResolveInstanceSEH.
+                    if (wd.damageTypes) {
+                        for (const auto& dt : *wd.damageTypes) {
+                            auto* dmgType = dt.first ? dt.first->As<RE::BGSDamageType>() : nullptr;
+                            if (!dmgType || !dmgType->data.resistance) { continue; }
+                            const char* eid = dmgType->data.resistance->formEditorID.c_str();
+                            if (!eid) { continue; }
+                            const double value = static_cast<double>(dt.second.f);
+                            if (ContainsCI(eid, "energy")) {
+                                a_out.energyDmg += value;
+                                a_out.haveEnergyDmg = true;
+                            } else if (ContainsCI(eid, "rad")) {
+                                a_out.radDmg += value;
+                                a_out.haveRadDmg = true;
+                            } else if (ContainsCI(eid, "poison")) {
+                                a_out.poisonDmg += value;
+                                a_out.havePoisonDmg = true;
+                            }
+                        }
+                    }
+                    a_out.thrown = wd.type.any(RE::WEAPON_TYPE::kGrenade, RE::WEAPON_TYPE::kMine);
+                    // Vanilla exposes shotgun damage as per-projectile damage times the authored projectile
+                    // count. The count lives on the resolved instance ranged data, so OMOD receivers remain
+                    // authoritative. Thrown weapons are different: their useful damage is the projectile's
+                    // explosion record, not WEAP::attackDamage (commonly zero or a token value).
+                    RE::BGSProjectile* projectile = nullptr;
+                    if (wd.rangedData) {
+                        const auto count = static_cast<std::int32_t>(wd.rangedData->numProjectiles);
+                        if (count > 1) { a_out.projectileCount = static_cast<std::uint32_t>(count); }
+                        projectile = wd.rangedData->overrideProjectile;
+                    }
+                    if (!projectile && wd.ammo) { projectile = wd.ammo->data.projectile; }
+                    if (a_out.thrown && projectile && projectile->data.explosionType) {
+                        a_out.dmg = static_cast<double>(projectile->data.explosionType->data.damage);
+                    }
                     {
                         const float delay = wd.attackDelaySec;
                         const float spd   = wd.speed;
@@ -681,6 +750,19 @@ namespace PipOS
                                 return true;
                             }
 
+                            if (auto* weap = obj->As<RE::TESObjectWEAP>()) {
+                                const auto& wd = inst
+                                    ? *static_cast<const RE::TESObjectWEAP::InstanceData*>(inst.get())
+                                    : weap->weaponData;
+                                RE::BGSObjectInstanceT<RE::TESObjectWEAP> weaponInstance(weap, inst.get());
+                                if (!ReadWeaponDisplayStatsSEH(
+                                        weaponInstance, *weap, wd, RE::PlayerCharacter::GetSingleton(), pod)) {
+                                    logger::info(
+                                        "[PipOS] vanilla display-stat read failed for {:08X}; using guarded raw fallbacks",
+                                        id);
+                                }
+                            }
+
                             // ---- installed mods (weapons + armor) -> modsMap[key] = [names...] ----
                             if (needMods && pod.modCount > 0) {
                                 std::vector<std::string> mods;
@@ -715,8 +797,13 @@ namespace PipOS
                             movieRoot->CreateString(std::addressof(stype), pod.type);
                             entry.SetMember("type", stype);
 
-                            if (pod.isWeap) {
-                                entry.SetMember("dmg", Scaleform::GFx::Value(pod.dmg));
+                             if (pod.isWeap) {
+                                 entry.SetMember("dmg", Scaleform::GFx::Value(pod.dmg));
+                                 if (pod.haveEnergyDmg) { entry.SetMember("energyDmg", Scaleform::GFx::Value(pod.energyDmg)); }
+                                 if (pod.haveRadDmg) { entry.SetMember("radDmg", Scaleform::GFx::Value(pod.radDmg)); }
+                                 if (pod.havePoisonDmg) { entry.SetMember("poisonDmg", Scaleform::GFx::Value(pod.poisonDmg)); }
+                                 entry.SetMember("projectiles", Scaleform::GFx::Value(static_cast<double>(pod.projectileCount)));
+                                 entry.SetMember("thrown", Scaleform::GFx::Value(pod.thrown));
                                 entry.SetMember("firerate", Scaleform::GFx::Value(pod.firerate));
                                 entry.SetMember("rpm", Scaleform::GFx::Value(pod.rpm));
                                 entry.SetMember("range", Scaleform::GFx::Value(pod.range));
@@ -879,15 +966,78 @@ namespace PipOS
                 if (!obj.IsObject()) { logger::error("[PipOS] settings: CreateObject failed; skipping"); return; }
                 obj.SetMember("veil", Scaleform::GFx::Value(static_cast<double>(s->VeilAlpha())));
                 obj.SetMember("breathe", Scaleform::GFx::Value(s->CrtBreathe()));
+                obj.SetMember("vignette", Scaleform::GFx::Value(s->CrtVignette()));
                 obj.SetMember("openAnim", Scaleform::GFx::Value(s->OpenAnim()));
                 obj.SetMember("openAnimSpeed", Scaleform::GFx::Value(static_cast<double>(s->OpenAnimSpeed())));   // 0.0.60
                 obj.SetMember("folders", Scaleform::GFx::Value(s->Folders()));
                 obj.SetMember("showRPM", Scaleform::GFx::Value(s->ShowRPM()));
                 root.SetMember("PipOS_settings", obj);
-                logger::info("[PipOS] settings: pushed veil={} breathe={} openAnim={} speed={} folders={} showRPM={}",
-                    s->VeilAlpha(), s->CrtBreathe(), s->OpenAnim(), s->OpenAnimSpeed(), s->Folders(), s->ShowRPM());
+                logger::info("[PipOS] settings: pushed veil={} breathe={} vignette={} openAnim={} speed={} folders={} showRPM={}",
+                    s->VeilAlpha(), s->CrtBreathe(), s->CrtVignette(), s->OpenAnim(), s->OpenAnimSpeed(), s->Folders(),
+                    s->ShowRPM());
             } catch (...) {
                 logger::error("[PipOS] settings: marshalling threw; skipped (AS uses const fallbacks)");
+            }
+        }
+
+        void PushStatusNow(Scaleform::GFx::Movie* a_view, bool a_quiet = false)
+        {
+            if (!a_view) { return; }
+            Scaleform::GFx::Value root;
+            if (!a_view->GetVariable(std::addressof(root), "root1") || !root.IsObject()) { return; }
+
+            double radsCurrent = 0.0;
+            double radsMax = 1.0;
+            if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                if (auto* actorValues = RE::ActorValue::GetSingleton(); actorValues && actorValues->health &&
+                    actorValues->rads && actorValues->radHealthMax) {
+                    const float permanentHealth =
+                        std::max(1.0F, player->GetPermanentActorValue(*actorValues->health));
+                    const float radPool = std::max(0.0F, player->GetActorValue(*actorValues->radHealthMax));
+                    // RadHealthMax is the health pool consumed by radiation. Reject tiny compatibility-mod
+                    // sentinel values, which would otherwise turn any nonzero radiation into a full meter.
+                    if (radPool >= std::max(1.0F, permanentHealth * 0.1F)) {
+                        radsCurrent = std::max(0.0F, player->GetActorValue(*actorValues->rads));
+                        radsMax = std::max(1.0F, radPool);
+                    }
+                }
+            }
+
+            root.SetMember("PipOS_rads", Scaleform::GFx::Value(radsCurrent));
+            root.SetMember("PipOS_radsMax", Scaleform::GFx::Value(radsMax));
+            if (!a_quiet) {
+                logger::info("[PipOS] status: pushed radiation={:.1f}/{:.1f}", radsCurrent, radsMax);
+            }
+        }
+
+        // Baka Fullscreen Pip-Boy can place a second Interface3D HUD-glass surface behind its
+        // PipboyBackgroundMenu movie. That surface has its own opacityAlpha and therefore is not affected by
+        // either GFx::Movie::SetBackgroundAlpha or Chrome's full-frame PIP-OS veil. Leaving it opaque produces
+        // the field-observed darker center at very small VeilAlpha values. PIP-OS owns the one uniform dimmer,
+        // so make Baka's optional backing surface transparent while this menu is active; its SWF CRT art,
+        // scanlines, and borders are separate and remain visible.
+        void NeutralizeBakaBackgroundSurface()
+        {
+            constexpr auto kBakaBackgroundRenderer = "PipboyBackgroundScreenModel";
+            if (auto* renderer = RE::Interface3D::Renderer::GetByName(RE::BSFixedString(kBakaBackgroundRenderer))) {
+                renderer->MainScreen_SetOpacityAlpha(0.0f);
+                logger::info("[PipOS] transparency: Baka background screen-model opacity=0");
+            } else {
+                logger::info("[PipOS] transparency: Baka background screen-model not active");
+            }
+        }
+
+        // Baka constructs/enables its custom renderer from a separate menu-advance event. Retry after the
+        // immediate open task so load ordering cannot reintroduce the backing surface one frame later.
+        void DelayedBakaBackgroundNeutralize(int a_hops)
+        {
+            if (auto* task = F4SE::GetTaskInterface()) {
+                task->AddUITask([a_hops]() {
+                    if (a_hops > 0) { DelayedBakaBackgroundNeutralize(a_hops - 1); return; }
+                    if (auto* ui = RE::UI::GetSingleton(); ui && ui->GetMenu(kPipboyMenu)) {
+                        NeutralizeBakaBackgroundSurface();
+                    }
+                });
             }
         }
 
@@ -1071,6 +1221,7 @@ namespace PipOS
         // ("tab:KEY|KEY;tab:KEY"); the page (and root1) die with the menu, so we bank the string here at close
         // and re-seed it onto the fresh root1 at the next open. Session-scoped by design (not saved to disk).
         std::string s_folderMem{};
+        std::string s_invListMem{};
 
         void CaptureFolderMemNow(Scaleform::GFx::Movie* a_view)
         {
@@ -1091,6 +1242,29 @@ namespace PipOS
                 Scaleform::GFx::Value v(s_folderMem.c_str());
                 if (a_view->SetVariable("root1.PipOS_folderMem", v)) {
                     logger::info("[PipOS] folderMem: re-seeded '{}' at open", s_folderMem);
+                }
+            } catch (...) {}
+        }
+
+        void CaptureInvListMemNow(Scaleform::GFx::Movie* a_view)
+        {
+            if (!a_view) { return; }
+            try {
+                Scaleform::GFx::Value v;
+                if (a_view->GetVariable(std::addressof(v), "root1.PipOS_invListMem") && v.IsString()) {
+                    s_invListMem = v.GetString();
+                    logger::info("[PipOS] invListMem: captured '{}' at close", s_invListMem);
+                }
+            } catch (...) {}
+        }
+
+        void SeedInvListMemNow(Scaleform::GFx::Movie* a_view)
+        {
+            if (!a_view || s_invListMem.empty()) { return; }
+            try {
+                Scaleform::GFx::Value v(s_invListMem.c_str());
+                if (a_view->SetVariable("root1.PipOS_invListMem", v)) {
+                    logger::info("[PipOS] invListMem: re-seeded '{}' at open", s_invListMem);
                 }
             } catch (...) {}
         }
@@ -1153,6 +1327,7 @@ namespace PipOS
                             logger::info("[PipOS][MENUKIDS] ---- close snapshot ----");
                             LogMenuChildren(menu->uiMovie.get());
                             CaptureFolderMemNow(menu->uiMovie.get());   // 0.0.59: bank opened-folder state for the next open
+                            CaptureInvListMemNow(menu->uiMovie.get());  // per-tab selection + scroll position
                         }
                     }
                 }
@@ -1171,12 +1346,16 @@ namespace PipOS
                                     // 0.0.54: PeriodicLifeLog chain RETIRED -- it never produced a line in the
                                     // field (task-pump timing) and the open/close snapshots carry the trail
                                     // reliably. Left compiled but unstarted to avoid any pump-recursion risk.
+                                    // Chrome reads PipOS_settings in its document constructor. Publish settings
+                                    // first so a newly loaded Chrome sees the saved veil value immediately.
+                                    PushSettingsNow(view);
+                                    PushStatusNow(view);
                                     AttachChromeNow(view);
                                     PushEquipmentNow(view);  // 0.0.20: native worn-armor -> root1.PipOS_equip
                                     PushItemInfoNow(view);   // 0.0.23 P1-D: per-item WT/VAL/AMMO -> root1.PipOS_iteminfo
                                     PushItemStatsNow(view);  // 0.0.25: per-item stats + mods + favorites (formID-keyed)
-                                    PushSettingsNow(view);   // 0.0.38: customization -> root1.PipOS_settings (veil/breathe/openAnim/folders)
                                     SeedFolderMemNow(view);  // 0.0.59: session folder memory -> root1.PipOS_folderMem
+                                    SeedInvListMemNow(view); // session inventory selection/scroll -> root1.PipOS_invListMem
                                     // 0.0.60 TRANSPARENCY PASS: force BOTH pipboy movies to composite with a
                                     // fully transparent movie background. Our AS layers have no full-screen
                                     // opaque fill and the shipped background art is aperture-open, so any
@@ -1189,6 +1368,8 @@ namespace PipOS
                                             logger::info("[PipOS] transparency: background-menu movie alpha=0");
                                         }
                                     }
+                                    NeutralizeBakaBackgroundSurface();
+                                    DelayedBakaBackgroundNeutralize(45);
                                     logger::info("[PipOS] transparency: pipboy movie background alpha=0");
                                     if (auto* s = Settings::GetSingleton()) {
                                         DiagnoseViewport(view, s->WidescreenSpike());  // spike: default 0 = no-op
@@ -1293,7 +1474,10 @@ namespace PipOS
             task->AddUITask([]() {
                 if (auto* ui = RE::UI::GetSingleton()) {
                     if (auto menu = ui->GetMenu(kPipboyMenu)) {
-                        if (auto* view = menu->uiMovie.get()) { PushEquipmentNow(view, true); }
+                        if (auto* view = menu->uiMovie.get()) {
+                            PushEquipmentNow(view, true);
+                            PushStatusNow(view, true);
+                        }
                     }
                 }
             });

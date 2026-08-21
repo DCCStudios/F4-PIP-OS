@@ -75,7 +75,7 @@ package
          Theme.panelR(g, this._panels, this.SCOPE_X, this.SCOPE_Y, this.SCOPE_W, Theme.BB - this.SCOPE_Y, 0.5);
          // Divider above the freqrow band (mockup #freqrow border-top).
          var fy:Number = Theme.BB - this.FREQ_STRIP;
-         g.lineStyle(1, Theme.LINE, 0.16); g.moveTo(this.SCOPE_X + P, fy); g.lineTo(this.SCOPE_X + this.SCOPE_W - P, fy); g.lineStyle();
+         Theme.fillLine(g, this.SCOPE_X + P, fy, this.SCOPE_X + this.SCOPE_W - P, fy, Theme.LINE, 0.16);
          this._list = new PipList(stationsW - 2 * P, 28, 18);   // 18 rows: a header band (FREQUENCIES, mockup h3) is reserved above
          this._list.x = Theme.CX + P; this._list.y = Theme.BY + 34; this._list.onSelectionChange = this.onListSel; this._list.onItemPress = this.onListPress; this._list.playSound = this.sfx; addChild(this._list);
          // Scope trace is inset below the OSCILLOSCOPE header band (SCOPE_HDR) and above the freqrow strip; onTick uses scopeTraceH().
@@ -200,16 +200,15 @@ package
          g.beginFill(0x0A120C, 1); g.drawRect(0, 0, w, h); g.endFill();
          // Faint phosphor graticule (mockup: rgba(134,224,140,.08); 24px CSS grid -> ~19 local at MS=0.8).
          var step:Number = 19;
-         g.lineStyle(1, Theme.PHOS, 0.08);
-         for (var gx:Number = 0; gx <= w + 0.5; gx += step) { g.moveTo(gx, 0); g.lineTo(gx, h); }
-         for (var gy2:Number = 0; gy2 <= h + 0.5; gy2 += step) { g.moveTo(0, gy2); g.lineTo(w, gy2); }
-         g.lineStyle();
+         for (var gx:Number = 0; gx <= w + 0.5; gx += step) { Theme.fillLine(g, gx, 0, gx, h, Theme.PHOS, 0.08); }
+         for (var gy2:Number = 0; gy2 <= h + 0.5; gy2 += step) { Theme.fillLine(g, 0, gy2, w, gy2, Theme.PHOS, 0.08); }
          var midY:Number = h / 2;
          var maxA:Number = midY - 3;                    // keep the trace off the top/bottom edges
          var on:Boolean = (this._activeIdx >= 0);
          // Waveform: compound-harmonic sine (mockup drawScope: sin*.5 + sin(2.7)*.3 + sin(6.1)*.12), amp v*h*0.3.
-         g.lineStyle(1.6, on ? Theme.PHOS_BRIGHT : Theme.PHOS_DIM, on ? 1 : 0.5);
-         g.moveTo(0, midY);
+         var waveColor:uint = on ? Theme.PHOS_BRIGHT : Theme.PHOS_DIM;
+         var waveAlpha:Number = on ? 1 : 0.5;
+         var prevX:Number = 0, prevY:Number = midY;
          if (on)
          {
             for (var x:Number = 0; x <= w; x += 4)
@@ -218,11 +217,12 @@ package
                var v:Number = Math.sin(ph) * 0.5 + Math.sin(ph * 2.7) * 0.3 + Math.sin(ph * 6.1) * 0.12;
                var amp:Number = v * h * 0.3;
                if (amp > maxA) { amp = maxA; } else if (amp < -maxA) { amp = -maxA; }
-               g.lineTo(x, midY + amp);
+               var nextY:Number = midY + amp;
+               Theme.fillLine(g, prevX, prevY, x, nextY, waveColor, waveAlpha, 1.6);
+               prevX = x; prevY = nextY;
             }
          }
-         else { g.lineTo(w, midY); }   // flatline
-         g.lineStyle();
+         else { Theme.fillLine(g, 0, midY, w, midY, waveColor, waveAlpha, 1.6); }
       }
 
       public function debugRects():Array { return this._panels; }

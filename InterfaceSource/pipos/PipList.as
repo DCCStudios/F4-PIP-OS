@@ -45,6 +45,7 @@ package pipos
       // (no fields/geometry), so it stays pool-safe. NOTE: whether GFx delivers right-mouse to the movie at all is
       // runtime-unproven here; the page logs a breadcrumb when this fires so a test decides it.
       public var onRowContext:Function;        // function(idx:int, entry:Object, ex:Number, ey:Number)
+      public var onViewportChange:Function;    // function(sel:int, top:int), used to persist list position
       public var columns:Array = null;         // optional [{w,align}]; adapter returns cols:[String,...]. STABLE by pool-build time.
       public var optCol:int = -1;              // index of an OPTIONAL column (e.g. INV AMMO); toggled by optOn without geometry writes
       public var optOn:Boolean = true;         // when false the opt column is hidden and the NAME cell widens (scrollRect only)
@@ -164,12 +165,12 @@ package pipos
          var k:Number = 0.5 + 0.5 * Math.sin(this._pulseT * 3.0);   // 0..1, period ~2.09s
          var inner:Number = 0.22 + 0.40 * k;                         // 0.22 .. 0.62 bright edge
          var outer:Number = 0.06 + 0.16 * k;                         // 0.06 .. 0.22 faint bloom
-         g.lineStyle(2.5, Theme.PHOS_BRIGHT, outer); g.drawRoundRect(-1.5, y - 1.5, this._w + 3, this._rowH + 1, 6, 6);
-         g.lineStyle(1, Theme.PHOS_BRIGHT, inner);   g.drawRoundRect(0.5, y + 0.5, this._w - 1, this._rowH - 3, 5, 5);
-         g.lineStyle();
+         Theme.frameRect(g, -1.5, y - 1.5, this._w + 3, this._rowH + 1, Theme.PHOS_BRIGHT, outer, 2.5);
+         Theme.frameRect(g, 0.5, y + 0.5, this._w - 1, this._rowH - 3, Theme.PHOS_BRIGHT, inner, 1);
       }
 
       public function get selectedIndex():int { return this._sel; }
+      public function get topIndex():int { return this._top; }
       public function get length():int { return this._entries ? this._entries.length : 0; }
       public function get hoverIndex():int { return this._hoverIdx; }   // 0.0.62: DLL-forwarded right-click asks which row the cursor is on
       public function entryAt(i:int):Object { return (i >= 0 && i < this._entries.length) ? this._entries[i] : null; }
@@ -231,6 +232,27 @@ package pipos
          this._sel = i; this.clampScroll(); this.render();
       }
 
+      // Restore a previously saved selection + scroll window in one update-only operation. The saved top is
+      // authoritative when it still contains the selection; otherwise clampScroll brings the selection onscreen.
+      public function restoreView(i:int, top:int):void
+      {
+         if (this._entries.length == 0) { this._sel = -1; this._top = 0; this.render(); return; }
+         if (i < 0) { i = 0; } if (i >= this._entries.length) { i = this._entries.length - 1; }
+         if (!this.isSelectable(i)) {
+            var probe:int = i;
+            while (probe < this._entries.length && !this.isSelectable(probe)) { probe++; }
+            if (probe >= this._entries.length) {
+               probe = i - 1; while (probe >= 0 && !this.isSelectable(probe)) { probe--; }
+            }
+            i = (probe >= 0 && probe < this._entries.length) ? probe : 0;
+         }
+         this._sel = i;
+         var maxTop:int = Math.max(0, this._entries.length - this._visible);
+         this._top = Math.max(0, Math.min(top, maxTop));
+         if (this._sel < this._top || this._sel >= this._top + this._visible) { this.clampScroll(); }
+         this.render();
+      }
+
       // Per-column geometry in list-LOCAL coords, matching buildPool's layout EXACTLY. Callable BEFORE the pool
       // is built so the page can align its header cells over the data columns (parity fix C1). Column x's are
       // stable regardless of optOn (the name field always advances by its narrow width; the opt column just hides).
@@ -290,11 +312,13 @@ package pipos
 
       private function onWheel(e:MouseEvent):void
       {
+         var oldTop:int = this._top;
          this._top -= (e.delta > 0 ? 1 : -1);
          var maxTop:int = Math.max(0, this._entries.length - this._visible);
          if (this._top < 0) { this._top = 0; }
          if (this._top > maxTop) { this._top = maxTop; }
          this.render();
+         if (this._top != oldTop && onViewportChange != null) { onViewportChange(this._sel, this._top); }
       }
 
       private function onRowClick(e:MouseEvent):void
@@ -495,14 +519,14 @@ package pipos
             if (a.equipped == true) { mg.beginFill(isSel ? 0x0A140A : Theme.PHOS_BRIGHT, 0.95); mg.drawRect(0, y + 2, 2.5, this._rowH - 5); mg.endFill(); }
             if (isColsRow) {
                // legendary sparkle sits in the ~12px left padding, slightly preceding the name (mockup look).
-               if (a.legendary) { Theme.legendaryMark(mg, 6, gy, 5, isSel ? 0x0A140A : Theme.WARN); }   // 0.0.60: diamond, not a second star
+               if (a.legendary) { Theme.legendaryMark(mg, 6, gy, 5, isSel ? 0x0A140A : Theme.WARN); }
                if (a.star) {
                   var nameVis:Number = this.optOn ? this._nameNarrowVis : this._nameWideVis;
                   Theme.star(mg, this._markX + nameVis - 8, gy, 6, isSel ? 0x0A140A : Theme.PHOS_BRIGHT);
                }
             } else {
                var mx:Number = 10;
-               if (a.legendary) { Theme.legendaryMark(mg, mx + 4, gy, 6, isSel ? 0x0A140A : Theme.WARN); mx += MARK_STEP; }   // 0.0.60: diamond, not a second star
+               if (a.legendary) { Theme.legendaryMark(mg, mx + 4, gy, 6, isSel ? 0x0A140A : Theme.WARN); mx += MARK_STEP; }
                if (a.star)      { Theme.star(mg, mx + 4, gy, 6, isSel ? 0x0A140A : Theme.PHOS_BRIGHT); mx += MARK_STEP; }
             }
 
@@ -586,7 +610,7 @@ package pipos
       // the dedicated _markers layer; lineStyle() reset first so it can never inherit a stroke or connect a pen path.
       private function drawFolderCaret(g:*, cx:Number, cy:Number, collapsed:Boolean):void
       {
-         g.lineStyle();
+         g.lineStyle(0, 0, 0);
          g.beginFill(Theme.PHOS_BRIGHT, 1);
          if (collapsed) { g.moveTo(cx - 2, cy - 4); g.lineTo(cx + 4, cy); g.lineTo(cx - 2, cy + 4); }
          else           { g.moveTo(cx - 4, cy - 2); g.lineTo(cx + 4, cy - 2); g.lineTo(cx, cy + 4); }

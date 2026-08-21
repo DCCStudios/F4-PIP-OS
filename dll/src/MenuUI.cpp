@@ -17,11 +17,9 @@
 // menu-open push to root1.PipOS_settings (PipboyBridge) which the AS3 reads with fallback to its own const
 // defaults. "Save" writes only the [Customization] keys of PipOSPipboy.ini so the choice survives a restart.
 //
-// HONEST OPACITY FRAMING: the veil slider controls ONLY the PIP-OS-owned world-dim veil (default 0.10). A
-// near-solid BLACK world behind the Pip-Boy is NOT this veil: it is Baka Fullscreen Pip-Boy's own "Black
-// Background" option (bBackground=1 / fBackgroundAlpha ~0.85 in Data/MCM/Settings/BakaFullscreenPipboy.ini, a
-// user override some presets ship ON), which this mod cannot override. The page says so and sends the user to
-// Baka's MCM "Black Background" toggle for a brighter world.
+// OPACITY CONTRACT: the veil slider controls one uniform, full-visible-frame black layer below the pages.
+// Scanlines, phosphor glow, and frame borders stay independent. The formerly mandatory 230-unit edge vignette
+// is now a separate default-off CRT option so it cannot make the slider appear to affect only the center.
 
 namespace
 {
@@ -37,18 +35,17 @@ namespace
             "updates never overwrite); without Save they last only for this session.");
         ImGuiMCP::Spacing();
 
-        ImGuiMCP::SeparatorText("Background dimming");
-        ImGuiMCP::SliderFloat("PIP-OS dimming", settings->pVeilAlpha(), 0.0F, 0.60F, "veil alpha %.2f");
+        ImGuiMCP::SeparatorText("Background transparency");
+        ImGuiMCP::SliderFloat("Background opacity", settings->pVeilAlpha(), 0.0F, 1.0F, "black layer %.2f");
         ImGuiMCP::TextDisabled(
-            "How dark PIP-OS makes the world BEHIND the Pip-Boy (our own veil layer). 0.00 = no added "
-            "dim; 0.10 is the default. IMPORTANT: if the world behind the Pip-Boy is a near-solid BLACK "
-            "screen, that is NOT this veil and NOT PIP-OS. It is Baka Fullscreen Pip-Boy's own \"Black "
-            "Background\" option (some presets and patches force it ON via bBackground=1 in "
-            "BakaFullscreenPipboy.ini). Open Baka's MCM and turn \"Black Background\" OFF to get the world "
-            "back. This slider only tunes the small extra dim PIP-OS adds on top.");
+            "Opacity of one uniform black layer behind the complete PIP-OS UI. 0.00 is fully transparent; "
+            "1.00 is black. CRT scanlines, phosphor texture, and frame borders are intentionally unaffected.");
 
         ImGuiMCP::Spacing();
         ImGuiMCP::SeparatorText("CRT effects");
+        ImGuiMCP::Checkbox("Edge vignette", settings->pCrtVignette());
+        ImGuiMCP::TextDisabled(
+            "Optional fixed edge darkening. Off by default so background opacity is uniform across the screen.");
         ImGuiMCP::Checkbox("Phosphor breathing", settings->pCrtBreathe());
         ImGuiMCP::TextDisabled("Slow, subtle glow oscillation on the CRT overlay.");
         ImGuiMCP::Checkbox("Power-on open animation", settings->pOpenAnim());
@@ -77,26 +74,92 @@ namespace
         ImGuiMCP::Spacing();
         ImGuiMCP::SeparatorText("Figure placement (Live 3D)");
         ImGuiMCP::TextDisabled(
-            "Where and how big the live 3D character sits in the Pip-Boy figure slot. Unlike the toggle above, "
-            "these apply on the NEXT Pip-Boy open -- no restart -- so you can tune the fit iteratively. The "
-            "defaults estimate the center-column figure box; expect to nudge them once in-game.");
-        // clipRect = the on-screen window (positive centered extents, display-plane world units ~+-148 x /
-        // +-80 y). Bind straight to the live Settings fields, exactly like the veil/breathe sliders.
-        ImGuiMCP::SliderFloat("Window left",   settings->pChar3dClipLeft(),   0.0F, 148.0F, "%.1f");
-        ImGuiMCP::SliderFloat("Window top",    settings->pChar3dClipTop(),    0.0F,  80.0F, "%.1f");
-        ImGuiMCP::SliderFloat("Window right",  settings->pChar3dClipRight(),  0.0F, 148.0F, "%.1f");
-        ImGuiMCP::SliderFloat("Window bottom", settings->pChar3dClipBottom(), 0.0F,  80.0F, "%.1f");
-        ImGuiMCP::TextDisabled(
-            "The window straddles screen-center; each value is the distance from center to that edge. Setting "
-            "both left and right (or both top and bottom) to 0 spans the whole screen on that axis.");
-        ImGuiMCP::Spacing();
-        ImGuiMCP::SliderFloat("Model scale",     settings->pChar3dScale(),    0.05F,   2.0F, "%.3f");
-        ImGuiMCP::SliderFloat("Camera distance", settings->pChar3dDistance(), 50.0F, 600.0F, "%.0f");
-        static const char* const kTargets[] = { "Head", "Chest", "Pelvis", "Root" };
-        ImGuiMCP::Combo("Framing target", settings->pChar3dTarget(), kTargets, 4);
-        ImGuiMCP::TextDisabled(
-            "Model scale sizes the figure; camera distance pulls the camera back (bigger = smaller figure). "
-            "Framing target is the body point centered in the frame.");
+            "Character X/Y translate the model inside the fixed figure window. They do not resize the display "
+            "quad, change its UVs, alter camera projection, or stretch the character. Changes apply live.");
+        ImGuiMCP::SliderFloat("Character X", settings->pChar3dScreenX(), -100.0F, 100.0F, "%.1f");
+        ImGuiMCP::SliderFloat("Character Y", settings->pChar3dScreenY(), -100.0F, 100.0F, "%.1f");
+        if (ImGuiMCP::Button("Center character")) {
+            *settings->pChar3dScreenX() = 0.0F;
+            *settings->pChar3dScreenY() = 0.0F;
+        }
+        if (ImGuiMCP::CollapsingHeader("Advanced framing and aperture")) {
+            ImGuiMCP::TextDisabled(
+                "These controls intentionally change size, projection, rotation, or the compositor aperture. "
+                "Use Character X/Y above for translation-only placement.");
+            ImGuiMCP::SliderFloat("Window left", settings->pChar3dClipLeft(), 0.0F, 148.0F, "%.1f");
+            ImGuiMCP::SliderFloat("Window top", settings->pChar3dClipTop(), 0.0F, 80.0F, "%.1f");
+            ImGuiMCP::SliderFloat("Window right", settings->pChar3dClipRight(), 0.0F, 148.0F, "%.1f");
+            ImGuiMCP::SliderFloat("Window bottom", settings->pChar3dClipBottom(), 0.0F, 80.0F, "%.1f");
+            ImGuiMCP::SliderFloat("Model scale", settings->pChar3dScale(), 0.05F, 2.0F, "%.3f");
+            ImGuiMCP::SliderFloat("Camera distance", settings->pChar3dDistance(), 50.0F, 600.0F, "%.0f");
+            ImGuiMCP::SliderFloat("Camera FOV", settings->pChar3dFov(), 20.0F, 120.0F, "%.1f deg");
+            ImGuiMCP::SliderFloat("Model yaw", settings->pChar3dYaw(), -180.0F, 180.0F, "%.1f deg");
+            ImGuiMCP::SliderFloat("Model pitch", settings->pChar3dPitch(), -180.0F, 180.0F, "%.1f deg");
+            ImGuiMCP::SliderFloat("Model roll", settings->pChar3dRoll(), -180.0F, 180.0F, "%.1f deg");
+            static const char* const kTargets[] = { "Head", "Chest", "Pelvis", "Root" };
+            ImGuiMCP::Combo("Framing target", settings->pChar3dTarget(), kTargets, 4);
+        }
+
+        if (ImGuiMCP::CollapsingHeader("Animation and state")) {
+            ImGuiMCP::Checkbox("Run private animation graph", settings->pChar3dAnimate());
+            static const char* const kIdleStates[] = { "Weapon ready", "Weapon sighted" };
+            ImGuiMCP::Combo("Equipped-weapon idle", settings->pChar3dIdleState(), kIdleStates, 2);
+            ImGuiMCP::TextDisabled(
+                "When a weapon is equipped the preview is always drawn and uses this stationary pose. "
+                "Unarmed previews use the relaxed state.");
+            if (ImGuiMCP::CollapsingHeader("Mirrored event groups (no locomotion)")) {
+                ImGuiMCP::Checkbox("Sneak", settings->pChar3dMirrorSneak());
+                ImGuiMCP::SameLine();
+                ImGuiMCP::Checkbox("Jump", settings->pChar3dMirrorJump());
+                ImGuiMCP::Checkbox("Weapon fire", settings->pChar3dMirrorWeaponFire());
+                ImGuiMCP::SameLine();
+                ImGuiMCP::Checkbox("Weapon reload", settings->pChar3dMirrorWeaponReload());
+                ImGuiMCP::Checkbox("Melee / block", settings->pChar3dMirrorMelee());
+                ImGuiMCP::SameLine();
+                ImGuiMCP::Checkbox("Grenades / mines", settings->pChar3dMirrorThrowable());
+            }
+            ImGuiMCP::TextDisabled("Locomotion mirroring is intentionally excluded; the preview remains stationary.");
+        }
+
+        if (ImGuiMCP::CollapsingHeader("Face, equipment, and cloth")) {
+            ImGuiMCP::Checkbox("Live facial expressions and morphs", settings->pChar3dFaceMorphs());
+            ImGuiMCP::Checkbox("Initialize preview cloth", settings->pChar3dCloth());
+            ImGuiMCP::Checkbox("Hide preview in power armor", settings->pChar3dHidePowerArmor());
+            if (ImGuiMCP::Button("Enable all equipment slots")) { *settings->pChar3dSlotMask() = 0xFFFF'FFFFu; }
+            ImGuiMCP::SameLine();
+            if (ImGuiMCP::Button("Disable all equipment slots")) { *settings->pChar3dSlotMask() = 0; }
+            if (ImGuiMCP::CollapsingHeader("Equipment slot mask (30-61)")) {
+                for (std::uint32_t slot = 0; slot < 32; ++slot) {
+                    bool enabled = (*settings->pChar3dSlotMask() & (1u << slot)) != 0;
+                    const auto label = std::format("Slot {}", slot + 30);
+                    if (ImGuiMCP::Checkbox(label.c_str(), &enabled)) {
+                        if (enabled) { *settings->pChar3dSlotMask() |= (1u << slot); }
+                        else { *settings->pChar3dSlotMask() &= ~(1u << slot); }
+                    }
+                    if ((slot % 4) != 3) { ImGuiMCP::SameLine(); }
+                }
+            }
+        }
+
+        if (ImGuiMCP::CollapsingHeader("Target following")) {
+            ImGuiMCP::Checkbox("Follow animated framing target", settings->pChar3dFollow());
+            ImGuiMCP::Checkbox("Follow X", settings->pChar3dFollowX());
+            ImGuiMCP::SameLine();
+            ImGuiMCP::Checkbox("Follow Y", settings->pChar3dFollowY());
+            ImGuiMCP::SameLine();
+            ImGuiMCP::Checkbox("Follow Z", settings->pChar3dFollowZ());
+        }
+
+        if (ImGuiMCP::CollapsingHeader("Renderer and lighting")) {
+            ImGuiMCP::Checkbox("Pip-green character rim", settings->pChar3dHologram());
+            ImGuiMCP::TextDisabled(
+                "Keeps the normal key/fill colors and strengthens only the green rear rim light. "
+                "A character-masked scanline requires a dedicated compositor shader.");
+            ImGuiMCP::Checkbox("Anti-aliasing", settings->pChar3dAntiAliasing());
+            ImGuiMCP::SliderFloat("Key intensity", settings->pChar3dKeyIntensity(), 0.0F, 12.0F, "%.2f");
+            ImGuiMCP::SliderFloat("Fill intensity", settings->pChar3dFillIntensity(), 0.0F, 12.0F, "%.2f");
+            ImGuiMCP::SliderFloat("Rim intensity", settings->pChar3dRimIntensity(), 0.0F, 12.0F, "%.2f");
+        }
 
         ImGuiMCP::Spacing();
         ImGuiMCP::Separator();
@@ -107,9 +170,10 @@ namespace
         }
         ImGuiMCP::SameLine();
         if (ImGuiMCP::Button("Reset to defaults")) {
-            // Defaults reproduce 0.0.37 behavior exactly (veil 0.10, breathe/open-anim/folders on, live3D off).
+            // Uniform-background defaults: veil 0.10, edge vignette off, breathing/open-anim/folders on.
             *settings->pVeilAlpha() = 0.10F;
             *settings->pCrtBreathe() = true;
+            *settings->pCrtVignette() = false;
             *settings->pOpenAnim() = true;
             *settings->pOpenAnimSpeed() = 1.0F;
             *settings->pFolders() = true;
@@ -117,12 +181,39 @@ namespace
             *settings->pLive3D() = false;
             // Figure-slot placement estimate (matches the Settings ctor / Load defaults).
             *settings->pChar3dScale() = 0.45F;
+            *settings->pChar3dFov() = 70.0F;
+            *settings->pChar3dYaw() = 160.0F;
             *settings->pChar3dDistance() = 200.0F;
             *settings->pChar3dTarget() = 1;
             *settings->pChar3dClipLeft() = 46.0F;
             *settings->pChar3dClipTop() = 56.0F;
             *settings->pChar3dClipRight() = 52.0F;
             *settings->pChar3dClipBottom() = 30.0F;
+            *settings->pChar3dScreenX() = 0.0F;
+            *settings->pChar3dScreenY() = 0.0F;
+            *settings->pChar3dAnimate() = true;
+            *settings->pChar3dIdleState() = 0;
+            *settings->pChar3dHideWeaponIdle() = false;
+            *settings->pChar3dSheatheWeaponIdle() = false;
+            *settings->pChar3dMirrorSneak() = true;
+            *settings->pChar3dMirrorJump() = true;
+            *settings->pChar3dMirrorWeaponFire() = true;
+            *settings->pChar3dMirrorWeaponReload() = true;
+            *settings->pChar3dMirrorMelee() = true;
+            *settings->pChar3dMirrorThrowable() = true;
+            *settings->pChar3dFaceMorphs() = true;
+            *settings->pChar3dCloth() = true;
+            *settings->pChar3dFollow() = true;
+            *settings->pChar3dFollowX() = true;
+            *settings->pChar3dFollowY() = true;
+            *settings->pChar3dFollowZ() = true;
+            *settings->pChar3dHidePowerArmor() = true;
+            *settings->pChar3dAntiAliasing() = false;
+            *settings->pChar3dHologram() = false;
+            *settings->pChar3dSlotMask() = 0xFFFF'FFFFu;
+            *settings->pChar3dKeyIntensity() = 3.4F;
+            *settings->pChar3dFillIntensity() = 1.55F;
+            *settings->pChar3dRimIntensity() = 2.15F;
         }
         ImGuiMCP::SameLine();
         if (ImGuiMCP::Button("Reload from file")) {

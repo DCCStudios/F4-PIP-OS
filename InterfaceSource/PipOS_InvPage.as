@@ -9,6 +9,7 @@ package
    import pipos.Ticker;
    import flash.display.DisplayObject;
    import flash.display.Graphics;
+   import flash.display.MovieClip;
    import flash.display.Shape;
    import flash.display.Sprite;
    import flash.events.Event;
@@ -24,6 +25,10 @@ package
    // SetQuickkey/onInvItemSelection/updateItem3D). Single input path per action (ProcessUserEvent).
    public class PipOS_InvPage extends PipboyPage
    {
+      // Exact 59-frame icon strip used by vanilla FavoritesMenu. DataObj.FavoritesList[i].FavIconType is the
+      // authoritative frame number; embedding the vanilla symbol keeps modded favorite categories in parity.
+      [Embed(source="../InterfaceAssets/FavoritesMenu.swf", symbol="FavoritesMenu_fla.HotkeyIcons_6")]
+      private static var FavoritesIconClip:Class;
       private const DMG_TYPES:Array = ["BALLISTIC","ENERGY","RADIATION","POISON"];
       private static const CATS:Array = ["WEAPONS","APPAREL","AID","MISC","JUNK","MODS","AMMO"];
       private static const SLOTS:Array = ["HEAD","TORSO","LEFT ARM","RIGHT ARM","LEFT LEG","RIGHT LEG","UNDER ARMOR","OUTFIT","BACKPACK","WEAPON"];   // 0.0.60: WEAPON row (was the static PIP-BOY row)
@@ -41,6 +46,7 @@ package
       private var _charCap:TextField;      // 0.0.60: figure-slot caption ("LIVE CAPTURE" only when 3D active)
       private var _list:PipList;
       private var _card:Sprite;
+      private var _cardBg:Sprite;   // item-card border/background, faded with its contents during list expansion
       private var _quick:Sprite;
       private var _panels:Array = [];   // panel rects for the DEBUG clearance overlay
 
@@ -53,6 +59,10 @@ package
       // an Object {BUCKET_KEY:true} where presence == OPENED (absence == collapsed). Survives refreshes/re-sorts (it
       // lives on the page, not the list); resets on menu reopen (no cross-session store available from AS3).
       private var _folderState:Array = [];
+      private var _listSelMem:Array = [];
+      private var _listTopMem:Array = [];
+      private var _listMemLoaded:Boolean = false;
+      private var _builtTab:int = -1;
       // 0.0.38: runtime folder-grouping toggle (F4SE Menu Framework). Defaults to Theme.FOLDERS so absent
       // settings == 0.0.37 behavior; refreshed from root1.PipOS_settings.folders each data refresh (guarded).
       private var _foldersOn:Boolean = Theme.FOLDERS;
@@ -117,6 +127,7 @@ package
                                            // identifiable without hovering (no real vanilla item icon is available)
       private var _qHit:Array = [];        // pooled per-box hit sprites (click select + hover tooltip)
       private var _qIcons:Sprite;          // pooled vector type-icon layer (graphics-only redraw)
+      private var _qFavIcons:Array = [];   // pooled vanilla FavoritesMenu HotkeyIcons clips (frame = FavIconType)
       private var _qBox:Array = [];        // frozen per-box geometry {x,y,w,h,cx,cy} (no reads on update path)
       private var _favs:Array = null;      // root1.PipOS_favorites (12 slots {slot,formID,name,count,type}); cached
       private var _pendingFavFormID:String = null;   // QA click cross-category select: honoured on the next rebuild
@@ -196,6 +207,8 @@ package
          this._sortCol = [-1, -1, -1, -1, -1, -1, -1];   // one per category tab; -1 = engine order
          this._sortAsc = [false, false, false, false, false, false, false];
          this._folderState = [{}, {}, {}, {}, {}, {}, {}];   // per-category folder collapse memory (empty == all open)
+         this._listSelMem = [-1, -1, -1, -1, -1, -1, -1];
+         this._listTopMem = [0, 0, 0, 0, 0, 0, 0];
          this.buildPanels();
          this._dbg = new Debug("INV"); addChild(this._dbg);
          Theme.life("IV.c");   // 0.0.52 forensics: ctor completed (control for the STAT trail)
@@ -250,7 +263,11 @@ package
          // LIST panel is drawn into its OWN sprite (_listBg) so the expand animation can redraw only it
          // (graphics-only) without disturbing the other panels/headers. Its rect is still registered for debug.
          this._panels.push({ x:this.LX, y:Theme.BY, w:this.LW, h:this._listH });
-         Theme.panelR(g, this._panels, this.LX, cardTop, this.LW, Theme.BB - cardTop);    // ITEM CARD
+         // ITEM CARD owns a separate graphics layer so expand/collapse can fade the whole window, including
+         // its border, without redrawing the shared chrome Graphics object.
+         this._cardBg = new Sprite(); addChild(this._cardBg);
+         Theme.panel(this._cardBg.graphics, this.LX, cardTop, this.LW, Theme.BB - cardTop);
+         this._panels.push({ x:this.LX, y:cardTop, w:this.LW, h:Theme.BB - cardTop });
          this._wIcon = new Sprite(); addChild(this._wIcon);
          this._subtabs = new Sprite(); this._subtabs.y = Theme.SUB_Y; addChild(this._subtabs);
          this._equip = new Sprite(); this._equip.x = this.EQX + P; this._equip.y = Theme.BY + P; addChild(this._equip);
@@ -269,6 +286,7 @@ package
          this._list.onHover = this.onListHover;   // B: row hover -> item tooltip (pure callback; no fields/geometry)
          this._list.onFolderToggle = this.onFolderToggle;   // FIS folders: header click -> collapse toggle (pure callback)
          this._list.onRowContext = this.onRowContext;       // 0.0.61: right-click -> context menu
+         this._list.onViewportChange = this.onListViewport;
          // 4-column config is STABLE (NAME|AMMO|WT|VAL); set here (font-free) so columnGeom() can align headers.
          this._list.columns = [{w:0,align:"left"},{w:64,align:"left"},{w:40,align:"right"},{w:44,align:"right"}]; this._list.optCol = 1; this._list.optOn = false;
          this._colGeom = this._list.columnGeom();
@@ -281,7 +299,7 @@ package
          // 0.0.59: raised from BY+6 to BY-2 -- at BY+6 the 18px glyph sat straight over the right-aligned VAL
          // column header (BY+16..). At BY-2 it ends exactly where VAL starts and only overlaps the empty right
          // end of the INVENTORY title band (button added later == on top, so its clicks are unaffected).
-         this._expandBtn = new Sprite(); this._expandBtn.x = this.LX + this.LW - 26; this._expandBtn.y = Theme.BY - LIST_HEADROOM + 1; this._expandBtn.buttonMode = true; this._expandBtn.addEventListener(MouseEvent.MOUSE_DOWN, this.onExpandBtn); addChild(this._expandBtn); this.drawExpandGlyph();   // 0.0.62: in the new headroom strip, clear of the title/VAL
+         this._expandBtn = new Sprite(); this._expandBtn.x = this.LX + this.LW - 26; this._expandBtn.y = Theme.BY - LIST_HEADROOM + 7; this._expandBtn.buttonMode = true; this._expandBtn.addEventListener(MouseEvent.MOUSE_DOWN, this.onExpandBtn); addChild(this._expandBtn); this.drawExpandGlyph();   // 6px lower per field layout review
          this._card = new Sprite(); this._card.x = this.LX + P; this._card.y = cardTop + P; addChild(this._card);
          this._card.scrollRect = new Rectangle(0, 0, this.LW - 2 * P, (Theme.BB - cardTop) - 2 * P);
          addEventListener(Event.ADDED_TO_STAGE, this.onPageStage);
@@ -318,16 +336,15 @@ package
       {
          var g:* = this._expandBtn.graphics; g.clear();
          g.beginFill(0x000000, 0.004); g.drawRect(-3, -3, 24, 24); g.endFill();   // generous hit pad
-         g.lineStyle(1, Theme.PHOS, 0.5); g.drawRoundRect(0, 0, 18, 18, 3, 3);
-         g.lineStyle(1.4, Theme.PHOS_BRIGHT, 1); g.moveTo(4, 4); g.lineTo(14, 14);   // diagonal
+         Theme.frameRect(g, 0, 0, 18, 18, Theme.PHOS, 0.5);
+         Theme.fillLine(g, 4, 4, 14, 14, Theme.PHOS_BRIGHT, 1, 1.4);
          if (!this._expanded) {   // outward corner arrows == expand
-            g.moveTo(4, 4); g.lineTo(9, 4); g.moveTo(4, 4); g.lineTo(4, 9);
-            g.moveTo(14, 14); g.lineTo(9, 14); g.moveTo(14, 14); g.lineTo(14, 9);
+            Theme.fillLine(g, 4, 4, 9, 4, Theme.PHOS_BRIGHT, 1, 1.4); Theme.fillLine(g, 4, 4, 4, 9, Theme.PHOS_BRIGHT, 1, 1.4);
+            Theme.fillLine(g, 14, 14, 9, 14, Theme.PHOS_BRIGHT, 1, 1.4); Theme.fillLine(g, 14, 14, 14, 9, Theme.PHOS_BRIGHT, 1, 1.4);
          } else {                 // inward corner arrows == collapse
-            g.moveTo(9, 4); g.lineTo(4, 4); g.lineTo(4, 9);
-            g.moveTo(9, 14); g.lineTo(14, 14); g.lineTo(14, 9);
+            Theme.fillLine(g, 9, 4, 4, 4, Theme.PHOS_BRIGHT, 1, 1.4); Theme.fillLine(g, 4, 4, 4, 9, Theme.PHOS_BRIGHT, 1, 1.4);
+            Theme.fillLine(g, 9, 14, 14, 14, Theme.PHOS_BRIGHT, 1, 1.4); Theme.fillLine(g, 14, 14, 14, 9, Theme.PHOS_BRIGHT, 1, 1.4);
          }
-         g.lineStyle();
       }
 
       // ON-STAGE ONLY (via ensureText): ALL TextField creation + text.
@@ -356,9 +373,9 @@ package
          this._chipBg = new Sprite(); addChild(this._chipBg);
          var cbg:* = this._chipBg.graphics;
          cbg.beginFill(Theme.PANEL, 0.82); cbg.drawRoundRect(weightChipL, chipY, wChipW, chH, 6, 6); cbg.endFill();
-         cbg.lineStyle(1, Theme.LINE, 0.42); cbg.drawRoundRect(weightChipL + 0.5, chipY + 0.5, wChipW - 1, chH - 1, 6, 6); cbg.lineStyle();
+         Theme.frameRect(cbg, weightChipL + 0.5, chipY + 0.5, wChipW - 1, chH - 1, Theme.LINE, 0.42);
          cbg.beginFill(Theme.PANEL, 0.82); cbg.drawRoundRect(capsChipL, chipY, cChipW, chH, 6, 6); cbg.endFill();
-         cbg.lineStyle(1, Theme.LINE, 0.42); cbg.drawRoundRect(capsChipL + 0.5, chipY + 0.5, cChipW - 1, chH - 1, 6, 6); cbg.lineStyle();
+         Theme.frameRect(cbg, capsChipL + 0.5, chipY + 0.5, cChipW - 1, chH - 1, Theme.LINE, 0.42);
          addChild(this._wIcon);   // lift the weight/caps icons above the chip fill
          this._caps = Theme.mk(this, 12, Theme.PHOS_BRIGHT, false, "right"); this._caps.autoSize = "none"; this._caps.width = capsW; this._caps.height = 18; this._caps.x = capsX; this._caps.y = chipY + 5; Theme.setText(this._caps, "CAPS --");
          this._weight = Theme.mk(this, 12, Theme.PHOS_BRIGHT, false, "right"); this._weight.autoSize = "none"; this._weight.width = weightW; this._weight.height = 18; this._weight.x = weightX; this._weight.y = chipY + 5; Theme.setText(this._weight, "WEIGHT --/--");
@@ -437,7 +454,7 @@ package
             this._hdr.push(ht); this._hdrLabels.push(String(hcols[hi][0]));
          }
          var hyd:Number = Theme.BY + 34; var hxd:Number = this.LX + Theme.PAD;
-         this._listHdr.graphics.lineStyle(1, Theme.LINE, 0.3); this._listHdr.graphics.moveTo(hxd, hyd); this._listHdr.graphics.lineTo(hxd + innerWd, hyd); this._listHdr.graphics.lineStyle();
+         Theme.fillLine(this._listHdr.graphics, hxd, hyd, hxd + innerWd, hyd, Theme.LINE, 0.3);
          // invtitle: "INVENTORY . <CAT>[ . BY <KEY>]" (mockup list-panel heading; the sort suffix shows the active
          // column, e.g. ". BY WEIGHT"). Compact band in the panel-top padding above the headers. Geometry-before-text.
          this._invTitle = Theme.mk(this._listHdr, 10, Theme.PHOS_BRIGHT, true); this._invTitle.autoSize = "none"; this._invTitle.width = innerWd; this._invTitle.height = 14; this._invTitle.x = hxd; this._invTitle.y = Theme.BY + 1;   // 0.0.46: bright "INVENTORY . <CAT>" heading (mockup)
@@ -455,9 +472,12 @@ package
          for (var qi:int = 0; qi < qn7; qi++) {
             var qx:Number = qstart + qi * (qcw + qgap); var qy:Number = 0;
             qg.beginFill(Theme.PANEL, 0.82); qg.drawRoundRect(qx, qy, qcw, qch, 5, 5); qg.endFill();
-            qg.lineStyle(1, Theme.LINE, 0.4); qg.drawRoundRect(qx + 0.5, qy + 0.5, qcw - 1, qch - 1, 5, 5); qg.lineStyle();
+            Theme.frameRect(qg, qx + 0.5, qy + 0.5, qcw - 1, qch - 1, Theme.LINE, 0.4);
             // 0.0.43: icon centred slightly HIGH so a SHORT-NAME label fits along the box bottom.
             this._qBox.push({ x:qx, y:qy, w:qcw, h:qch, cx:(qx + qcw / 2), cy:(qy + qch / 2 - 5) });
+            var qfav:MovieClip = new FavoritesIconClip() as MovieClip; qfav.mouseEnabled = false; qfav.mouseChildren = false;
+            qfav.x = qx + qcw / 2; qfav.y = qy + qch / 2 - 5; qfav.scaleX = 0.46; qfav.scaleY = 0.46; qfav.visible = false;
+            this._quick.addChild(qfav); this._qFavIcons.push(qfav);
             var qnum:TextField = Theme.mk(this._quick, 9, Theme.PHOS_DIM, true); qnum.x = qx + 4; qnum.y = qy + 2; Theme.setText(qnum, String(qi + 1)); this._qNum.push(qnum);
             // 0.0.43: count badge at the box TOP-RIGHT (right-aligned, opposite the hotkey number) so the box
             // bottom is free for the short-name label below.
@@ -676,7 +696,16 @@ package
          // 0.0.38: refresh the folders toggle from the DLL push (fallback to Theme.FOLDERS => 0.0.37 behavior).
          // 0.0.43: refresh the RPM display switch from the same push (fallback FALSE => firerate behavior).
          this._foldersOn = Theme.FOLDERS; this._showRPM = false;
-         try { var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr != null) { this._itemInfo = rr.PipOS_iteminfo; this._itemStats = rr.PipOS_itemstats; this._itemMods = rr.PipOS_itemmods; this._favs = rr.PipOS_favorites; var st:* = rr.PipOS_settings; if (st != null && st.hasOwnProperty("folders")) { this._foldersOn = (st.folders == true); } if (st != null && st.hasOwnProperty("showRPM")) { this._showRPM = (st.showRPM == true); } this.hydrateFolderMem(rr); } } catch (ex:*) { this._itemInfo = null; this._itemStats = null; this._itemMods = null; this._favs = null; }
+         try { var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr != null) { this._itemInfo = rr.PipOS_iteminfo; this._itemStats = rr.PipOS_itemstats; this._itemMods = rr.PipOS_itemmods; this._favs = rr.PipOS_favorites; var st:* = rr.PipOS_settings; if (st != null && st.hasOwnProperty("folders")) { this._foldersOn = (st.folders == true); } if (st != null && st.hasOwnProperty("showRPM")) { this._showRPM = (st.showRPM == true); } this.hydrateFolderMem(rr); this.hydrateListMem(rr); } } catch (ex:*) { this._itemInfo = null; this._itemStats = null; this._itemMods = null; this._favs = null; }
+         // The native favorite mirror supplies stable form IDs/counts; the engine DataObj supplies vanilla's
+         // icon-frame contract. Merge by quick-key slot before renderQuick without replacing either source.
+         if (this._favs != null && d.FavoritesList != null) {
+            for (var fi:int = 0; fi < this._favs.length && fi < d.FavoritesList.length; fi++) {
+               if (this._favs[fi] != null && d.FavoritesList[fi] != null && d.FavoritesList[fi].FavIconType != null) {
+                  this._favs[fi].FavIconType = d.FavoritesList[fi].FavIconType;
+               }
+            }
+         }
          this.hideTooltip();   // B: drop any stale tooltip across a data refresh (re-shown on next hover)
          this.closeContextMenu();   // 0.0.61: a live data refresh rebuilds the list -> drop any open context menu
          // Filter (vanilla ListFilterer rule) + per-category sort + setItems, preserving the selected item.
@@ -1010,6 +1039,38 @@ package
             }
          } catch (eh:*) {}
       }
+
+      // Session list-position memory, mirrored through root1 and banked by the DLL on menu close. Format is
+      // "tab,selectedDisplayIndex,topDisplayIndex;...". Selection + top are stored per inventory category.
+      private function persistListMem():void
+      {
+         if (this._list != null && this._builtTab >= 0 && this._builtTab < this._listSelMem.length) {
+            this._listSelMem[this._builtTab] = this._list.selectedIndex;
+            this._listTopMem[this._builtTab] = this._list.topIndex;
+         }
+         try {
+            var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; if (rr == null) { return; }
+            var s:String = "";
+            for (var t:int = 0; t < this._listSelMem.length; t++) {
+               s += (s.length > 0 ? ";" : "") + t + "," + int(this._listSelMem[t]) + "," + int(this._listTopMem[t]);
+            }
+            rr.PipOS_invListMem = s;
+         } catch (ep:*) {}
+      }
+      private function hydrateListMem(rr:*):void
+      {
+         if (this._listMemLoaded) { return; } this._listMemLoaded = true;
+         try {
+            var raw:* = (rr != null) ? rr.PipOS_invListMem : null; if (raw == null) { return; }
+            var parts:Array = String(raw).split(";");
+            for (var i:int = 0; i < parts.length; i++) {
+               var v:Array = String(parts[i]).split(","); if (v.length < 3) { continue; }
+               var t:int = int(v[0]); if (t < 0 || t >= this._listSelMem.length) { continue; }
+               this._listSelMem[t] = int(v[1]); this._listTopMem[t] = int(v[2]);
+            }
+         } catch (eh:*) {}
+      }
+      private function onListViewport(sel:int, top:int):void { this.persistListMem(); }
       // Folder header click (from PipList.onFolderToggle): flip this category+tag's collapse state and rebuild.
       // Pool-safe: rebuildList -> setItems/selectIndexSilent are update-only on the already-built pool.
       private function onFolderToggle(entry:Object):void
@@ -1023,6 +1084,7 @@ package
 
       private function onListSel(i:int):void
       {
+         this.persistListMem();
          this._dmgIndex = 0; var oi:int = this.invIdx(i);
          // TASK B: remember the selected InvItems row so renderCard can join it against the DLL data maps.
          this._selRow = (this._lastData != null && this._lastData.InvItems != null && oi >= 0 && oi < this._lastData.InvItems.length) ? this._lastData.InvItems[oi] : null;
@@ -1088,7 +1150,7 @@ package
             var info:Object = null; try { info = this._itemInfo[bare]; } catch (e3:*) { info = null; }
             if (info != null) { if (info.w != null) { wStr = String(info.w); } if (info.v != null) { vStr = String(info.v); } }
          }
-         g.lineStyle(1, Theme.LINE, 0.4); g.drawRoundRect(0, 24, 74, 20, 6, 6); g.drawRoundRect(84, 24, 74, 20, 6, 6); g.lineStyle();   // 0.0.60: compacted bands
+         Theme.frameRect(g, 0, 24, 74, 20, Theme.LINE, 0.4); Theme.frameRect(g, 84, 24, 74, 20, Theme.LINE, 0.4);   // 0.0.60: compacted bands
          Theme.iconWeight(g, 8, 27, 13, Theme.PHOS); Theme.iconCaps(g, 92, 27, 13, Theme.PHOS);
          Theme.setText(this._cardWt, wStr); this._cardWt.visible = true;
          Theme.setText(this._cardCaps, vStr); this._cardCaps.visible = true;
@@ -1182,9 +1244,14 @@ package
             var dmgVal:String = D;
             if (stats.dmg != null) {
                var base:Number = Number(stats.dmg);
-               if (mode == 0) { dmgVal = String(Math.round(base)); }                 // BALLISTIC = pushed base
-               else if (mode == 1) { dmgVal = String(Math.round(base * 0.35)); }      // ENERGY = presentation 0.35x (contract note)
-               else { dmgVal = D; }                                                   // RAD/POISON: no data pushed
+               if (mode == 0) {
+                  dmgVal = String(Math.round(base));                                  // BALLISTIC = vanilla display damage
+                  var pellets:int = (stats.projectiles != null) ? int(stats.projectiles) : 1;
+                  if (pellets > 1) { dmgVal += " x " + pellets; }                    // vanilla shotgun convention
+               }
+               else if (mode == 1 && stats.energyDmg != null) { dmgVal = String(Math.round(Number(stats.energyDmg))); }
+               else if (mode == 2 && stats.radDmg != null) { dmgVal = String(Math.round(Number(stats.radDmg))); }
+               else if (mode == 3 && stats.poisonDmg != null) { dmgVal = String(Math.round(Number(stats.poisonDmg))); }
             }
             out.push({ t: "DAMAGE · " + String(this.DMG_TYPES[mode]), v: dmgVal });
             // 0.0.43 RPM switch: show RPM/stats.rpm when the setting is on AND the push carries rpm; else FIRE RATE/
@@ -1268,9 +1335,13 @@ package
             var f:Object = (favs != null && i < favs.length) ? favs[i] : null;
             var populated:Boolean = (f != null && f.formID != null && String(f.formID) != "0" && String(f.formID).length > 0);
             var b:Object = this._qBox[i];
+            var favClip:MovieClip = (i < this._qFavIcons.length) ? this._qFavIcons[i] as MovieClip : null;
+            if (favClip != null) { favClip.visible = false; }
             if (populated) {
                var ty:String = (f.type != null) ? String(f.type) : "misc";
-               this.drawQAIcon(ig, ty, Number(b.cx), Number(b.cy), 14, Theme.PHOS_BRIGHT);
+               var favFrame:int = (f.FavIconType != null) ? int(f.FavIconType) : 0;
+               if (favClip != null && favFrame > 0) { favClip.gotoAndStop(favFrame); favClip.visible = true; }
+               else { this.drawQAIcon(ig, ty, Number(b.cx), Number(b.cy), 14, Theme.PHOS_BRIGHT); }
                var cnt:Number = (f.count != null) ? Number(f.count) : 0;
                if (cnt > 1) { Theme.setText(this._qCount[i], "x" + String(int(cnt))); this._qCount[i].visible = true; }
                else { this._qCount[i].visible = false; }
@@ -1308,28 +1379,27 @@ package
       private function icoWeapon(g:*, cx:Number, cy:Number, s:Number, color:uint):void
       {
          var h:Number = s / 2;
-         g.lineStyle(1.6, color, 1);
-         g.moveTo(cx - h, cy - h * 0.5); g.lineTo(cx + h, cy - h * 0.5);      // barrel
-         g.moveTo(cx + h * 0.55, cy - h * 0.5); g.lineTo(cx + h * 0.55, cy - h);  // front sight
-         g.moveTo(cx - h * 0.2, cy - h * 0.5); g.lineTo(cx - h * 0.55, cy + h);    // grip
-         g.moveTo(cx - h, cy - h * 0.5); g.lineTo(cx - h, cy + h * 0.2);           // trigger guard back
-         g.lineStyle();
+         Theme.fillLine(g, cx - h, cy - h * 0.5, cx + h, cy - h * 0.5, color, 1, 1.6);
+         Theme.fillLine(g, cx + h * 0.55, cy - h * 0.5, cx + h * 0.55, cy - h, color, 1, 1.6);
+         Theme.fillLine(g, cx - h * 0.2, cy - h * 0.5, cx - h * 0.55, cy + h, color, 1, 1.6);
+         Theme.fillLine(g, cx - h, cy - h * 0.5, cx - h, cy + h * 0.2, color, 1, 1.6);
       }
       private function icoApparel(g:*, cx:Number, cy:Number, s:Number, color:uint):void
       {
          var h:Number = s / 2;
-         g.lineStyle(1.5, color, 1);
-         // simple shirt/torso: shoulders + body
-         g.moveTo(cx - h, cy - h * 0.4); g.lineTo(cx - h * 0.45, cy - h);         // left shoulder
-         g.lineTo(cx + h * 0.45, cy - h); g.lineTo(cx + h, cy - h * 0.4);          // right shoulder
-         g.lineTo(cx + h * 0.55, cy - h * 0.1); g.lineTo(cx + h * 0.55, cy + h);   // right side
-         g.lineTo(cx - h * 0.55, cy + h); g.lineTo(cx - h * 0.55, cy - h * 0.1);   // left side
-         g.lineTo(cx - h, cy - h * 0.4);
-         g.lineStyle();
+         Theme.fillLine(g, cx - h, cy - h * 0.4, cx - h * 0.45, cy - h, color, 1, 1.5);
+         Theme.fillLine(g, cx - h * 0.45, cy - h, cx + h * 0.45, cy - h, color, 1, 1.5);
+         Theme.fillLine(g, cx + h * 0.45, cy - h, cx + h, cy - h * 0.4, color, 1, 1.5);
+         Theme.fillLine(g, cx + h, cy - h * 0.4, cx + h * 0.55, cy - h * 0.1, color, 1, 1.5);
+         Theme.fillLine(g, cx + h * 0.55, cy - h * 0.1, cx + h * 0.55, cy + h, color, 1, 1.5);
+         Theme.fillLine(g, cx + h * 0.55, cy + h, cx - h * 0.55, cy + h, color, 1, 1.5);
+         Theme.fillLine(g, cx - h * 0.55, cy + h, cx - h * 0.55, cy - h * 0.1, color, 1, 1.5);
+         Theme.fillLine(g, cx - h * 0.55, cy - h * 0.1, cx - h, cy - h * 0.4, color, 1, 1.5);
       }
       private function icoAid(g:*, cx:Number, cy:Number, s:Number, color:uint):void
       {
          var h:Number = s / 2; var t:Number = h * 0.34;
+         g.lineStyle(0, 0, 0);
          g.beginFill(color, 1);   // medical cross
          g.drawRect(cx - t, cy - h, 2 * t, 2 * h);
          g.drawRect(cx - h, cy - t, 2 * h, 2 * t);
@@ -1338,6 +1408,7 @@ package
       private function icoAmmo(g:*, cx:Number, cy:Number, s:Number, color:uint):void
       {
          var h:Number = s / 2;
+         g.lineStyle(0, 0, 0);
          g.beginFill(color, 1);   // two bullets
          for (var k:int = 0; k < 2; k++) {
             var bx:Number = cx + (k == 0 ? -h * 0.5 : h * 0.35);
@@ -1351,30 +1422,26 @@ package
       private function icoNote(g:*, cx:Number, cy:Number, s:Number, color:uint):void
       {
          var h:Number = s / 2;
-         g.lineStyle(1.4, color, 1);   // page with folded corner + text lines
-         g.moveTo(cx - h * 0.7, cy - h); g.lineTo(cx + h * 0.35, cy - h); g.lineTo(cx + h * 0.7, cy - h * 0.6);
-         g.lineTo(cx + h * 0.7, cy + h); g.lineTo(cx - h * 0.7, cy + h); g.lineTo(cx - h * 0.7, cy - h);
-         g.moveTo(cx - h * 0.4, cy - h * 0.15); g.lineTo(cx + h * 0.4, cy - h * 0.15);
-         g.moveTo(cx - h * 0.4, cy + h * 0.35); g.lineTo(cx + h * 0.4, cy + h * 0.35);
-         g.lineStyle();
+         Theme.frameRect(g, cx - h * 0.7, cy - h, h * 1.4, h * 2, color, 1, 1.4);
+         Theme.fillLine(g, cx - h * 0.4, cy - h * 0.15, cx + h * 0.4, cy - h * 0.15, color, 1, 1.4);
+         Theme.fillLine(g, cx - h * 0.4, cy + h * 0.35, cx + h * 0.4, cy + h * 0.35, color, 1, 1.4);
       }
       private function icoJunk(g:*, cx:Number, cy:Number, s:Number, color:uint):void
       {
          var h:Number = s / 2;
-         g.lineStyle(1.5, color, 1); g.drawCircle(cx, cy, h * 0.42);   // nut/bolt: hex-ish + ring
-         g.moveTo(cx - h, cy); g.lineTo(cx + h, cy);
-         g.moveTo(cx, cy - h); g.lineTo(cx, cy + h);
-         g.lineStyle();
+         Theme.circleLine(g, cx, cy, h * 0.42, color, 1, 1.5, 12);
+         Theme.fillLine(g, cx - h, cy, cx + h, cy, color, 1, 1.5);
+         Theme.fillLine(g, cx, cy - h, cx, cy + h, color, 1, 1.5);
       }
       private function icoMisc(g:*, cx:Number, cy:Number, s:Number, color:uint):void
       {
          var h:Number = s / 2;   // small cube
-         g.lineStyle(1.4, color, 1);
-         g.drawRect(cx - h * 0.7, cy - h * 0.5, h * 1.4, h * 1.2);
-         g.moveTo(cx - h * 0.7, cy - h * 0.5); g.lineTo(cx - h * 0.35, cy - h);
-         g.lineTo(cx + h, cy - h); g.lineTo(cx + h * 0.7, cy - h * 0.5);
-         g.moveTo(cx + h, cy - h); g.lineTo(cx + h, cy + h * 0.35); g.lineTo(cx + h * 0.7, cy + h * 0.7);
-         g.lineStyle();
+         Theme.frameRect(g, cx - h * 0.7, cy - h * 0.5, h * 1.4, h * 1.2, color, 1, 1.4);
+         Theme.fillLine(g, cx - h * 0.7, cy - h * 0.5, cx - h * 0.35, cy - h, color, 1, 1.4);
+         Theme.fillLine(g, cx - h * 0.35, cy - h, cx + h, cy - h, color, 1, 1.4);
+         Theme.fillLine(g, cx + h, cy - h, cx + h * 0.7, cy - h * 0.5, color, 1, 1.4);
+         Theme.fillLine(g, cx + h, cy - h, cx + h, cy + h * 0.35, color, 1, 1.4);
+         Theme.fillLine(g, cx + h, cy + h * 0.35, cx + h * 0.7, cy + h * 0.7, color, 1, 1.4);
       }
 
       // ---- B. TOOLTIP build (on-stage build window; geometry baked on fresh EMPTY fields, text set in handlers) ----
@@ -1803,7 +1870,7 @@ package
          this._insLeg = new Sprite(); this._insLeg.mouseEnabled = false; this._insLeg.mouseChildren = false; this._insLeg.visible = false; this._insLay.addChild(this._insLeg);
          this._insBadge = new Sprite(); this._insLeg.addChild(this._insBadge);
          var bg:* = this._insBadge.graphics;
-         bg.lineStyle(1, 0xD6FFBE, 0.65); bg.drawRoundRect(cx - 150, Theme.my(90), 96, 20, 4, 4); bg.lineStyle();
+         Theme.frameRect(bg, cx - 150, Theme.my(90), 96, 20, 0xD6FFBE, 0.65);
          Theme.sparkle(bg, cx - 138, Theme.my(100), 4, 0xEAFFDC);
          var lb:TextField = Theme.mk(this._insBadge, 10, 0xEAFFDC, true, "center");
          lb.autoSize = "none"; lb.width = 78; lb.height = 16; lb.x = cx - 132; lb.y = Theme.my(92);
@@ -1848,7 +1915,7 @@ package
          if (this._insEmblem == null) { return; }
          var g:* = this._insEmblem.graphics; g.clear();
          Theme.brackets(g, -150, -104, 300, 208, 30, Theme.PHOS, 0.35);          // frame
-         g.lineStyle(1, Theme.PHOS_FAINT, 0.5); g.drawCircle(0, 20, 132); g.lineStyle();   // stage ring
+         Theme.circleLine(g, 0, 20, 132, Theme.PHOS_FAINT, 0.5, 1, 32);   // stage ring
          var col:uint = this._insIsLeg ? Theme.WARN : Theme.PHOS_BRIGHT;
          this.drawQAIcon(g, type, 0, 0, 150, col);                               // big type silhouette
       }
@@ -2005,10 +2072,11 @@ package
          Theme.life("IV.d" + di);   // 0.0.69: PRE-guard mark -- di==-1 (folder-header selection) shows up too
          if (di < 0) { return; }
          // 0.0.62: diagnostic -- log the selected item's count/favorite/equipped so a test reveals WHY the engine
-         // rejects the drop (the index is proven correct: the same invIdx equips fine). Vanilla drops single items
-         // with count 1 and opens a quantity menu for stacks; we have no quantity UI, so drop the WHOLE stack.
+         // rejects the drop (the index is proven correct: the same invIdx equips fine). Vanilla's direct DropItem
+         // path always sends count 1; only its separate quantity dialog sends a larger count. Match the direct
+         // contract here so both the R hotkey and context-menu DROP work without synthesizing that dialog.
          var row:Object = (this._lastData != null && this._lastData.InvItems != null && di < this._lastData.InvItems.length) ? this._lastData.InvItems[di] : null;
-         var cnt:int = (row != null && row.count != null) ? int(row.count) : 1; if (cnt < 1) { cnt = 1; }
+         var cnt:int = 1;
          var fav:int = (row != null && row.favorite != null) ? int(row.favorite) : -1;
          var eqp:* = (row != null && row.hasOwnProperty("equipState")) ? row.equipState : "?";
          var nm:String = (row != null && row.text != null) ? String(row.text) : "?";
@@ -2057,7 +2125,9 @@ package
       private function rebuildList(d:Pipboy_DataObj):void
       {
          if (d == null || this._list == null) { return; }
-         var prevOi:int = (this._list.selectedIndex >= 0) ? this.invIdx(this._list.selectedIndex) : -1;
+         var sameTab:Boolean = (this._builtTab == this._curTab);
+         var prevOi:int = (sameTab && this._list.selectedIndex >= 0) ? this.invIdx(this._list.selectedIndex) : -1;
+         if (this._builtTab >= 0) { this.persistListMem(); }
          var flt:int = int(d.InvFilter);
          var src:Array = d.InvItems;
          var pairs:Array = [];
@@ -2079,7 +2149,13 @@ package
          var newSel:int = 0;
          if (prevOi >= 0) { for (var m:int = 0; m < this._invMap.length; m++) { if (int(this._invMap[m]) == prevOi) { newSel = m; break; } } }
          this._list.setItems(shown, this.itemAdapter);
-         this._list.selectIndexSilent(newSel);
+         if (sameTab) { this._list.selectIndexSilent(newSel); }
+         else {
+            var savedSel:int = (this._curTab >= 0 && this._curTab < this._listSelMem.length) ? int(this._listSelMem[this._curTab]) : 0;
+            var savedTop:int = (this._curTab >= 0 && this._curTab < this._listTopMem.length) ? int(this._listTopMem[this._curTab]) : 0;
+            this._list.restoreView(savedSel, savedTop);
+         }
+         this._builtTab = this._curTab; this.persistListMem();
          this.renderQuick();
          // A. QA cross-category select: a QA click on an item outside the current category stashed its formID and
          // switched tabs; now that this category's list is built, select it (fires onListSel -> card). No-op if the
@@ -2173,9 +2249,8 @@ package
          this.sfx("UIMenuPrevNext");
          if (this._expanded) {
             // Reveal the extra rows NOW (pool holds EXPANDED_ROWS, so render() only toggles visibility -- no field
-            // creation/geometry). The panel + clip then GROW to uncover them; card content hides beneath.
+            // creation/geometry). The panel + clip then GROW to uncover them; card content fades beneath.
             this._list.setRenderRows(EXPANDED_ROWS);
-            this._card.visible = false;
          }
          this.drawExpandGlyph();
          if (this._expandTicker == null) { this._expandTicker = new Ticker(this, this.onExpandTick); }
@@ -2187,6 +2262,10 @@ package
          if (this._expandT < 0) { this._expandT = 0; }
          if (this._expandT > 1) { this._expandT = 1; }
          var e:Number = this._expandT * this._expandT * (3 - 2 * this._expandT);   // smoothstep
+         // Keep the item card present as context while the list expands, but de-emphasize it to 25%.
+         // Sprite alpha is graphics-only and safe on the tick path; collapse restores it along the same tween.
+         this._card.alpha = 1.0 - 0.75 * e;
+         this._cardBg.alpha = this._card.alpha;
          var h:Number = this._listH + (this._expH - this._listH) * e;
          this.drawListBg(h);
          var clip:Number = h - 44; var maxClip:Number = EXPANDED_ROWS * 25;
@@ -2195,13 +2274,14 @@ package
          if (this._expandDir > 0 && this._expandT >= 1) {
             this._expandTicker.stop(); this._list.setClipHeight(EXPANDED_ROWS * 25);
          } else if (this._expandDir < 0 && this._expandT <= 0) {
-            this._expandTicker.stop(); this._list.setClipHeight(COLLAPSED_ROWS * 25); this._list.setRenderRows(COLLAPSED_ROWS); this._card.visible = true;
+            this._expandTicker.stop(); this._list.setClipHeight(COLLAPSED_ROWS * 25); this._list.setRenderRows(COLLAPSED_ROWS); this._card.alpha = 1.0; this._cardBg.alpha = 1.0;
          }
       }
 
       private function onPageStage(e:Event):void
       {
          this.ensureText(); if (this._dbg != null) this._dbg.mark("add");
+         this.publishInventoryPage(true);
          if (stage != null) {
             stage.addEventListener(KeyboardEvent.KEY_DOWN, this.onKey);
             stage.addEventListener(MouseEvent.MOUSE_MOVE, this.onMouseMove);   // B: tooltip cursor-follow
@@ -2216,24 +2296,41 @@ package
          if (this._charPoll == null) { this._charPoll = new Ticker(this, this.onCharPoll); }
          this._charPoll.start();
       }
-      // Hide the Vault Boy while the DLL reports its offscreen 3D character renderer active+available; restore
-      // it the moment the contract drops (menu close resets it, so re-opens re-evaluate cleanly).
+      // Reserve the figure slot as soon as Live 3D is active. Waiting for available:true exposes Vault Boy during
+      // the model-placement/display-attach frames on every Inventory transition. Availability now controls only
+      // the readiness caption; a brief empty slot is preferable to flashing the wrong figure.
       private var _charPoll:Ticker;
       private var _char3dOn:Boolean = false;
+      private var _char3dReady:Boolean = false;
+      private var _pageSignalRoot:* = null;
       private var _eqPollN:int = 0;
+      // The native renderer cannot reliably read PipboyMenu.DataObj through this shell. Publish the actual page
+      // lifecycle on root1 instead: ADDED means Inventory is installed, REMOVED means it is no longer visible.
+      private function publishInventoryPage(active:Boolean):void
+      {
+         try {
+            if (active && stage != null && stage.numChildren > 0) { this._pageSignalRoot = stage.getChildAt(0); }
+            if (this._pageSignalRoot != null) { this._pageSignalRoot.PipOS_inventoryPageActive = active; }
+         } catch (ep:*) {}
+      }
       private function onCharPoll(dt:Number):void
       {
-         var avail:Boolean = false;
+         var active:Boolean = false;
+         var ready:Boolean = false;
          try {
             var rr:* = (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null;
             var c3:* = (rr != null) ? rr.PipOS_char3d : null;
-            avail = (c3 != null && c3.active == true && c3.available == true);
-         } catch (e3:*) { avail = false; }
-         if (avail != this._char3dOn) {
-            this._char3dOn = avail;
-            if (this._vb != null) { this._vb.visible = !avail; }
-            if (this._charCap != null) { Theme.setText(this._charCap, avail ? "LIVE CAPTURE" : ""); }   // 0.0.60: caption only when 3D is live
-            Theme.life(avail ? "IV.3d1" : "IV.3d0");   // trail: figure slot switched to 3D / back to Vault Boy
+            active = (c3 != null && c3.active == true);
+            ready = (active && c3.available == true);
+         } catch (e3:*) { active = false; ready = false; }
+         if (active != this._char3dOn) {
+            this._char3dOn = active;
+            if (this._vb != null) { this._vb.visible = !active; }
+         }
+         if (ready != this._char3dReady) {
+            this._char3dReady = ready;
+            if (this._charCap != null) { Theme.setText(this._charCap, ready ? "LIVE CAPTURE" : ""); }
+            Theme.life(ready ? "IV.3d1" : "IV.3d0");
          }
          // 0.0.60: equipment live-refresh. The DLL re-pushes root1.PipOS_equip ~2x/s while the menu is open;
          // re-apply every ~15 frames (applyEquip is diff-only, so unchanged pushes cost 10 string compares).
@@ -2269,6 +2366,7 @@ package
       private function get _rrPoll():* { try { return (stage != null && stage.numChildren > 0) ? stage.getChildAt(0) : null; } catch (e:*) { return null; } }
       private function onPageUnstage(e:Event):void
       {
+         this.publishInventoryPage(false);
          if (stage != null) {
             stage.removeEventListener(KeyboardEvent.KEY_DOWN, this.onKey);
             stage.removeEventListener(MouseEvent.MOUSE_MOVE, this.onMouseMove);

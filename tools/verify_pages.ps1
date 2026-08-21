@@ -16,7 +16,14 @@ foreach ($p in $Pages) {
     $ver = $b[3]
     $hdrOK = ($sig -eq "CWS" -and $ver -eq 17)
     $vdir = Join-Path $out "_v_$p"
+    # FFDec writes its Java logging banner to stderr even on success. Temporarily
+    # keep native stderr non-terminating, while still enforcing FFDec's exit code.
+    $savedErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $ffdec -export script $vdir $swf 2>&1 | Out-Null
+    $ffdecExit = $LASTEXITCODE
+    $ErrorActionPreference = $savedErrorPreference
+    if ($ffdecExit -ne 0) { throw "FFDec script export failed for $p (exit $ffdecExit)" }
     $doc = Get-ChildItem -Recurse $vdir -Filter "$p.as" | Select-Object -First 1
     $extends = $false; $callSurface = @()
     if ($doc) {

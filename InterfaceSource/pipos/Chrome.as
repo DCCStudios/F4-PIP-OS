@@ -11,6 +11,7 @@ package pipos
    import flash.system.ApplicationDomain;
    import flash.system.LoaderContext;
    import flash.text.TextField;
+   import flash.utils.getQualifiedClassName;
 
    // PIP-OS chrome, DLL-ROUTE. Loaded as a ROOT CHILD of the byte-identical vanilla Pip-Boy movie by the
    // companion DLL (S2 pattern). The shell is UNTOUCHED, so it never calls updateData(); the chrome
@@ -96,6 +97,7 @@ package pipos
       private var _built:Boolean = false;
       private var _bg:Sprite;                   // CRT bezel / frame border (below tabs)
       private var _tabBar:Sprite;               // holds tab label/hit children; .graphics = boxes+icons+accents
+      private var _mapFrame:Sprite;              // page-3-only theme border above the engine-owned vanilla map
       private var _crt:Sprite;                  // CRT polish overlay (mouse-transparent, topmost)
       private var _glow:Sprite;                 // central phosphor glow layer (FEATURE A: breathe via .alpha)
       private var _sweep:Sprite;                // soft bright band (FEATURE A: scan sweep via .y + .alpha)
@@ -108,10 +110,12 @@ package pipos
       private var _tabLabels:Array = [];
       private var _tabHits:Array = [];
       private var _tabY:Array = [];
+      private var _tabPaint:Array = [];          // isolated retained Graphics, one per main tab
       private var _codeLabels:Array = [];
       private var _extLabels:Array = [];
       private var _extHits:Array = [];
       private var _extY:Array = [];
+      private var _extPaint:Array = [];          // isolated retained Graphics, one per extension row
       private var _clockDate:TextField;
       private var _clockTime:TextField;
       private var _tel:TextField;
@@ -124,6 +128,8 @@ package pipos
       private var _medicRedisp:Number = 0;
       private var _pumpLastPage:int = -99;      // 0.0.57: instant re-dispatch when the native page/tab changes
       private var _pumpLastTab:int = -99;
+      private var _pendingDirectPage:int = -1;  // retry STATUS/DATA refresh until the incoming class is staged
+      private var _pendingDirectTicks:int = 0;
 
       // 0.0.57 PAGE-DEF PRELOADER. Root cause of the FindFont(NULL) page-switch CTDs (radio/data crash stacks):
       // pipos.* classes + the embedded font follow first-def-wins -- whichever SWF loads FIRST donates them for the
@@ -166,6 +172,7 @@ package pipos
       private var _openSpeed:Number = 1;        // 0.0.60: power-on speed multiplier (settings slider; 0.25-4)
       private var _openAnim:Boolean = OPEN_ANIM;
       private var _breathe:Boolean = CRT_BREATHE;
+      private var _vignette:Boolean = false;     // optional fixed edge darkening; uniform background is the default
 
       // resolved local-space geometry (set once in buildText from Theme.mx/my/ms).
       private var BX:Number, BW:Number, TABH:Number, EXTH:Number;
@@ -178,6 +185,7 @@ package pipos
          this.mouseEnabled = false; this.mouseChildren = true;   // only the tab hit rects consume mouse
          this._bg = new Sprite(); this._bg.mouseEnabled = false; this._bg.mouseChildren = false; addChild(this._bg);
          this._tabBar = new Sprite(); addChild(this._tabBar);
+         this._mapFrame = new Sprite(); this._mapFrame.mouseEnabled = false; this._mapFrame.mouseChildren = false; this._mapFrame.visible = false; addChild(this._mapFrame);
          this._dbg = new Debug("CHROME"); addChild(this._dbg);
          addEventListener(Event.ADDED_TO_STAGE, this.onAdded);
          addEventListener(Event.REMOVED_FROM_STAGE, this.onRemoved);   // 0.0.29: tear the veil down so a closed Pip-Boy leaves no orphan
@@ -271,6 +279,7 @@ package pipos
             }
             if (s.hasOwnProperty("openAnim")) { this._openAnim = (s.openAnim == true); }
             if (s.hasOwnProperty("breathe")) { this._breathe = (s.breathe == true); }
+            if (s.hasOwnProperty("vignette")) { this._vignette = (s.vignette == true); }
             // 0.0.60: open-animation SPEED multiplier (user slider). 1.0 = shipped timing; 2.0 = twice as fast.
             if (s.hasOwnProperty("openAnimSpeed")) {
                var os:Number = Number(s.openAnimSpeed);
@@ -347,7 +356,7 @@ package pipos
          var topL:TextField = Theme.mk(this, 11, Theme.PHOS_DIM, true); topL.x = Theme.mx(24); topL.y = stripY; Theme.setText(topL, "PIP-BOY OS  V2.7.1");
          // boxed OS id (mockup .os border)
          var bg:Graphics = this._bg.graphics;
-         bg.lineStyle(1, Theme.LINE, 0.38); bg.drawRect(Theme.mx(24) - 6, stripY - 2, topL.width + 12, 17); bg.lineStyle();
+         Theme.frameRect(bg, Theme.mx(24) - 6, stripY - 2, topL.width + 12, 17, Theme.LINE, 0.38);
          var topC:TextField = Theme.mk(this, 11, Theme.PHOS_FAINT, false); topC.y = stripY; Theme.setText(topC, "SSS NFO 3247-98A   -   CONNECTION: STABLE"); topC.x = (Theme.CX + Theme.CR) / 2 - topC.width / 2;
          var topR:TextField = Theme.mk(this, 11, Theme.PHOS_DIM, true); topR.y = stripY; Theme.setText(topR, "PROPERTY OF VAULT-TEC"); topR.x = Theme.mx(1578) - topR.width;
 
@@ -355,6 +364,7 @@ package pipos
          for (var i:int = 0; i < PAGES.length; i++) {
             var ty:Number = Theme.my(Number(TAB_MY[i]));
             this._tabY.push(ty);
+            var paint:Sprite = new Sprite(); paint.mouseEnabled = false; paint.mouseChildren = false; this._tabBar.addChildAt(paint, 0); this._tabPaint.push(paint);
             var lbl:TextField = Theme.mk(this._tabBar, 15, Theme.PHOS_DIM, true); lbl.x = this.BX + 40; lbl.y = ty + this.TABH / 2 - 10; Theme.setText(lbl, String(PAGES[i]));
             this._tabLabels.push(lbl);
             var hit:Sprite = new Sprite(); hit.graphics.beginFill(0, 0.004); hit.graphics.drawRect(this.BX, ty, this.BW, this.TABH); hit.graphics.endFill();
@@ -372,6 +382,7 @@ package pipos
          for (var j:int = 0; j < EXTS.length; j++) {
             var ey:Number = Theme.my(Number(EXT_MY[j]));
             this._extY.push(ey);
+            var epaint:Sprite = new Sprite(); epaint.mouseEnabled = false; epaint.mouseChildren = false; this._tabBar.addChildAt(epaint, 0); this._extPaint.push(epaint);
             var elbl:TextField = Theme.mk(this._tabBar, 12, Theme.PHOS_DIM, true); elbl.x = this.BX + 22; elbl.y = ey + this.EXTH / 2 - 8; Theme.setText(elbl, String(EXTS[j]));
             this._extLabels.push(elbl);
             // P2 (0.0.27): geometry-before-text. badge.y is the FIXED slot, so set it on the fresh empty field
@@ -393,7 +404,7 @@ package pipos
          var clY:Number = Theme.my(CLOCK_MY);
          var clH:Number = Theme.ms(90);
          bg.beginFill(Theme.PANEL, 0.50); bg.drawRoundRect(this.BX, clY, this.BW, clH, 8, 8); bg.endFill();
-         bg.lineStyle(1, Theme.LINE, 0.22); bg.drawRoundRect(this.BX, clY, this.BW, clH, 8, 8); bg.lineStyle();
+         Theme.frameRect(bg, this.BX, clY, this.BW, clH, Theme.LINE, 0.22);
          this._clockDate = Theme.mk(this, 16, Theme.PHOS_BRIGHT, true, "center"); this._clockDate.autoSize = "none"; this._clockDate.width = this.BW; this._clockDate.x = this.BX; this._clockDate.y = clY + 10; Theme.setText(this._clockDate, "--.--.----");
          this._clockTime = Theme.mk(this, 13, Theme.PHOS, false, "center"); this._clockTime.autoSize = "none"; this._clockTime.width = this.BW; this._clockTime.x = this.BX; this._clockTime.y = clY + 33; Theme.setText(this._clockTime, "--:--");
          this._tel = Theme.mk(this, 9, Theme.PHOS_FAINT, false, "center"); this._tel.autoSize = "none"; this._tel.width = this.BW; this._tel.x = this.BX; this._tel.y = clY + 54; Theme.setText(this._tel, "PIP-OS(R)  V2.7.1");
@@ -409,6 +420,9 @@ package pipos
          this.buildPower();
 
          this.paintTabs(this._lastPage);   // initial draw (all inactive until first tick reads CurrentPage)
+         var mapG:Graphics = this._mapFrame.graphics;
+         Theme.frameRect(mapG, Theme.CX, Theme.BY, Theme.CW, Theme.BB - Theme.BY, Theme.PHOS, 0.72, 0.55);
+         Theme.brackets(mapG, Theme.CX, Theme.BY, Theme.CW, Theme.BB - Theme.BY, 18, Theme.PHOS_BRIGHT, 0.75);
          if (this._dbg != null) { this._dbg.mark("built"); }
       }
 
@@ -418,14 +432,9 @@ package pipos
          var g:Graphics = this._bg.graphics;
          var x0:Number = Theme.mx(16), y0:Number = Theme.my(26), x1:Number = Theme.mx(1584), y1:Number = Theme.my(884);
          var r:Number = Theme.ms(10);
-         g.lineStyle(1, Theme.LINE, 0.16); g.drawRoundRect(x0, y0, x1 - x0, y1 - y0, r, r); g.lineStyle();
+         Theme.frameRect(g, x0, y0, x1 - x0, y1 - y0, Theme.LINE, 0.16);
          var L:Number = Theme.ms(18);   // corner bracket arm length
-         g.lineStyle(1.5, Theme.LINE, 0.75);
-         g.moveTo(x0, y0 + L); g.lineTo(x0, y0); g.lineTo(x0 + L, y0);                 // TL
-         g.moveTo(x1 - L, y0); g.lineTo(x1, y0); g.lineTo(x1, y0 + L);                 // TR
-         g.moveTo(x0, y1 - L); g.lineTo(x0, y1); g.lineTo(x0 + L, y1);                 // BL
-         g.moveTo(x1 - L, y1); g.lineTo(x1, y1); g.lineTo(x1, y1 - L);                 // BR
-         g.lineStyle();
+         Theme.brackets(g, x0, y0, x1 - x0, y1 - y0, L, Theme.LINE, 0.75);
       }
 
       // Build the CRT polish overlay: gentle central phosphor glow + SOFT edge vignette + rolling scanline
@@ -441,15 +450,16 @@ package pipos
          var fx:Number = FRAME_X, fy:Number = FRAME_Y, fw:Number = FRAME_W, fh:Number = FRAME_H;   // full visible frame (root1-local)
          var g:Graphics = this._crt.graphics;
 
-         // SOFT edge vignette (four LINEAR bands, low alpha, wide + smooth falloff dark->transparent inward;
-         // linear gradients render reliably in GFx, so a failure can't flat-darken the screen). Bands overlap
-         // gently at the corners (~0.36) for a natural vignette; the large clear center = no hard hole. Drawn
-         // into _crt.graphics (static).
-         var vb:Number = 230, va:Number = 0.20;
-         this.vignetteBand(g, fx, fy, fw, vb, 90, va);              // top
-         this.vignetteBand(g, fx, fy + fh - vb, fw, vb, 270, va);   // bottom
-         this.vignetteBand(g, fx, fy, vb, fh, 0, va);               // left
-         this.vignetteBand(g, fx + fw - vb, fy, vb, fh, 180, va);   // right
+         // Optional SOFT edge vignette. This used to be unconditional, so the opacity slider changed the center
+         // while the four 230-unit black bands stayed fixed and made the background look like a bright aperture.
+         // Default OFF leaves the full-frame veil as the only darkening layer. Scanlines, glow, and borders remain.
+         if (this._vignette) {
+            var vb:Number = 230, va:Number = 0.20;
+            this.vignetteBand(g, fx, fy, fw, vb, 90, va);              // top
+            this.vignetteBand(g, fx, fy + fh - vb, fw, vb, 270, va);   // bottom
+            this.vignetteBand(g, fx, fy, vb, fh, 0, va);               // left
+            this.vignetteBand(g, fx + fw - vb, fy, vb, fh, 180, va);   // right
+         }
 
          // FEATURE A (0.0.37) BREATHE: gentle central phosphor glow, now on its OWN pooled Sprite so onTick can
          // "breathe" it by Sprite.alpha ONLY (no redraw, no text). Drawn once; a mis-honoured radial degrades to a
@@ -468,7 +478,8 @@ package pipos
          this._crt.addChild(this._sweep);
          var wg:Graphics = this._sweep.graphics;
          var wm:Matrix = new Matrix(); wm.createGradientBox(fw, SWEEP_H, 90 * Math.PI / 180, fx, 0);
-         wg.beginGradientFill(GradientType.LINEAR, [Theme.PHOS, Theme.PHOS, Theme.PHOS], [0.0, 0.055, 0.0], [0, 128, 255], wm);
+         var sweepAlpha:Number = 0.055;
+         wg.beginGradientFill(GradientType.LINEAR, [Theme.PHOS, Theme.PHOS, Theme.PHOS], [0.0, sweepAlpha, 0.0], [0, 128, 255], wm);
          wg.drawRect(fx, 0, fw, SWEEP_H); wg.endFill();
          this._sweep.y = fy - SWEEP_H;   // start fully above the frame (no text set here -> geometry-before-text N/A)
 
@@ -521,33 +532,38 @@ package pipos
       // field creation, no .width. Cheap; only called when the page changes (and once at build).
       private function paintTabs(cp:int):void
       {
-         var g:Graphics = this._tabBar.graphics;
-         g.clear();
+         this._tabBar.graphics.clear();
+         if (this._mapFrame != null) { this._mapFrame.visible = (cp == 3); }
+         // These controls are scaled with the fullscreen movie. A one-unit filled edge becomes several physical
+         // pixels at 4K, so keep the artifact-safe filled frame but use a sub-unit edge that reads as a hairline.
+         var navEdge:Number = 0.35;
          var i:int, ty:Number, active:Boolean;
          for (i = 0; i < this._tabLabels.length; i++) {
+            var g:Graphics = (this._tabPaint[i] as Sprite).graphics; g.clear();
             ty = Number(this._tabY[i]); active = (i == cp);
             var hov:Boolean = (i == this._hoverIdx);   // P1-B: hovered-but-inactive highlight
             if (active) {
                g.beginFill(Theme.SEL, 0.18); g.drawRoundRect(this.BX, ty, this.BW, this.TABH, 8, 8); g.endFill();
-               g.lineStyle(1, Theme.PHOS, 0.9); g.drawRoundRect(this.BX, ty, this.BW, this.TABH, 8, 8); g.lineStyle();
+               Theme.frameRect(g, this.BX, ty, this.BW, this.TABH, Theme.PHOS, 0.9, navEdge);
                g.beginFill(Theme.SEL, 1); g.drawRoundRect(this.BX - 1, ty + 6, 3, this.TABH - 12, 2, 2); g.endFill();
             } else {
                if (hov) { g.beginFill(Theme.SEL, 0.07); g.drawRoundRect(this.BX, ty, this.BW, this.TABH, 8, 8); g.endFill(); }
-               g.lineStyle(1, hov ? Theme.PHOS : Theme.LINE, hov ? 0.6 : 0.22); g.drawRoundRect(this.BX, ty, this.BW, this.TABH, 8, 8); g.lineStyle();
+               Theme.frameRect(g, this.BX, ty, this.BW, this.TABH, hov ? Theme.PHOS : Theme.LINE, hov ? 0.6 : 0.22, navEdge);
             }
             this.drawIcon(g, i, this.BX + 22, ty + this.TABH / 2, active || hov);
             (this._tabLabels[i] as TextField).textColor = active ? Theme.PHOS_BRIGHT : (hov ? Theme.PHOS : Theme.PHOS_DIM);
          }
          for (i = 0; i < this._extLabels.length; i++) {
+            g = (this._extPaint[i] as Sprite).graphics; g.clear();
             ty = Number(this._extY[i]); active = (cp == (5 + i));
             var ehov:Boolean = (this._hoverIdx == (5 + i));   // P1-B
             if (active) {
                g.beginFill(Theme.SEL, 0.14); g.drawRoundRect(this.BX, ty, this.BW, this.EXTH, 6, 6); g.endFill();
-               g.lineStyle(1, Theme.SEL, 0.8); g.drawRoundRect(this.BX, ty, this.BW, this.EXTH, 6, 6); g.lineStyle();
+               Theme.frameRect(g, this.BX, ty, this.BW, this.EXTH, Theme.SEL, 0.8, navEdge);
                g.beginFill(Theme.SEL, 1); g.drawRect(this.BX - 1, ty + 4, 3, this.EXTH - 8); g.endFill();
             } else {
                if (ehov) { g.beginFill(Theme.SEL, 0.06); g.drawRoundRect(this.BX, ty, this.BW, this.EXTH, 6, 6); g.endFill(); }
-               g.lineStyle(1, ehov ? Theme.PHOS : Theme.LINE, ehov ? 0.5 : 0.14); g.drawRoundRect(this.BX, ty, this.BW, this.EXTH, 6, 6); g.lineStyle();
+               Theme.frameRect(g, this.BX, ty, this.BW, this.EXTH, ehov ? Theme.PHOS : Theme.LINE, ehov ? 0.5 : 0.14, navEdge);
             }
             Theme.diamond(g, this.BX + 11, ty + this.EXTH / 2, 3, (active || ehov) ? Theme.PHOS_BRIGHT : Theme.PHOS_FAINT);
             (this._extLabels[i] as TextField).textColor = active ? Theme.PHOS_BRIGHT : (ehov ? Theme.PHOS : Theme.PHOS_DIM);
@@ -575,32 +591,32 @@ package pipos
       private function drawIcon(g:Graphics, page:int, cx:Number, cy:Number, active:Boolean):void
       {
          var c:uint = active ? Theme.PHOS_BRIGHT : Theme.PHOS_DIM;
-         g.lineStyle(1.6, c, 1);
          switch (page) {
             case 0:  // STAT - pulse / heartbeat
-               g.moveTo(cx - 9, cy); g.lineTo(cx - 3, cy); g.lineTo(cx - 1, cy - 7); g.lineTo(cx + 2, cy + 7); g.lineTo(cx + 4, cy); g.lineTo(cx + 9, cy);
+               Theme.fillLine(g, cx - 9, cy, cx - 3, cy, c, 1, 1.6); Theme.fillLine(g, cx - 3, cy, cx - 1, cy - 7, c, 1, 1.6);
+               Theme.fillLine(g, cx - 1, cy - 7, cx + 2, cy + 7, c, 1, 1.6); Theme.fillLine(g, cx + 2, cy + 7, cx + 4, cy, c, 1, 1.6);
+               Theme.fillLine(g, cx + 4, cy, cx + 9, cy, c, 1, 1.6);
                break;
             case 1:  // INV - lock
-               g.drawRoundRect(cx - 6, cy - 1, 12, 9, 2, 2);
-               g.moveTo(cx - 3, cy - 1); g.lineTo(cx - 3, cy - 4); g.curveTo(cx, cy - 9, cx + 3, cy - 4); g.lineTo(cx + 3, cy - 1);
+               Theme.frameRect(g, cx - 6, cy - 1, 12, 9, c, 1, 1.6);
+               Theme.fillLine(g, cx - 3, cy - 1, cx - 3, cy - 5, c, 1, 1.6); Theme.fillLine(g, cx - 3, cy - 5, cx, cy - 8, c, 1, 1.6);
+               Theme.fillLine(g, cx, cy - 8, cx + 3, cy - 5, c, 1, 1.6); Theme.fillLine(g, cx + 3, cy - 5, cx + 3, cy - 1, c, 1, 1.6);
                break;
             case 2:  // DATA - document
-               g.drawRect(cx - 6, cy - 8, 12, 16);
-               g.moveTo(cx - 2, cy - 3); g.lineTo(cx + 3, cy - 3);
-               g.moveTo(cx - 2, cy);     g.lineTo(cx + 3, cy);
-               g.moveTo(cx - 2, cy + 3); g.lineTo(cx + 3, cy + 3);
+               Theme.frameRect(g, cx - 6, cy - 8, 12, 16, c, 1, 1.6);
+               Theme.fillLine(g, cx - 2, cy - 3, cx + 3, cy - 3, c, 1, 1.6); Theme.fillLine(g, cx - 2, cy, cx + 3, cy, c, 1, 1.6);
+               Theme.fillLine(g, cx - 2, cy + 3, cx + 3, cy + 3, c, 1, 1.6);
                break;
             case 3:  // MAP - pin
-               g.drawCircle(cx, cy - 2, 5);
-               g.moveTo(cx - 4, cy + 1); g.lineTo(cx, cy + 8); g.lineTo(cx + 4, cy + 1);
+               Theme.circleLine(g, cx, cy - 2, 5, c, 1, 1.6, 14);
+               Theme.fillLine(g, cx - 4, cy + 1, cx, cy + 8, c, 1, 1.6); Theme.fillLine(g, cx, cy + 8, cx + 4, cy + 1, c, 1, 1.6);
                break;
             default: // RADIO - antenna
-               g.moveTo(cx, cy + 8); g.lineTo(cx, cy - 4);
-               g.moveTo(cx - 5, cy + 2); g.curveTo(cx, cy - 7, cx + 5, cy + 2);
-               g.moveTo(cx - 8, cy + 4); g.curveTo(cx, cy - 12, cx + 8, cy + 4);
+               Theme.fillLine(g, cx, cy + 8, cx, cy - 4, c, 1, 1.6);
+               Theme.fillLine(g, cx - 5, cy + 2, cx, cy - 7, c, 1, 1.6); Theme.fillLine(g, cx, cy - 7, cx + 5, cy + 2, c, 1, 1.6);
+               Theme.fillLine(g, cx - 8, cy + 4, cx, cy - 12, c, 1, 1.6); Theme.fillLine(g, cx, cy - 12, cx + 8, cy + 4, c, 1, 1.6);
                break;
          }
-         g.lineStyle();
       }
 
       // 0.0.50 PIPBOYTABS COMPAT: the EXTENSIONS entries are NOT separate pages. PipboyTabs injects them as extra
@@ -711,8 +727,9 @@ package pipos
                   // page here, regardless of the flag-clear result. The page's onPipboyChangeEvent is the normal
                   // idempotent data path, so a duplicate on first open is harmless.
                   try {
-                     if (stage != null && mpage.stage != null) {
-                        PipboyChangeEvent.DispatchEvent(new PipboyUpdateMask(4294967295), stage, this._menu.DataObj, mpage.TabNames);
+                      if (stage != null && mpage.stage != null) {
+                         try { if ("PipOSForceRefresh" in mpage) { mpage.PipOSForceRefresh(this._menu.DataObj); Theme.life("MD.direct"); } } catch (emd:*) {}
+                         PipboyChangeEvent.DispatchEvent(new PipboyUpdateMask(4294967295), stage, this._menu.DataObj, mpage.TabNames);
                         Theme.life("MD.pump");
                      }
                   } catch (emp:*) {}
@@ -772,6 +789,30 @@ package pipos
                this._lastPage = cp;
                this.paintTabs(cp);
                if (this._dbg != null) { this._dbg.pageTab(cp, "-"); }
+               // DataObj.CurrentPage can change several frames before CurrentPage points at the incoming staged
+               // movie. Keep a bounded retry only for the two repaired page classes; a one-shot call here could
+               // hit the outgoing page and permanently miss DATA's QuestsList initialization.
+               this._pendingDirectPage = (cp == 0 || cp == 2) ? cp : -1;
+               this._pendingDirectTicks = 0;
+            }
+            if (this._pendingDirectPage >= 0) {
+               this._pendingDirectTicks++;
+               try {
+                  var active:* = this._menu.CurrentPage;
+                  var className:String = active != null ? getQualifiedClassName(active) : "";
+                  var expected:String = this._pendingDirectPage == 0 ? "PipOS_StatsPage" : "PipOS_DataPage";
+                  if (active != null && active.stage != null && className.indexOf(expected) >= 0 &&
+                      "PipOSForceRefresh" in active) {
+                     active.PipOSForceRefresh(d);
+                     Theme.life("MD.activate" + this._pendingDirectPage);
+                     this._pendingDirectPage = -1;
+                  } else if (this._pendingDirectTicks >= 180) {
+                     Theme.life("MD.activateTimeout" + this._pendingDirectPage);
+                     this._pendingDirectPage = -1;
+                  }
+               } catch (eActivate:*) {
+                  if (this._pendingDirectTicks >= 180) { this._pendingDirectPage = -1; }
+               }
             }
             if (d != null) {
                try {
