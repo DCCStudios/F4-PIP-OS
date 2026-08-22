@@ -1,4 +1,5 @@
 #include "PCH.h"
+#include "CharacterCapture.h"
 #include "Scaleform/G/GFx_ASMovieRootBase.h"
 #include "Scaleform/G/GFx_Viewport.h"
 #include "PipboyBridge.h"
@@ -1425,6 +1426,7 @@ namespace PipOS
                 if (be->device.get() != RE::INPUT_DEVICE::kMouse) { continue; }
                 if (be->idCode != 1) { continue; }   // mouse idCode 1 == right button
                 if (!be->QJustPressed()) { continue; }
+                if (CharacterCapture::TryHandleCharacterRightClick()) { continue; }
                 BumpRclickCounter();
             }
         }

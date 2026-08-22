@@ -34,5 +34,9 @@ namespace PipOS
 
         // True once an offscreen capture of the player is live this session (drives the AS3 contract value).
         static bool IsCaptureAvailable();
+
+        // Accepts the existing UI input hook's right-click only while the Inventory character interaction
+        // surface owns the cursor. The actual graph mutation is queued onto the main-thread capture pass.
+        static bool TryHandleCharacterRightClick();
     };
 }

@@ -11,6 +11,7 @@
 #include "RE/A/AIProcess.h"
 #include "RE/T/TESEquipEvent.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -118,13 +119,25 @@ namespace PipOS
         std::atomic<bool> g_installed{ false };
         std::atomic<bool> g_available{ false };    // an offscreen player clone is currently live
         std::atomic<bool> g_pipboyOpen{ false };   // set by the menu sink; read cheaply in the hook
+        // Every open/close transition advances this token. All deferred menu work captures the token and must
+        // not mutate scene/UI state after close or against a later reopen of the Pip-Boy.
+        std::atomic<std::uint64_t> g_menuSessionToken{ 0 };
         std::atomic<bool> g_dirty{ true };          // rebuild requested (set on menu open / after release)
         std::atomic<bool> g_taskInFlight{ false };  // collapses worker-thread hook multiplicity -> 1 pass queued
+        // F4SE drains its task list with while (!empty), so a delegate that calls AddTask can execute its own
+        // replacement immediately in the same drain. Equipment settling must yield an engine/render frame before
+        // polling again or an unpublished biped slot becomes an infinite main-thread loop.
+        std::atomic<bool> g_captureTaskRunning{ false };
+        std::atomic<bool> g_captureRetryRequested{ false };
+        std::atomic<bool> g_captureTaskReentryLogged{ false };
+        thread_local std::uint32_t g_renderHookDepth{ 0 };
         std::atomic<bool> g_failed{ false };        // hard-disable for the rest of the session on any failure
         std::atomic<bool> g_inventoryPageActive{ false }; // unknown pages start safely offscreen; never gates construction
         std::atomic<bool> g_pageProbeInFlight{ false };
         std::atomic<bool> g_rendererRecreateRequested{ false };
-        std::atomic<bool> g_equipmentSettleRequested{ false };
+        std::atomic<bool> g_characterHovered{ false };
+        std::atomic<float> g_sessionYawOffset{ 0.0f };
+        std::atomic<std::uint32_t> g_poseToggleRequests{ 0 };
 
         // ---- MAIN-THREAD-ONLY scene state (only ever touched inside RunCaptureTask / teardown tasks, which
         //      F4SE drains serially on the game main thread -- so no lock is required) ----
@@ -133,10 +146,45 @@ namespace PipOS
         RE::NiPointer<RE::NiAVObject> g_previewRoot;
         RE::NiPointer<RE::BSFaceGenNiNode> g_previewFaceNode;
         RE::NiPointer<RE::NiAVObject> g_displayRoot;
+        bool g_previewWeaponEquipped{ false };
         const RE::NiAVObject* g_sourceRoot{ nullptr };  // detect a player-3D swap -> rebuild
         std::uint64_t g_sourceBipedSignature{ 0 };      // diagnose Pip-Boy's temporary selected-item biped swaps
         std::uint64_t g_sourceVisualSignature{ 0 };
+        enum class PendingEquipmentKind : std::uint8_t
+        {
+            kWeapon,
+            kArmor
+        };
+
+        struct PendingEquipmentEvent
+        {
+            std::uint32_t formID{ 0 };
+            std::uint32_t armorSlotMask{ 0 };
+            std::uint64_t sequence{ 0 };
+            PendingEquipmentKind kind{ PendingEquipmentKind::kArmor };
+            bool equipped{ false };
+        };
+
+        struct PendingEquipmentSnapshot
+        {
+            std::vector<PendingEquipmentEvent> events;
+            std::uint64_t lastSequence{ 0 };
+        };
+
+        // TESEquipEvent delivery is not assumed to share the capture task's main-thread affinity. The watcher
+        // only mutates this queue while holding its lock; Tick copies a snapshot before inspecting BipedAnim.
+        std::mutex g_pendingEquipmentLock;
+        std::vector<PendingEquipmentEvent> g_pendingEquipmentEvents;
+        std::uint64_t g_nextEquipmentEventSequence{ 0 };
+
+        // These settle counters are main-thread-only. A sequence change invalidates all stability evidence from
+        // the previous event batch, while the queue itself remains pending until BuildPreview succeeds.
         std::uint64_t g_equipmentCandidateSignature{ 0 };
+        std::uint64_t g_equipmentCandidateSequence{ 0 };
+        std::uint64_t g_equipmentWaitLoggedSequence{ 0 };
+        std::uint64_t g_equipmentReadyLoggedSequence{ 0 };
+        std::unordered_set<std::uint64_t> g_equipmentMaskMismatchLoggedSequences;
+        std::uint32_t g_equipmentQuietPasses{ 0 };
         std::uint32_t g_equipmentStablePasses{ 0 };
         std::atomic_bool g_loggedTransientBipedPreview{ false };
         RE::NiTransform g_baseTransform;                // framed transform; breathing is added on top
@@ -226,15 +274,37 @@ namespace PipOS
         void SchedulePushContract();
         void ScheduleInventoryPageProbe();
         void SanitizeClone(RE::NiAVObject& a_root, RE::NiAVObject* a_source);
-        void RunCaptureTask(float a_delta);
+        void RunCaptureTask(
+            float a_delta, std::uint64_t a_sessionToken, bool a_afterRenderBoundary);
 
-        void QueueCapturePass(float a_delta)
+        void QueueCapturePass(float a_delta, bool a_afterRenderBoundary = false)
         {
+            const bool captureTaskRunning = g_captureTaskRunning.load(std::memory_order_acquire);
+            if (captureTaskRunning || g_renderHookDepth != 0) {
+                g_captureRetryRequested.store(true, std::memory_order_release);
+                if (captureTaskRunning &&
+                    !g_captureTaskReentryLogged.exchange(true, std::memory_order_acq_rel)) {
+                    logger::info(
+                        "[PipOS][3D] capture retry deferred to the next render frame; avoided F4SE task-queue reentry");
+                }
+                return;
+            }
+            // Capturing the menu generation here closes the race where the menu-close event releases the
+            // renderer while a capture pass queued by the previous frame is still waiting in F4SE's task list.
+            // The task must validate this generation again on the main thread before it can recreate anything.
+            const auto sessionToken = g_menuSessionToken.load(std::memory_order_acquire);
             bool expected = false;
-            if (!g_taskInFlight.compare_exchange_strong(expected, true)) { return; }
+            if (!g_taskInFlight.compare_exchange_strong(expected, true)) {
+                // Preserve the wake if a task from an older menu generation is still queued. That task may reject
+                // its stale token and clear the in-flight gate without doing this session's requested work.
+                g_captureRetryRequested.store(true, std::memory_order_release);
+                return;
+            }
             auto* task = F4SE::GetTaskInterface();
             if (!task) { g_taskInFlight.store(false); return; }
-            task->AddTask([a_delta]() { RunCaptureTask(a_delta); });
+            task->AddTask([a_delta, sessionToken, a_afterRenderBoundary]() {
+                RunCaptureTask(a_delta, sessionToken, a_afterRenderBoundary);
+            });
         }
 
         std::int32_t MakeRel32Displacement(std::uintptr_t a_sourceNext, std::uintptr_t a_destination)
@@ -350,6 +420,48 @@ namespace PipOS
                 if (name && a_name == name) { return std::addressof(bone); }
             }
             return nullptr;
+        }
+
+        bool IsPreviewNeckGoreGeometry(const std::string_view a_name)
+        {
+            return a_name == "FemaleNeckGore" || a_name == "MaleNeckGore" || a_name == "NeckGore";
+        }
+
+        bool HasPreviewShaderMaterial(RE::BSGeometry& a_geometry)
+        {
+            for (auto& property : a_geometry.properties) {
+                if (auto* shader = netimmerse_cast<RE::BSShaderProperty*>(property.get());
+                    shader && shader->material) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Pip-Boy biped clones can inherit app-cull flags while their equipped source is being replaced.
+        // TF3DHUD prepares every preview attachment as visible, then selectively suppresses only invalid
+        // shader paths and neck-gore geometry. Apply the same rule to non-weapon attachments before they are
+        // joined to the private preview skeleton so a newly equipped full outfit cannot leave only head/hands.
+        std::uint32_t PrepareBipedAttachmentVisibility(RE::NiAVObject& a_root)
+        {
+            std::uint32_t restored = 0;
+            ForEachAVObject(std::addressof(a_root), [&](RE::NiAVObject& a_object) {
+                bool hide = false;
+                if (auto* geometry = netimmerse_cast<RE::BSGeometry*>(std::addressof(a_object))) {
+                    const char* name = geometry->GetName().c_str();
+                    hide = IsPreviewNeckGoreGeometry(name ? std::string_view(name) : std::string_view{}) ||
+                        !HasPreviewShaderMaterial(*geometry);
+                }
+                if (hide) {
+                    a_object.SetAppCulled(true);
+                    a_object.fadeAmount = 0.0f;
+                } else {
+                    if (a_object.GetAppCulled()) { ++restored; }
+                    a_object.SetAppCulled(false);
+                    a_object.fadeAmount = 1.0f;
+                }
+            });
+            return restored;
         }
 
         // Resolve the world position of the configured framing target (0=Head 1=Chest 2=Pelvis 3=Root).
@@ -509,7 +621,11 @@ namespace PipOS
                 auto& db = dst->bone[i];
                 const char* nm = db.name.c_str();
                 if (!nm || nm[0] == '\0') { continue; }
-                if (auto* sb = FindFlattenedBoneByName(*src, std::string_view(nm))) {
+                const std::string_view boneName(nm);
+                // Equipment attachment bones belong to the private preview. Copying their live locals here would
+                // reintroduce the drawn, holstered, and mid-equip dependency removed from the weapon path.
+                if (boneName == "Weapon" || boneName == "WeaponLeft") { continue; }
+                if (auto* sb = FindFlattenedBoneByName(*src, boneName)) {
                     db.local = sb->local;
                     db.world = sb->world;   // seed; the flush Update re-derives from local anyway
                     ++copied;
@@ -762,15 +878,19 @@ namespace PipOS
         RE::NiNode* EnsureRightHandWeaponNode(RE::NiAVObject& a_previewRoot, PreviewNodeMap& a_nodes)
         {
             if (auto* existing = FindRightHandWeaponNode(a_previewRoot, a_nodes)) { return existing; }
-
-            // The field race skeleton has RArm_Hand but no authored Weapon entry. Refusing the equipment made
-            // every slot-41 firearm disappear. Add the missing conventional child explicitly so the weapon mesh
-            // has the requested hierarchy and follows the authoritative animated right-hand node.
             auto* rightHand = FindPreviewNode(a_nodes, "RArm_Hand");
             if (!rightHand) {
                 logger::error("[PipOS][3D] synthetic Weapon node failed: RArm_Hand is missing");
                 return nullptr;
             }
+            if (auto* existing = FindPreviewNode(a_nodes, "Weapon");
+                existing && existing->parent == rightHand) {
+                return existing;
+            }
+
+            // The field race skeleton has RArm_Hand but no authored Weapon entry. Create one stable private
+            // attachment node directly beneath that hand. Equipment clones remain ordinary children of this
+            // node, so no live gameplay transform or weapon-specific clone root can become the animation bone.
 
             auto weaponNode = RE::make_nismart<RE::NiNode>(0);
             weaponNode->name = RE::BSFixedString("Weapon");
@@ -804,6 +924,20 @@ namespace PipOS
             // which the earlier reduced port missed and consequently attached at the preview root.
             const auto slot = std::to_underlying(a_slot);
             return slot >= 32 && (slot <= 39 || (slot >= 41 && slot <= 43));
+        }
+
+        [[nodiscard]] bool BipedHasEquippedWeapon(const RE::BipedAnim& a_biped)
+        {
+            for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
+                const auto slot = static_cast<RE::BIPED_OBJECT>(i);
+                if (!IsEngineWeaponAttachSlot(slot) && slot != RE::BIPED_OBJECT::kShield) { continue; }
+                const auto& object = a_biped.object[i];
+                if (object.partClone && object.parent.object &&
+                    object.parent.object->Is(RE::ENUM_FORM_ID::kWEAP)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         void AttachChildLikeEngine(RE::NiAVObject& a_child, RE::NiNode& a_parent)
@@ -856,43 +990,6 @@ namespace PipOS
             return clone ? RE::NiPointer<RE::NiAVObject>(static_cast<RE::NiAVObject*>(clone)) : nullptr;
         }
 
-        [[nodiscard]] RE::NiTransform SeedLiveWeaponLocal(RE::PlayerCharacter& a_player)
-        {
-            if (const auto& biped = a_player.GetBiped(false); biped) {
-                for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
-                    const auto& object = biped->object[i];
-                    if (!object.parent.object || !object.parent.object->Is(RE::ENUM_FORM_ID::kWEAP) ||
-                        !object.partClone) {
-                        continue;
-                    }
-                    for (auto* parent = object.partClone->parent; parent; parent = parent->parent) {
-                        const char* name = parent->GetName().c_str();
-                        if (name && std::string_view(name) == "Weapon") {
-                            return parent->GetLocalTransform();
-                        }
-                    }
-                }
-            }
-            return RE::NiTransform::IDENTITY;
-        }
-
-        [[nodiscard]] bool FindSourceWeaponLocal(
-            const RE::NiAVObject& a_sourcePart, RE::NiTransform& a_out)
-        {
-            // The engine-built partClone is the authoritative source for this exact weapon instance. Its nearest
-            // Weapon ancestor owns the hand-space transform that BipedAnim normally supplies before the geometry
-            // reaches Scb. Resolve it before cloning so a weapon swap cannot accidentally reuse another biped
-            // object's transform or whatever live pose happened to exist when the menu opened.
-            for (auto* parent = a_sourcePart.parent; parent; parent = parent->parent) {
-                const char* name = parent->GetName().c_str();
-                if (name && std::string_view(name) == "Weapon") {
-                    a_out = parent->GetLocalTransform();
-                    return true;
-                }
-            }
-            return false;
-        }
-
         RE::NiPointer<RE::NiAVObject> LoadFreshRaceSkeleton(RE::PlayerCharacter& a_player)
         {
             auto* race = a_player.GetVisualsRace();
@@ -929,23 +1026,52 @@ namespace PipOS
 
             auto previewRoot = CloneSubtree(*loadedRoot);
             if (!previewRoot) { return nullptr; }
-            // This field race skeleton omits the conventional right-hand Weapon node. Add it before the actor
-            // skeleton is flattened so it becomes an authoritative flattened bone and the private behavior
-            // graph can update it. Adding an ordinary wrapper after flattening left it outside the graph; copying
-            // a live pose onto the weapon clone then aligned only the first open.
-            if (!previewRoot->GetObjectByName(RE::BSFixedString("Weapon"))) {
-                auto* handObject = previewRoot->GetObjectByName(RE::BSFixedString("RArm_Hand"));
-                auto* hand = handObject ? handObject->IsNode() : nullptr;
-                if (hand) {
-                    auto weaponNode = RE::make_nismart<RE::NiNode>(0);
-                    weaponNode->name = RE::BSFixedString("Weapon");
-                    weaponNode->SetLocalTransform(SeedLiveWeaponLocal(a_player));
-                    weaponNode->fadeAmount = 1.0f;
-                    hand->AttachChild(weaponNode.get(), false);
-                    logger::info(
-                        "[PipOS][3D] authored missing Weapon node before skeleton flatten: parent='RArm_Hand'");
-                }
+
+            // The shipped human race skeleton exposes Weapon as a logical flattened bone but does not carry an
+            // ordinary NiNode for equipment to parent beneath. Validate the stable hierarchy before
+            // ConvertNodeTree so the logical Weapon entry is preserved. The field runtime can still optimize its
+            // node pointer to null, so the ordinary wrapper receives the logical graph local through the private
+            // transform bridge after flattening. No live actor transform participates in either step.
+            auto* handObject = previewRoot->GetObjectByName(RE::BSFixedString("RArm_Hand"));
+            auto* hand = handObject ? handObject->IsNode() : nullptr;
+            if (!hand) {
+                logger::error(
+                    "[PipOS][3D] private Weapon node validation failed before skeleton flatten: RArm_Hand is missing");
+                return nullptr;
             }
+
+            bool privateWeaponNodeCreated = false;
+            bool privateWeaponNodeReparented = false;
+            auto* weaponObject = previewRoot->GetObjectByName(RE::BSFixedString("Weapon"));
+            auto* privateWeaponNode = weaponObject ? weaponObject->IsNode() : nullptr;
+            if (weaponObject && !privateWeaponNode) {
+                logger::error(
+                    "[PipOS][3D] private Weapon node validation failed before skeleton flatten: existing Weapon object is not a NiNode");
+                return nullptr;
+            }
+            if (!privateWeaponNode) {
+                auto weaponNode = RE::make_nismart<RE::NiNode>(0);
+                weaponNode->name = RE::BSFixedString("Weapon");
+                privateWeaponNode = weaponNode.get();
+                hand->AttachChild(privateWeaponNode, false);
+                privateWeaponNodeCreated = true;
+            } else if (privateWeaponNode->parent != hand) {
+                AttachChildLikeEngine(*privateWeaponNode, *hand);
+                privateWeaponNodeReparented = true;
+            }
+            privateWeaponNode->SetLocalTransform(RE::NiTransform::IDENTITY);
+            privateWeaponNode->SetAppCulled(false);
+            privateWeaponNode->fadeAmount = 1.0f;
+            const bool preFlattenPrivateWeaponNodeValidated = privateWeaponNode->parent == hand;
+            if (!preFlattenPrivateWeaponNodeValidated) {
+                logger::error(
+                    "[PipOS][3D] private Weapon node validation failed before skeleton flatten: parent is not RArm_Hand");
+                return nullptr;
+            }
+            logger::info(
+                "[PipOS][3D] private identity Weapon node validated before skeleton flatten: created={} reparented={}",
+                privateWeaponNodeCreated,
+                privateWeaponNodeReparented);
             constexpr auto kRootPart = RE::BGSBodyPartDefs::LIMB_ENUM::kRoot;
             auto* convertTarget = g_getActorBodyPart3D(
                 std::addressof(a_player), previewRoot.get(), std::addressof(kRootPart), false);
@@ -964,8 +1090,8 @@ namespace PipOS
             EngineCreateBoneMap(previewRoot.get());
             if (auto* weaponBone = FindFlattenedBoneByName(*flattened, "Weapon")) {
                 logger::info(
-                    "[PipOS][3D] flattened Weapon bone published: node={} parentIndex={}",
-                    weaponBone->node != nullptr, weaponBone->parent);
+                    "[PipOS][3D] flattened Weapon bone published: node={} parentIndex={} preFlattenPrivateNodeValidated={}",
+                    weaponBone->node != nullptr, weaponBone->parent, preFlattenPrivateWeaponNodeValidated);
             } else {
                 logger::error("[PipOS][3D] pre-flatten Weapon node was not published into flattened bones");
             }
@@ -1003,15 +1129,21 @@ namespace PipOS
             return initialized;
         }
 
-        int PopulateFreshSkeletonFromBiped(
+        struct BipedPopulationResult
+        {
+            int expected{ 0 };
+            int attached{ 0 };
+        };
+
+        BipedPopulationResult PopulateFreshSkeletonFromBiped(
             RE::PlayerCharacter& a_player, RE::NiAVObject& a_previewRoot, const RE::BipedAnim& a_biped)
         {
             PreviewNodeMap previewNodes;
             CollectPreviewNodes(a_previewRoot, previewNodes);
-            if (previewNodes.empty()) { return 0; }
+            if (previewNodes.empty()) { return {}; }
 
             std::unordered_set<RE::NiAVObject*> seenSources;
-            int attached = 0;
+            BipedPopulationResult result;
             for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
                 auto* settings = Settings::GetSingleton();
                 if (i < 32 && settings && (settings->Char3DSlotMask() & (1u << i)) == 0) { continue; }
@@ -1019,97 +1151,76 @@ namespace PipOS
                 const auto& sourceObject = a_biped.object[i];
                 auto* sourcePart = sourceObject.partClone.get();
                 if (!sourcePart || !seenSources.insert(sourcePart).second) { continue; }
+                ++result.expected;
 
                 auto clone = CloneBipedPartToFreshSkeleton(*sourcePart, a_previewRoot, previewNodes);
                 if (!clone) { continue; }
 
                 RE::NiNode* parent = nullptr;
                 const auto* sourceForm = sourceObject.parent.object;
-                const bool isWeaponAttach = IsEngineWeaponAttachSlot(slot) && sourceForm &&
-                    sourceForm->Is(RE::ENUM_FORM_ID::kWEAP);
+                const bool isWeaponForm = sourceForm && sourceForm->Is(RE::ENUM_FORM_ID::kWEAP);
+                const bool isWeaponAttach = isWeaponForm &&
+                    (IsEngineWeaponAttachSlot(slot) || slot == RE::BIPED_OBJECT::kShield);
+                const bool isLightAttach = slot == RE::BIPED_OBJECT::kWeaponHand && sourceForm &&
+                    sourceForm->Is(RE::ENUM_FORM_ID::kLIGH);
+                const bool isStaffAttach = slot == RE::BIPED_OBJECT::kWeaponStaff;
+                const bool usesStableWeaponParent = isWeaponAttach || isLightAttach || isStaffAttach;
                 const bool hadInternalWeapon =
                     clone->GetObjectByName(RE::BSFixedString("Weapon")) != nullptr;
-                const bool weaponRootWasCulled = clone->GetAppCulled();
-                RE::NiTransform promotedWeaponLocal = RE::NiTransform::IDENTITY;
-                const bool haveSourceWeaponLocal = isWeaponAttach &&
-                    FindSourceWeaponLocal(*sourcePart, promotedWeaponLocal);
-                const char* promotedTransformSource = haveSourceWeaponLocal ?
-                    "source-weapon-ancestor" : "live-weapon-fallback";
-                // Match TF3DHUD and BipedAnim::AttachToParent exactly. A weapon partClone is already an
-                // engine-assembled hierarchy, normally including its own Weapon node beneath a Prn-selected
-                // RArm_Hand root. Wrapping that complete hierarchy in a second synthetic Weapon node makes the
-                // mesh disappear after the private graph publishes its pose. Fixed special cases come first,
-                // then the partClone's Prn, then the skeleton Weapon fallback only when Prn is absent/unusable.
-                if (slot == RE::BIPED_OBJECT::kWeaponHand && sourceForm &&
-                    sourceForm->Is(RE::ENUM_FORM_ID::kLIGH)) {
+                const bool rootWasCulled = clone->GetAppCulled();
+                if (isLightAttach) {
                     parent = EnsureRightHandWeaponNode(a_previewRoot, previewNodes);
-                } else if (slot == RE::BIPED_OBJECT::kWeaponStaff) {
+                } else if (isStaffAttach) {
                     parent = EnsureRightHandWeaponNode(a_previewRoot, previewNodes);
                 } else if (slot == RE::BIPED_OBJECT::kShield && isWeaponAttach) {
                     parent = FindPreviewNode(previewNodes, "WeaponLeft");
+                } else if (isWeaponAttach) {
+                    parent = EnsureRightHandWeaponNode(a_previewRoot, previewNodes);
                 }
-                bool promotedWeaponRoot = false;
                 std::string prnName;
-                if (!parent) {
+                if (!parent && !usesStableWeaponParent) {
                     if (auto* prn = FindStringExtraDataInTree(*sourcePart, RE::BSFixedString("Prn"));
                         prn && !prn->GetValue().empty()) {
                         prnName = prn->GetValue().c_str();
                         parent = FindPreviewNode(previewNodes, prn->GetValue());
                     }
                 }
-                if (!parent) {
-                    // BipedAnim::AttachToParent falls back to WeaponUtils::GetWeaponBoneName for all
-                    // runtime weapon slots when the model has no usable Prn extra data.
-                    if (isWeaponAttach) {
-                        parent = FindPreviewNode(previewNodes, "Weapon");
-                        if (!parent && slot != RE::BIPED_OBJECT::kShield) {
-                            // The field race skeleton has no authored Weapon bone, and 0.0.102 proves the tested
-                            // partClones have no internal Weapon node either. Make the assembled clone root itself
-                            // the Weapon child of the existing animated RArm_Hand. This avoids a synthetic wrapper
-                            // that is absent from the flattened animation tree while preserving the requested
-                            // RArm_Hand -> Weapon -> geometry hierarchy.
-                            parent = FindPreviewNode(previewNodes, "RArm_Hand");
-                            promotedWeaponRoot = parent != nullptr;
-                        }
-                    }
-                }
-                if (!parent) {
+                if (!parent && !usesStableWeaponParent) {
                     for (auto* sourceParent = sourcePart->parent; sourceParent && !parent;
                          sourceParent = sourceParent->parent) {
                         const char* name = sourceParent->GetName().c_str();
                         if (name && name[0] != '\0') { parent = FindPreviewNode(previewNodes, name); }
                     }
                 }
-                if (!parent) { parent = netimmerse_cast<RE::NiNode*>(std::addressof(a_previewRoot)); }
+                if (!parent && !usesStableWeaponParent) {
+                    parent = netimmerse_cast<RE::NiNode*>(std::addressof(a_previewRoot));
+                }
                 if (!parent) { continue; }
 
-                if (isWeaponAttach) {
-                    // Opening the Pip-Boy culls the live weapon. The partClone inherits that root flag, so clear
-                    // only the attachment root. Child visibility remains untouched for receiver/mod geometry.
+                if (!isWeaponAttach) {
+                    const auto restored = PrepareBipedAttachmentVisibility(*clone);
+                    if (restored > 0) {
+                        logger::info(
+                            "[PipOS][3D] biped attachment visibility restored: slot={} form={:08X} objects={}",
+                            i, sourceForm ? sourceForm->GetFormID() : 0, restored);
+                    }
+                } else if (rootWasCulled) {
+                    // Weapon subtrees retain their NIF-authored visibility; only the attachment root must be
+                    // available to the private skeleton.
                     clone->SetAppCulled(false);
                     clone->fadeAmount = 1.0f;
-                    if (promotedWeaponRoot) {
-                        // The clone root is being promoted from assembled geometry to the actual Weapon child of
-                        // RArm_Hand. Therefore it must inherit the source Weapon ancestor's hand-space local, not
-                        // the partClone root's usually-identity local. Prefer the exact source assembly; retain the
-                        // older live-biped resolver only as a guarded compatibility fallback.
-                        if (!haveSourceWeaponLocal) {
-                            promotedWeaponLocal = SeedLiveWeaponLocal(a_player);
-                        }
-                        clone->SetLocalTransform(promotedWeaponLocal);
-                        clone->name = RE::BSFixedString("Weapon");
-                    }
                 }
+                const auto cloneLocal = clone->GetLocalTransform();
                 parent->AttachChild(clone.get(), false);
-                if (IsEngineWeaponAttachSlot(slot)) {
-                    // Match BipedAnim::AttachToParent's weapon post-layout when a separate preview Weapon parent
-                    // exists. When the clone itself was promoted to Weapon, Scb must remain beneath that clone;
-                    // reparenting it to RArm_Hand bypasses the hand-space Weapon transform and visibly splits or
-                    // rotates the mesh away from the hands.
+                bool scbReparented = false;
+                if (usesStableWeaponParent) {
+                    // Match BipedAnim::AttachToParent and TF3DHUD: after the complete clone is attached, move
+                    // Scb beneath the same stable private weapon node without altering either object's local.
                     if (auto* scb = clone->GetObjectByName(RE::BSFixedString("Scb"));
-                        scb && scb != clone.get() && !promotedWeaponRoot) {
+                        scb && scb != clone.get()) {
                         const auto before = scb->GetLocalTransform();
                         AttachChildLikeEngine(*scb, *parent);
+                        scbReparented = true;
                         logger::info(
                             "[PipOS][3D] weapon attach: slot={} form={:08X} parent='{}' boneParent='{}' Scb local=({:.2f},{:.2f},{:.2f}) scale={:.3f}",
                             i, sourceForm ? sourceForm->GetFormID() : 0,
@@ -1117,26 +1228,26 @@ namespace PipOS
                             parent->parent && parent->parent->GetName().c_str() ?
                                 parent->parent->GetName().c_str() : "<none>",
                             before.translate.x, before.translate.y, before.translate.z, before.scale);
-                    } else {
-                        const auto local = clone->GetLocalTransform();
-                        float pitch = 0.0f;
-                        float roll = 0.0f;
-                        float yaw = 0.0f;
-                        local.rotate.ToEulerAnglesXYZ(pitch, roll, yaw);
-                        logger::info(
-                            "[PipOS][3D] weapon attach: slot={} form={:08X} parent='{}' Prn='{}' internalWeapon={} promotedRoot={} rootWasCulled={} transformSource='{}' ScbRetained={}; root local=({:.2f},{:.2f},{:.2f}) rotDeg=({:.1f},{:.1f},{:.1f}) scale={:.3f}",
-                            i, sourceForm ? sourceForm->GetFormID() : 0,
-                            parent->GetName().c_str() ? parent->GetName().c_str() : "<unnamed>",
-                            prnName.empty() ? "<none>" : prnName,
-                            hadInternalWeapon,
-                            promotedWeaponRoot,
-                            weaponRootWasCulled,
-                            promotedWeaponRoot ? promotedTransformSource : "existing-preview-parent",
-                            promotedWeaponRoot && clone->GetObjectByName(RE::BSFixedString("Scb")) != nullptr,
-                            local.translate.x, local.translate.y, local.translate.z,
-                            pitch * 180.0f / kPi, roll * 180.0f / kPi, yaw * 180.0f / kPi,
-                            local.scale);
                     }
+                }
+                if (isWeaponAttach) {
+                    float pitch = 0.0f;
+                    float roll = 0.0f;
+                    float yaw = 0.0f;
+                    cloneLocal.rotate.ToEulerAnglesXYZ(pitch, roll, yaw);
+                    logger::info(
+                        "[PipOS][3D] weapon attach: slot={} form={:08X} parent='{}' boneParent='{}' Prn='{}' internalWeapon={} stablePrivateParent=true cloneLocalPreserved=true rootWasCulled={} ScbReparented={}; clone local=({:.2f},{:.2f},{:.2f}) rotDeg=({:.1f},{:.1f},{:.1f}) scale={:.3f}",
+                        i, sourceForm ? sourceForm->GetFormID() : 0,
+                        parent->GetName().c_str() ? parent->GetName().c_str() : "<unnamed>",
+                        parent->parent && parent->parent->GetName().c_str() ?
+                            parent->parent->GetName().c_str() : "<none>",
+                        prnName.empty() ? "<none>" : prnName,
+                        hadInternalWeapon,
+                        rootWasCulled,
+                        scbReparented,
+                        cloneLocal.translate.x, cloneLocal.translate.y, cloneLocal.translate.z,
+                        pitch * 180.0f / kPi, roll * 180.0f / kPi, yaw * 180.0f / kPi,
+                        cloneLocal.scale);
                 }
                 RE::bhkWorld::RemoveObjects(clone.get(), true, true);
                 ForEachAVObject(clone.get(), [](RE::NiAVObject& a_object) { a_object.controllers.reset(); });
@@ -1150,7 +1261,7 @@ namespace PipOS
                 });
                 const char* modelPath = sourceObject.part ? sourceObject.part->GetModel() : nullptr;
                 (void)InitializePreviewCloth(a_player, *clone, a_previewRoot, modelPath);
-                ++attached;
+                ++result.attached;
             }
 
             EngineCreateBoneMap(std::addressof(a_previewRoot));
@@ -1158,8 +1269,11 @@ namespace PipOS
                 EngineCreateBoneMap(flattened);
             }
             EngineCreateBoneMap(std::addressof(a_previewRoot));
-            logger::info("[PipOS][3D] TF3DHUD equipment construction: {} unique biped parts attached", attached);
-            return attached;
+            logger::info(
+                "[PipOS][3D] TF3DHUD equipment construction: {}/{} unique biped parts attached",
+                result.attached,
+                result.expected);
+            return result;
         }
 
         std::uint64_t BuildBipedSignature(const RE::BipedAnim& a_biped)
@@ -1203,6 +1317,200 @@ namespace PipOS
             }
             a_pendingSlot = -1;
             return false;
+        }
+
+        const char* PendingEquipmentKindName(const PendingEquipmentKind a_kind)
+        {
+            return a_kind == PendingEquipmentKind::kWeapon ? "weapon" : "armor";
+        }
+
+        void ResetEquipmentSettleCandidate()
+        {
+            g_equipmentCandidateSignature = 0;
+            g_equipmentCandidateSequence = 0;
+            g_equipmentStablePasses = 0;
+            g_equipmentQuietPasses = 0;
+            g_equipmentWaitLoggedSequence = 0;
+            g_equipmentReadyLoggedSequence = 0;
+            g_equipmentMaskMismatchLoggedSequences.clear();
+        }
+
+        void ClearPendingEquipmentEvents()
+        {
+            std::scoped_lock lock(g_pendingEquipmentLock);
+            g_pendingEquipmentEvents.clear();
+        }
+
+        void EnqueuePendingEquipmentEvent(
+            const std::uint32_t a_formID,
+            const std::uint32_t a_armorSlotMask,
+            const bool a_equipped,
+            const PendingEquipmentKind a_kind)
+        {
+            PendingEquipmentEvent pending;
+            {
+                std::scoped_lock lock(g_pendingEquipmentLock);
+                // A form's latest state supersedes its earlier state. A newly equipped right-hand weapon also
+                // supersedes older equipped-weapon targets because only one can own that attachment at a time.
+                std::erase_if(g_pendingEquipmentEvents, [&](const PendingEquipmentEvent& a_existing) {
+                    if (a_existing.kind != a_kind) { return false; }
+                    if (a_existing.formID == a_formID) { return true; }
+                    if (a_kind == PendingEquipmentKind::kWeapon) {
+                        return a_equipped && a_existing.equipped;
+                    }
+                    // Two equipped armor forms cannot simultaneously own the same advertised biped slot. The
+                    // latest overlapping equip is the only reachable target; retaining the older one would
+                    // deadlock the batch while waiting for mutually exclusive ownership.
+                    return a_equipped && a_existing.equipped && a_armorSlotMask != 0 &&
+                        (a_existing.armorSlotMask & a_armorSlotMask) != 0;
+                });
+                pending = {
+                    .formID = a_formID,
+                    .armorSlotMask = a_armorSlotMask,
+                    .sequence = ++g_nextEquipmentEventSequence,
+                    .kind = a_kind,
+                    .equipped = a_equipped,
+                };
+                g_pendingEquipmentEvents.push_back(pending);
+            }
+
+            logger::info(
+                "[PipOS][3D] equipment event queued: seq={} type={} form={:08X} equipped={} armorMask={:08X}",
+                pending.sequence,
+                PendingEquipmentKindName(pending.kind),
+                pending.formID,
+                pending.equipped,
+                pending.armorSlotMask);
+            if (g_pipboyOpen.load(std::memory_order_acquire)) {
+                QueueCapturePass(1.0f / 60.0f);
+            }
+        }
+
+        PendingEquipmentSnapshot SnapshotPendingEquipmentEvents()
+        {
+            std::scoped_lock lock(g_pendingEquipmentLock);
+            PendingEquipmentSnapshot snapshot;
+            snapshot.events = g_pendingEquipmentEvents;
+            for (const auto& event : snapshot.events) {
+                snapshot.lastSequence = (std::max)(snapshot.lastSequence, event.sequence);
+            }
+            return snapshot;
+        }
+
+        bool ClearPendingEquipmentEventsThrough(const std::uint64_t a_sequence)
+        {
+            std::scoped_lock lock(g_pendingEquipmentLock);
+            std::erase_if(g_pendingEquipmentEvents, [&](const PendingEquipmentEvent& a_event) {
+                return a_event.sequence <= a_sequence;
+            });
+            return !g_pendingEquipmentEvents.empty();
+        }
+
+        [[nodiscard]] bool BipedObjectHasForm(
+            const RE::BIPOBJECT& a_object, const std::uint32_t a_formID)
+        {
+            return a_object.parent.object && a_object.parent.object->GetFormID() == a_formID;
+        }
+
+        [[nodiscard]] bool PendingEquipmentEventReflected(
+            const RE::BipedAnim& a_biped,
+            const PendingEquipmentEvent& a_event,
+            std::int32_t& a_blockedSlot,
+            const char*& a_reason)
+        {
+            if (a_event.kind == PendingEquipmentKind::kWeapon) {
+                for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
+                    const auto slot = static_cast<RE::BIPED_OBJECT>(i);
+                    if (!IsEngineWeaponAttachSlot(slot) && slot != RE::BIPED_OBJECT::kShield) { continue; }
+                    const auto& object = a_biped.object[i];
+                    if (!BipedObjectHasForm(object, a_event.formID)) { continue; }
+                    if (!a_event.equipped) {
+                        a_blockedSlot = i;
+                        a_reason = "unequipped weapon is still present";
+                        return false;
+                    }
+                    if (!object.partClone) {
+                        a_blockedSlot = i;
+                        a_reason = "equipped weapon partClone is not published";
+                        return false;
+                    }
+                    return true;
+                }
+                if (a_event.equipped) {
+                    a_reason = "matching equipped weapon is not present";
+                    return false;
+                }
+                return true;
+            }
+
+            if (!a_event.equipped) {
+                for (std::int32_t i = 0; i < std::to_underlying(RE::BIPED_OBJECT::kTotal); ++i) {
+                    if (BipedObjectHasForm(a_biped.object[i], a_event.formID)) {
+                        a_blockedSlot = i;
+                        a_reason = "unequipped armor is still present";
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            // Armor with no advertised biped slots cannot replace visible preview geometry. Treat the event as
+            // reflected once the global pending-handle gate is clear instead of waiting forever on no slots.
+            if (a_event.armorSlotMask == 0) { return true; }
+
+            // ARMO slots describe occupancy/conflicts, while the runtime BipedAnim entries are produced by the
+            // applicable ARMA add-ons for this race and sex. Multi-slot and modded armor can therefore publish one
+            // complete partClone instead of duplicating that clone into every ARMO bit. Require at least one
+            // matching visible runtime part, then let the global pending-handle gate, quiet interval, and stable
+            // whole-biped signature prove that all participating add-ons have converged.
+            std::uint32_t matchingFormMask = 0;
+            std::uint32_t matchingCloneMask = 0;
+            for (std::int32_t i = 0; i < 32; ++i) {
+                const auto& object = a_biped.object[i];
+                if (!BipedObjectHasForm(object, a_event.formID)) { continue; }
+                matchingFormMask |= 1u << i;
+                if (object.partClone) { matchingCloneMask |= 1u << i; }
+            }
+            if ((matchingCloneMask & a_event.armorSlotMask) != 0) { return true; }
+            if (matchingCloneMask != 0) {
+                if (g_equipmentMaskMismatchLoggedSequences.insert(a_event.sequence).second) {
+                    logger::info(
+                        "[PipOS][3D] armor runtime-slot mismatch accepted: seq={} form={:08X} advertisedMask={:08X} matchingFormMask={:08X} matchingCloneMask={:08X}",
+                        a_event.sequence,
+                        a_event.formID,
+                        a_event.armorSlotMask,
+                        matchingFormMask,
+                        matchingCloneMask);
+                }
+                return true;
+            }
+
+            for (std::int32_t i = 0; i < 32; ++i) {
+                if ((a_event.armorSlotMask & (1u << i)) != 0) {
+                    a_blockedSlot = i;
+                    break;
+                }
+            }
+            a_reason = matchingFormMask != 0 ?
+                "matching equipped armor has no published visual partClone" :
+                "matching equipped armor is not published in an advertised runtime slot";
+            return false;
+        }
+
+        [[nodiscard]] bool PendingEquipmentEventsReflected(
+            const RE::BipedAnim& a_biped,
+            const PendingEquipmentSnapshot& a_snapshot,
+            PendingEquipmentEvent& a_blockedEvent,
+            std::int32_t& a_blockedSlot,
+            const char*& a_reason)
+        {
+            for (const auto& event : a_snapshot.events) {
+                if (!PendingEquipmentEventReflected(a_biped, event, a_blockedSlot, a_reason)) {
+                    a_blockedEvent = event;
+                    return false;
+                }
+            }
+            return true;
         }
 
         std::uint64_t BuildVisualSignature(RE::PlayerCharacter& a_player)
@@ -1350,11 +1658,19 @@ namespace PipOS
             }
             auto previewRoot = LoadFreshRaceSkeleton(a_player);
             if (!previewRoot) { return nullptr; }
-            if (PopulateFreshSkeletonFromBiped(a_player, *previewRoot, *biped) == 0) {
-                logger::error("[PipOS][3D] TF3DHUD fresh character: no biped parts attached");
+            const auto population = PopulateFreshSkeletonFromBiped(a_player, *previewRoot, *biped);
+            if (population.attached == 0 || population.attached != population.expected) {
+                logger::error(std::format(
+                    "[PipOS][3D] TF3DHUD fresh character: incomplete biped candidate ({}/{} parts attached)",
+                    population.attached,
+                    population.expected));
                 return nullptr;
             }
-            (void)AttachFreshFaceGenHead(a_player, *previewRoot);
+            if (!AttachFreshFaceGenHead(a_player, *previewRoot)) {
+                logger::error(
+                    "[PipOS][3D] TF3DHUD fresh character: mandatory FaceGen head attachment failed");
+                return nullptr;
+            }
             InitializePreviewHairCloth(a_player, *previewRoot);
             SanitizeClone(*previewRoot, std::addressof(a_liveSource));
             ApplyFreshBodyTint(a_player, *previewRoot);
@@ -1421,7 +1737,7 @@ namespace PipOS
         {
             auto* settings = Settings::GetSingleton();
             const float scale = settings ? settings->Char3DScale() : 0.45f;
-            const float yaw = settings ? settings->Char3DYaw() : 160.0f;
+            const float yaw = (settings ? settings->Char3DYaw() : 160.0f) + g_sessionYawOffset.load();
             const float pitch = settings ? settings->Char3DPitch() : 0.0f;
             const float roll = settings ? settings->Char3DRoll() : 0.0f;
             float distance = settings ? settings->Char3DDistance() : 200.0f;
@@ -1595,7 +1911,7 @@ namespace PipOS
                 // Replace 0.0.78's opaque proof color with TF3DHUD's transparent character target.
                 g_renderer->Offscreen_SetBackgroundColor(RE::NiColorA{ 0.0f, 0.0f, 0.0f, 0.0f });
                 logger::info(
-                    "[PipOS][3D] 0.0.109 ATTACHMENT AND STATUS PASS active: private behavior graph, source Weapon ancestor transform, retained Scb hierarchy, live radiation bridge, instant event consumption, "
+                    "[PipOS][3D] 0.0.123 FRAME-BOUND EQUIPMENT SETTLE active: Interface3D accumulation is lifetime-locked and every queued capture/probe/close operation is session-token guarded; each right-hand weapon clone keeps its NIF local beneath the ordinary private Weapon wrapper under RArm_Hand, the preview graph's flattened Weapon local is published to that wrapper after each private graph update, Scb is replayed beneath the same wrapper, and no live gameplay Weapon transform or animation-refresh request is used; equipment polls requested from inside an F4SE capture task are deferred to the next render frame, require matching published runtime ownership, then 15 quiet render frames and three identical whole-biped signatures, and remain pending until a complete preview publishes; newly equipped biped attachments use TF3DHUD selective visibility, cursor-matched session yaw drag, Ready/Sighted right-click toggle, "
                     "three-point lighting, transparent kModMenu RT, fresh "
                     "race skeleton, seeded biped clones, depth 15, recreate-on-open");
             } else {
@@ -1920,7 +2236,8 @@ namespace PipOS
             if (!settings || !g_previewRoot) { return; }
 
             const PlacementSnapshot current{
-                settings->Char3DScale(), settings->Char3DFov(), settings->Char3DYaw(),
+                settings->Char3DScale(), settings->Char3DFov(),
+                settings->Char3DYaw() + g_sessionYawOffset.load(),
                 settings->Char3DPitch(), settings->Char3DRoll(),
                 settings->Char3DDistance(), settings->Char3DTarget(),
                 settings->Char3DClipLeft(), settings->Char3DClipTop(),
@@ -1977,9 +2294,9 @@ namespace PipOS
             g_livePlacement = current;
         }
 
-        void AttachToRenderer(RE::NiAVObject& a_previewRoot)
+        bool AttachToRenderer(RE::NiAVObject& a_previewRoot)
         {
-            if (!g_renderer) { return; }
+            if (!g_renderer) { return false; }
 
             EnsureDisplayRoot();
             if (g_displayRoot) {
@@ -1993,26 +2310,55 @@ namespace PipOS
             g_renderer->Offscreen_Set3D(std::addressof(a_previewRoot));
 
             ConfigureThreePointLights(*g_renderer);
+            return g_renderer->offscreenElement.get() == std::addressof(a_previewRoot);
         }
 
-        bool BuildPreview(RE::PlayerCharacter& a_player, RE::NiAVObject& a_source)
+        bool BuildPreview(
+            RE::PlayerCharacter& a_player,
+            RE::NiAVObject& a_source,
+            const bool a_allowWholeRootFallback)
         {
-            CharacterAnimation::Reset();
-            g_livePlacement = {};
+            // Build the replacement off to the side. A failed equipment candidate must not disturb the last
+            // complete preview's face metadata, private graph, or renderer attachment.
+            auto previousFaceNode = g_previewFaceNode;
+            auto previousRoot = g_previewRoot;
+            bool candidateWeaponEquipped = false;
+            if (const auto& biped = a_player.GetBiped(false); biped) {
+                candidateWeaponEquipped = BipedHasEquippedWeapon(*biped);
+            }
             g_previewFaceNode.reset();
             auto clone = kTF3DHUDCharacterPass ? BuildFreshTF3DHUDCharacter(a_player, a_source) : nullptr;
-            if (!clone) {
+            if (!clone && a_allowWholeRootFallback && !previousRoot) {
                 logger::info("[PipOS][3D] TF3DHUD fresh construction unavailable; falling back to whole-root clone");
                 clone = CloneSubtree(a_source);
                 if (clone) { SanitizeClone(*clone, std::addressof(a_source)); }
             }
             if (!clone) {
-                logger::error("[PipOS][3D] player biped clone failed");
+                g_previewFaceNode = std::move(previousFaceNode);
+                logger::error(
+                    "[PipOS][3D] complete player biped candidate failed; previous preview retained");
+                return false;
+            }
+            if (!g_renderer) {
+                g_previewFaceNode = std::move(previousFaceNode);
+                logger::error("[PipOS][3D] preview candidate completed without an available renderer");
                 return false;
             }
             FrameClone(*clone);
-            AttachToRenderer(*clone);
+            if (!AttachToRenderer(*clone)) {
+                if (previousRoot && !AttachToRenderer(*previousRoot)) {
+                    logger::error(
+                        "[PipOS][3D] renderer rejected both the replacement and retained preview roots");
+                }
+                g_previewFaceNode = std::move(previousFaceNode);
+                logger::error(
+                    "[PipOS][3D] renderer rejected complete player biped candidate; previous preview retained");
+                return false;
+            }
+            CharacterAnimation::Reset();
+            g_livePlacement = {};
             g_previewRoot = clone;
+            g_previewWeaponEquipped = candidateWeaponEquipped;
             g_sourceRoot = std::addressof(a_source);
             if (const auto& biped = a_player.GetBiped(false); biped) {
                 g_sourceBipedSignature = BuildBipedSignature(*biped);
@@ -2085,12 +2431,13 @@ namespace PipOS
             g_available.store(false);
             g_previewRoot.reset();
             g_previewFaceNode.reset();
+            g_previewWeaponEquipped = false;
             g_sourceRoot = nullptr;
             g_sourceBipedSignature = 0;
             g_sourceVisualSignature = 0;
-            g_equipmentSettleRequested.store(false);
-            g_equipmentCandidateSignature = 0;
-            g_equipmentStablePasses = 0;
+            ClearPendingEquipmentEvents();
+            ResetEquipmentSettleCandidate();
+            g_captureRetryRequested.store(false, std::memory_order_release);
             g_livePlacement = {};
             g_dirty = true;
         }
@@ -2112,7 +2459,7 @@ namespace PipOS
 
         // Frame tick -- runs ONLY on the game main thread, inside RunCaptureTask (an F4SE task). All scene-graph
         // and D3D mutation happens here; the worker-thread hook never reaches this.
-        void Tick(float a_delta)
+        void Tick(float a_delta, bool a_afterRenderBoundary)
         {
             std::scoped_lock lock(g_sceneLock);
             if (g_failed.load()) { return; }
@@ -2134,10 +2481,20 @@ namespace PipOS
             auto* player = RE::PlayerCharacter::GetSingleton();
             if (!player) { HideAndRelease(); return; }
 
+            // UI input only increments an atomic request count. Consume it here, on the same main-thread path
+            // that owns the private behavior graph and renderer scene.
+            const auto poseRequests = g_poseToggleRequests.exchange(0);
+            for (std::uint32_t i = 0; i < poseRequests; ++i) {
+                CharacterAnimation::ToggleReadySighted();
+            }
+
             auto* source = player->Get3D(false);  // third-person root (carries worn armor + weapon)
             if (!source) { HideAndRelease(); return; }
 
-            if (const auto& biped = player->GetBiped(false); biped) {
+            const auto& biped = player->GetBiped(false);
+            const auto pendingEquipment = SnapshotPendingEquipmentEvents();
+            std::uint64_t settledEquipmentSequence = 0;
+            if (biped) {
                 std::int32_t pendingSlot = -1;
                 if (HasPendingBipedModelHandles(*biped, pendingSlot)) {
                     // Keep the last complete preview alive while the engine finishes the replacement. The
@@ -2147,17 +2504,85 @@ namespace PipOS
                         s_lastPendingSlot = pendingSlot;
                         logger::info("[PipOS][3D] deferred preview rebuild: biped slot {} is still loading", pendingSlot);
                     }
+                    if (!pendingEquipment.events.empty()) {
+                        g_equipmentCandidateSignature = 0;
+                        g_equipmentCandidateSequence = 0;
+                        g_equipmentQuietPasses = 0;
+                        g_equipmentStablePasses = 0;
+                    }
                     QueueCapturePass(a_delta);
                     return;
                 }
             }
 
-            // TESEquipEvent is emitted before every participating biped clone is guaranteed to be published.
-            // Require three consecutive complete passes with the same ownership signature before replacing a
-            // working preview. This keeps armor equips from settling on the partial 2/3/4-part snapshots seen
-            // in the 0.0.104 log, while menu-open construction remains immediate.
-            if (const auto& biped = player->GetBiped(false);
-                biped && g_previewRoot && g_equipmentSettleRequested.load()) {
+            // TESEquipEvent arrives before all participating biped clones are guaranteed to be published. Wait
+            // for matching runtime ownership first, including ARMA-driven armor visuals that need not duplicate
+            // every ARMO occupancy bit, then require 15 quiet render frames and three identical whole-biped
+            // signatures. No timeout can convert a stable but incomplete outfit into a publishable preview.
+            if (!pendingEquipment.events.empty()) {
+                if (!biped) {
+                    g_equipmentCandidateSignature = 0;
+                    g_equipmentCandidateSequence = 0;
+                    g_equipmentQuietPasses = 0;
+                    g_equipmentStablePasses = 0;
+                    QueueCapturePass(a_delta);
+                    return;
+                }
+                PendingEquipmentEvent blockedEvent;
+                std::int32_t blockedSlot = -1;
+                const char* blockedReason = "requested equipment state is not reflected";
+                if (!PendingEquipmentEventsReflected(
+                        *biped, pendingEquipment, blockedEvent, blockedSlot, blockedReason)) {
+                    g_equipmentCandidateSignature = 0;
+                    g_equipmentCandidateSequence = 0;
+                    g_equipmentQuietPasses = 0;
+                    g_equipmentStablePasses = 0;
+                    if (g_equipmentWaitLoggedSequence != pendingEquipment.lastSequence) {
+                        g_equipmentWaitLoggedSequence = pendingEquipment.lastSequence;
+                        logger::info(
+                            "[PipOS][3D] equipment event waiting: seq={} type={} form={:08X} equipped={} slot={} reason='{}'",
+                            blockedEvent.sequence,
+                            PendingEquipmentKindName(blockedEvent.kind),
+                            blockedEvent.formID,
+                            blockedEvent.equipped,
+                            blockedSlot,
+                            blockedReason);
+                    }
+                    QueueCapturePass(a_delta);
+                    return;
+                }
+
+                const bool newEquipmentCandidate =
+                    g_equipmentCandidateSequence != pendingEquipment.lastSequence;
+                if (newEquipmentCandidate) {
+                    g_equipmentCandidateSequence = pendingEquipment.lastSequence;
+                    g_equipmentCandidateSignature = 0;
+                    g_equipmentQuietPasses = 0;
+                    g_equipmentStablePasses = 0;
+                }
+                constexpr std::uint32_t kRequiredQuietEquipmentPasses = 15;
+                if (g_equipmentReadyLoggedSequence != pendingEquipment.lastSequence) {
+                    g_equipmentReadyLoggedSequence = pendingEquipment.lastSequence;
+                    logger::info(
+                        "[PipOS][3D] equipment ownership reflected through seq={}; waiting {} quiet render frames",
+                        pendingEquipment.lastSequence,
+                        kRequiredQuietEquipmentPasses);
+                }
+                // Actor, equipment, and UI wakeups can enqueue capture work more than once per rendered frame.
+                // They may observe readiness, but only a task emitted by the outer render-boundary retry pump can
+                // advance the quiet/stable evidence. This keeps all settle counts separated by engine rendering.
+                // A boundary task queued before a newer event may observe that event only when it executes, so
+                // the first observation establishes the candidate but never counts as its first quiet boundary.
+                if (newEquipmentCandidate || !a_afterRenderBoundary) {
+                    QueueCapturePass(a_delta);
+                    return;
+                }
+                if (g_equipmentQuietPasses < kRequiredQuietEquipmentPasses) {
+                    ++g_equipmentQuietPasses;
+                    QueueCapturePass(a_delta);
+                    return;
+                }
+
                 const auto signature = BuildBipedSignature(*biped);
                 if (signature != g_equipmentCandidateSignature) {
                     g_equipmentCandidateSignature = signature;
@@ -2165,18 +2590,22 @@ namespace PipOS
                 } else {
                     ++g_equipmentStablePasses;
                 }
-                if (g_equipmentStablePasses < 3) {
+                constexpr std::uint32_t kRequiredStableEquipmentPasses = 3;
+                if (g_equipmentStablePasses < kRequiredStableEquipmentPasses) {
                     QueueCapturePass(a_delta);
                     return;
                 }
-                g_equipmentSettleRequested.store(false);
-                g_equipmentStablePasses = 0;
+                settledEquipmentSequence = pendingEquipment.lastSequence;
+                g_dirty.store(true);
                 logger::info(
-                    "[PipOS][3D] equipment biped stabilized: signature={:016X}; rebuilding preview",
-                    signature);
+                    "[PipOS][3D] equipment state complete: throughSeq={} events={} signature={:016X} stablePasses={}; rebuilding preview",
+                    settledEquipmentSequence,
+                    pendingEquipment.events.size(),
+                    signature,
+                    g_equipmentStablePasses);
             }
 
-            if (const auto& biped = player->GetBiped(false); biped && g_previewRoot) {
+            if (biped && g_previewRoot) {
                 const auto currentSignature = BuildBipedSignature(*biped);
                 if (currentSignature != g_sourceBipedSignature) {
                     if (!g_loggedTransientBipedPreview.exchange(true)) {
@@ -2202,7 +2631,11 @@ namespace PipOS
                     HideAndRelease();
                     return;
                 }
-                if (g_previewRoot) { AttachToRenderer(*g_previewRoot); }
+                if (g_previewRoot && !AttachToRenderer(*g_previewRoot)) {
+                    logger::error("[PipOS][3D] live FOV renderer recreation rejected the retained preview");
+                    HideAndRelease();
+                    return;
+                }
                 logger::info("[PipOS][3D] renderer recreated for live FOV={}", settings->Char3DFov());
             }
 
@@ -2259,7 +2692,8 @@ namespace PipOS
                     const bool shouldDraw = ShouldDrawCharacter(*player);
                     g_previewRoot->SetAppCulled(!shouldDraw);
                     if (shouldDraw) {
-                        CharacterAnimation::Update(*player, *g_previewRoot, a_delta);
+                        CharacterAnimation::Update(
+                            *player, *g_previewRoot, g_previewWeaponEquipped, a_delta);
                         ApplyTargetFollow(*g_previewRoot);
                         SyncPreviewFacialExpression(*player);
                     }
@@ -2285,8 +2719,33 @@ namespace PipOS
             }
 
             if (!g_previewRoot || g_dirty || g_sourceRoot != source) {
-                if (!BuildPreview(*player, *source)) { HideAndRelease(); return; }
+                const bool equipmentReplacement = settledEquipmentSequence != 0;
+                if (!BuildPreview(*player, *source, !equipmentReplacement)) {
+                    if (equipmentReplacement) {
+                        // Keep both the previous complete preview and the event batch. Another three stable
+                        // passes will retry construction; a failed candidate is never published or timed out.
+                        g_dirty.store(false);
+                        ResetEquipmentSettleCandidate();
+                        logger::error(std::format(
+                            "[PipOS][3D] equipment preview rebuild failed through seq={}; retaining previous preview and pending events",
+                            settledEquipmentSequence));
+                        QueueCapturePass(a_delta);
+                        return;
+                    }
+                    HideAndRelease();
+                    return;
+                }
                 g_dirty = false;
+                if (equipmentReplacement) {
+                    const bool moreEventsPending =
+                        ClearPendingEquipmentEventsThrough(settledEquipmentSequence);
+                    ResetEquipmentSettleCandidate();
+                    logger::info(
+                        "[PipOS][3D] equipment preview published through seq={}; newerEventsPending={}",
+                        settledEquipmentSequence,
+                        moreEventsPending);
+                    if (moreEventsPending) { QueueCapturePass(a_delta); }
+                }
             }
 
             if (g_previewRoot) { RefreshLivePlacement(); }
@@ -2370,15 +2829,40 @@ namespace PipOS
         // MAIN-THREAD task body: the entire build/attach/idle/teardown pass. Scheduled from the hook via
         // AddTask; F4SE drains it serially on the game main thread. Re-pushes the AS3 contract whenever the
         // "clone is live" availability flips, so the AS3 side learns when the capture actually goes live.
-        void RunCaptureTask(float a_delta)
+        void RunCaptureTask(
+            float a_delta, std::uint64_t a_sessionToken, bool a_afterRenderBoundary)
         {
-            // Reset the in-flight gate FIRST so the next frame's hook can queue the following pass. F4SE tasks
-            // never run concurrently, so at most one pass executes + one is queued -- never N clones.
-            g_taskInFlight.store(false);
+            struct CaptureTaskExecutionScope
+            {
+                CaptureTaskExecutionScope()
+                {
+                    g_captureTaskRunning.store(true, std::memory_order_release);
+                }
+
+                ~CaptureTaskExecutionScope()
+                {
+                    g_taskInFlight.store(false, std::memory_order_release);
+                    g_captureTaskRunning.store(false, std::memory_order_release);
+                }
+            } executionScope;
+
+            // Keep the in-flight gate set through the complete delegate. QueueCapturePass detects this active
+            // task and records a render-frame retry instead of appending another task to F4SE's current
+            // while-not-empty drain. The scope clears both gates on every return path.
             if (g_failed.load()) { return; }
 
+            const auto currentToken = g_menuSessionToken.load(std::memory_order_acquire);
+            if (!g_pipboyOpen.load(std::memory_order_acquire) || currentToken != a_sessionToken) {
+                logger::info(
+                    "[PipOS][3D] skipped stale capture pass: taskToken={} currentToken={} open={}",
+                    a_sessionToken,
+                    currentToken,
+                    g_pipboyOpen.load(std::memory_order_relaxed));
+                return;
+            }
+
             const bool wasAvailable = g_available.load();
-            Tick(a_delta);
+            Tick(a_delta, a_afterRenderBoundary);
             if (g_available.load() != wasAvailable) {
                 SchedulePushContract();  // clone went live / was released -> tell AS3 (available:true/false)
             }
@@ -2451,41 +2935,62 @@ namespace PipOS
 
         void HookedRenderPrepassesAndMenus(RE::Interface3D::Renderer* a_renderer)
         {
-            if (a_renderer && g_pipboyOpen.load() && !g_failed.load()) {
-                // UI state is read only by a queued UI task. The renderer path consumes the resulting atomic,
-                // so character construction never waits for Scaleform's asynchronous CurrentPage property.
-                ScheduleInventoryPageProbe();
-                std::scoped_lock lock(g_sceneLock);
-                if (a_renderer == g_renderer && g_previewRoot &&
-                    a_renderer->offscreenElement.get() == g_previewRoot.get()) {
-                    // A paused Pip-Boy may not run the actor-update hook again after the first deferred clip
-                    // attempt. Queue a main-thread retry from each render boundary until the display quad attaches.
-                    if (!g_displayAttached) { QueueCapturePass(1.0f / 60.0f); }
-                    RefreshLivePlacement();
-                    if (auto* player = RE::PlayerCharacter::GetSingleton()) {
-                        const auto visualSignature = BuildVisualSignature(*player);
-                        if (visualSignature != g_sourceVisualSignature) {
-                            g_dirty.store(true);
-                            QueueCapturePass(1.0f / 60.0f);
-                        }
-                        const bool shouldDraw = ShouldDrawCharacter(*player);
-                        g_previewRoot->SetAppCulled(!shouldDraw);
-                        const bool renderAvailable = shouldDraw && g_inventoryPageActive.load() && g_displayAttached;
-                        const bool wasAvailable = g_available.exchange(renderAvailable);
-                        if (wasAvailable != renderAvailable) { SchedulePushContract(); }
+            ++g_renderHookDepth;
+            {
+                // Interface3D's original body performs deferred accumulation before it returns. Keep the scene
+                // mutex for that complete interval, not merely for our pre-pass updates: otherwise the main-thread
+                // close task can clear Offscreen_Set3D, release ModMenuRenderMesh, and drop the last NiPointer while
+                // BSBatchRenderer worker tasks still hold raw geometry/pass pointers. The recursive mutex is needed
+                // because this same thread can re-enter PIP-OS helpers during the original renderer call.
+                std::scoped_lock renderLifetimeLock(g_sceneLock);
+                if (a_renderer && g_pipboyOpen.load() && !g_failed.load()) {
+                    // UI state is read only by a queued UI task. The renderer path consumes the resulting atomic,
+                    // so character construction never waits for Scaleform's asynchronous CurrentPage property.
+                    ScheduleInventoryPageProbe();
+                    if (a_renderer == g_renderer && g_previewRoot &&
+                        a_renderer->offscreenElement.get() == g_previewRoot.get()) {
+                        // A paused Pip-Boy may not run the actor-update hook again after the first deferred clip
+                        // attempt. Queue a main-thread retry from each render boundary until the display quad attaches.
+                        if (!g_displayAttached) { QueueCapturePass(1.0f / 60.0f); }
+                        RefreshLivePlacement();
+                        if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                            const auto visualSignature = BuildVisualSignature(*player);
+                            if (visualSignature != g_sourceVisualSignature) {
+                                g_dirty.store(true);
+                                QueueCapturePass(1.0f / 60.0f);
+                            }
+                            const bool shouldDraw = ShouldDrawCharacter(*player);
+                            g_previewRoot->SetAppCulled(!shouldDraw);
+                            const bool renderAvailable = shouldDraw && g_inventoryPageActive.load() && g_displayAttached;
+                            const bool wasAvailable = g_available.exchange(renderAvailable);
+                            if (wasAvailable != renderAvailable) { SchedulePushContract(); }
 
-                        const auto* timer = RE::BSTimer::GetSingleton();
-                        if (shouldDraw) {
-                            CharacterAnimation::Update(
-                                *player, *g_previewRoot, timer ? timer->delta : (1.0f / 60.0f));
-                            ApplyTargetFollow(*g_previewRoot);
-                            SyncPreviewFacialExpression(*player);
+                            const auto* timer = RE::BSTimer::GetSingleton();
+                            if (shouldDraw) {
+                                CharacterAnimation::Update(
+                                    *player,
+                                    *g_previewRoot,
+                                    g_previewWeaponEquipped,
+                                    timer ? timer->delta : (1.0f / 60.0f));
+                                ApplyTargetFollow(*g_previewRoot);
+                                SyncPreviewFacialExpression(*player);
+                            }
                         }
                     }
                 }
-            }
 
-            if (g_origRenderPrepassesAndMenus) { g_origRenderPrepassesAndMenus(a_renderer); }
+                if (g_origRenderPrepassesAndMenus) { g_origRenderPrepassesAndMenus(a_renderer); }
+            }
+            --g_renderHookDepth;
+
+            // Convert a retry requested inside RunCaptureTask or while g_sceneLock was held into one future task
+            // only after the renderer has advanced and released the scene. This avoids both same-drain reentry
+            // and the F4SE-task-lock versus scene-lock inversion.
+            if (g_renderHookDepth == 0 &&
+                g_captureRetryRequested.exchange(false, std::memory_order_acq_rel) &&
+                g_pipboyOpen.load(std::memory_order_acquire) && !g_failed.load(std::memory_order_acquire)) {
+                QueueCapturePass(1.0f / 60.0f, true);
+            }
         }
 
         std::uint32_t HookedProcessGraphEvent(
@@ -2541,14 +3046,6 @@ namespace PipOS
             if (g_pipboyOpen.load()) { QueueCapturePass(1.0f / 60.0f); }
         }
 
-        void RequestEquipmentRebuild()
-        {
-            g_equipmentCandidateSignature = 0;
-            g_equipmentStablePasses = 0;
-            g_equipmentSettleRequested.store(true);
-            RequestVisualRebuild();
-        }
-
         void HookedUpdate3DModel(RE::AIProcess* a_process, RE::Actor* a_actor, bool a_queued)
         {
             if (g_origUpdate3DModel) { g_origUpdate3DModel(a_process, a_actor, a_queued); }
@@ -2568,8 +3065,18 @@ namespace PipOS
                 auto* player = RE::PlayerCharacter::GetSingleton();
                 if (!player || a_event.actor.get() != player) { return RE::BSEventNotifyControl::kContinue; }
                 auto* form = RE::TESForm::GetFormByID(a_event.baseObject);
-                if (form && form->Is(RE::ENUM_FORM_ID::kARMO, RE::ENUM_FORM_ID::kWEAP)) {
-                    RequestEquipmentRebuild();
+                if (form && form->Is(RE::ENUM_FORM_ID::kWEAP)) {
+                    EnqueuePendingEquipmentEvent(
+                        a_event.baseObject,
+                        0,
+                        a_event.equipped,
+                        PendingEquipmentKind::kWeapon);
+                } else if (auto* armor = form ? form->As<RE::TESObjectARMO>() : nullptr) {
+                    EnqueuePendingEquipmentEvent(
+                        a_event.baseObject,
+                        armor->bipedModelData.bipedObjectSlots,
+                        a_event.equipped,
+                        PendingEquipmentKind::kArmor);
                 }
                 return RE::BSEventNotifyControl::kContinue;
             }
@@ -2653,12 +3160,17 @@ namespace PipOS
 
         void ScheduleInventoryPageProbe()
         {
+            const auto sessionToken = g_menuSessionToken.load(std::memory_order_acquire);
             bool expected = false;
             if (!g_pageProbeInFlight.compare_exchange_strong(expected, true)) { return; }
             auto* task = F4SE::GetTaskInterface();
             if (!task) { g_pageProbeInFlight.store(false); return; }
-            task->AddUITask([]() {
+            task->AddUITask([sessionToken]() {
                 g_pageProbeInFlight.store(false);
+                if (!g_pipboyOpen.load(std::memory_order_acquire) ||
+                    g_menuSessionToken.load(std::memory_order_acquire) != sessionToken) {
+                    return;
+                }
                 auto* ui = RE::UI::GetSingleton();
                 auto menu = ui ? ui->GetMenu(RE::BSFixedString(kPipboyMenu.data())) : nullptr;
                 auto* view = menu ? menu->uiMovie.get() : nullptr;
@@ -2686,6 +3198,20 @@ namespace PipOS
                     inventory = static_cast<std::int32_t>(pageNumber) == 1;
                     source = "shell-dataobj";
                 }
+
+                Scaleform::GFx::Value hoverValue;
+                const bool hovered = view->GetVariable(
+                    std::addressof(hoverValue), "root1.PipOS_charHover") && hoverValue.IsBoolean() &&
+                    hoverValue.GetBoolean();
+                g_characterHovered.store(inventory && hovered);
+
+                Scaleform::GFx::Value yawValue;
+                if (view->GetVariable(std::addressof(yawValue), "root1.PipOS_charYawOffset") &&
+                    yawValue.IsNumber()) {
+                    const float newYaw = std::clamp(static_cast<float>(yawValue.GetNumber()), -720.0f, 720.0f);
+                    const float oldYaw = g_sessionYawOffset.exchange(newYaw);
+                    if (oldYaw != newYaw) { QueueCapturePass(1.0f / 60.0f); }
+                }
                 const bool previous = g_inventoryPageActive.exchange(inventory);
                 if (previous != inventory) {
                     logger::info("[PipOS][3D] page visibility changed: source={} CurrentPage={} inventory={}",
@@ -2704,25 +3230,61 @@ namespace PipOS
             {
                 if (a_event.menuName == kPipboyMenu.data()) {
                     if (a_event.opening) {
+                        g_menuSessionToken.fetch_add(1, std::memory_order_acq_rel);
                         g_pipboyOpen.store(true);
                         g_loggedTransientBipedPreview.store(false);
                         // Page state can be asynchronous, but it no longer gates preview construction. Start the
                         // live model offscreen until Scaleform positively identifies Inventory, avoiding a flash
                         // of the character when PIP-OS opens on STATUS, DATA, MAP, or RADIO.
                         g_inventoryPageActive.store(false);
+                        g_characterHovered.store(false);
+                        g_sessionYawOffset.store(0.0f);
+                        g_poseToggleRequests.store(0);
+                        g_captureRetryRequested.store(false, std::memory_order_release);
+                        g_captureTaskReentryLogged.store(false, std::memory_order_release);
+                        // Preserve equipment events that occurred after the prior close. They describe the live
+                        // gameplay transition that this open may be interrupting, and their exact-form gate keeps
+                        // an open-mid-equip snapshot from publishing before the requested biped state is complete.
+                        // The prior menu session's events were already cleared synchronously on its close.
+                        ResetEquipmentSettleCandidate();
+                        CharacterAnimation::ResetSessionPose();
                         g_dirty.store(true);  // rebuild with the equipment worn at this open
                         // Initial push (available:false until the clone actually builds in RunCaptureTask,
                         // which re-pushes available:true on the transition). Keeps absent-member -> fallback.
                         SchedulePushContract();
                         ScheduleInventoryPageProbe();
                     } else {
+                        const auto closeToken = g_menuSessionToken.fetch_add(1, std::memory_order_acq_rel) + 1;
                         g_pipboyOpen.store(false);
                         g_inventoryPageActive.store(false);
+                        g_characterHovered.store(false);
+                        g_sessionYawOffset.store(0.0f);
+                        g_poseToggleRequests.store(0);
+                        g_captureRetryRequested.store(false, std::memory_order_release);
+                        // Cancel every rebuild intent before the queued teardown. A capture task already queued
+                        // by the old session is generation-guarded above; these clears prevent a later reopen
+                        // from inheriting an obsolete FOV or equipment request.
+                        g_rendererRecreateRequested.store(false);
+                        ClearPendingEquipmentEvents();
+                        ResetEquipmentSettleCandidate();
+                        g_dirty.store(false);
+                        CharacterAnimation::ResetSessionPose();
                         // Teardown must be single-threaded like the build: run HideAndRelease on the main
                         // thread via AddTask (renderer Disable / Offscreen_Set3D(nullptr) / NiPointer release
                         // are all D3D/scene lifecycle). Then re-push the contract (now available:false).
                         if (auto* task = F4SE::GetTaskInterface()) {
-                            task->AddTask([]() {
+                            task->AddTask([closeToken]() {
+                                // A new open can be delivered before F4SE drains this task. In that case all
+                                // scene state now belongs to the newer session and this close is stale.
+                                if (g_pipboyOpen.load(std::memory_order_acquire) ||
+                                    g_menuSessionToken.load(std::memory_order_acquire) != closeToken) {
+                                    logger::info(
+                                        "[PipOS][3D] skipped stale menu-close teardown: closeToken={} currentToken={} open={}",
+                                        closeToken,
+                                        g_menuSessionToken.load(std::memory_order_relaxed),
+                                        g_pipboyOpen.load(std::memory_order_relaxed));
+                                    return;
+                                }
                                 HideAndRelease();
                                 SchedulePushContract();
                             });
@@ -2801,5 +3363,16 @@ namespace PipOS
     bool CharacterCapture::IsCaptureAvailable()
     {
         return g_available.load();
+    }
+
+    bool CharacterCapture::TryHandleCharacterRightClick()
+    {
+        if (!g_pipboyOpen.load() || !g_inventoryPageActive.load() || !g_characterHovered.load()) {
+            return false;
+        }
+        g_poseToggleRequests.fetch_add(1);
+        QueueCapturePass(1.0f / 60.0f);
+        logger::info("[PipOS][3D] character right-click accepted; queued Ready/Sighted session toggle");
+        return true;
     }
 }

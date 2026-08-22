@@ -4,6 +4,9 @@
 #include "Settings.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -12,13 +15,254 @@ namespace PipOS::CharacterAnimation
 {
     namespace
     {
+        // -1 uses the persisted Menu Framework choice. Ready (0) and Sighted (1) are menu-session overrides.
+        std::atomic<int> g_sessionIdleState{ -1 };
+
         constexpr std::size_t kGraphSize = 0x3D0;
         constexpr std::size_t kGraphAlignment = 0x10;
+
+        bool g_privateWeaponBridgeLogged{ false };
+        bool g_privateWeaponBridgeFailureLogged{ false };
 
         using Holder = RE::IAnimationGraphManagerHolder;
         using Graph = RE::BShkbAnimationGraph;
         using Manager = RE::BSAnimationGraphManager;
         using SubgraphArena = RE::BSTObjectArena<RE::BSFixedString, RE::BSTObjectArenaScrapAlloc, 32>;
+
+        struct PrivateWeaponBridgeResult
+        {
+            RE::NiNode* wrapper{ nullptr };
+            RE::NiNode* hand{ nullptr };
+            RE::BSFlattenedBoneTree::FlattenedBone* weaponBone{ nullptr };
+            RE::BSFlattenedBoneTree::FlattenedBone* handBone{ nullptr };
+            RE::NiTransform wrapperBefore{};
+            bool copiedGraphLocal{ false };
+        };
+
+        void ForEachPreviewObject(
+            RE::NiAVObject* a_object,
+            const std::function<void(RE::NiAVObject&)>& a_visitor)
+        {
+            if (!a_object) { return; }
+            a_visitor(*a_object);
+            if (auto* node = a_object->IsNode()) {
+                for (auto& child : node->children) {
+                    if (child) { ForEachPreviewObject(child.get(), a_visitor); }
+                }
+            }
+        }
+
+        RE::BSFlattenedBoneTree* FindPreviewFlattenedBoneTree(RE::NiAVObject* a_root)
+        {
+            if (!a_root) { return nullptr; }
+            if (auto* flattened = netimmerse_cast<RE::BSFlattenedBoneTree*>(a_root)) { return flattened; }
+            auto* node = a_root->IsNode();
+            if (!node) { return nullptr; }
+            for (auto& child : node->children) {
+                if (child) {
+                    if (auto* flattened = FindPreviewFlattenedBoneTree(child.get())) { return flattened; }
+                }
+            }
+            return nullptr;
+        }
+
+        RE::BSFlattenedBoneTree::FlattenedBone* FindPreviewFlattenedBone(
+            RE::BSFlattenedBoneTree& a_tree,
+            const std::string_view a_name)
+        {
+            if (!a_tree.bone || a_tree.boneCount <= 0 || a_tree.boneCount > 1024) { return nullptr; }
+            for (std::int32_t index = 0; index < a_tree.boneCount; ++index) {
+                auto& bone = a_tree.bone[index];
+                const char* name = bone.name.c_str();
+                if (name && a_name == name) { return std::addressof(bone); }
+            }
+            return nullptr;
+        }
+
+        RE::NiNode* FindDirectPreviewChild(RE::NiNode& a_parent, const std::string_view a_name)
+        {
+            for (auto& child : a_parent.children) {
+                if (!child) { continue; }
+                const char* name = child->GetName().c_str();
+                if (name && a_name == name) { return child->IsNode(); }
+            }
+            return nullptr;
+        }
+
+        bool IsFinitePrivateTransform(const RE::NiTransform& a_transform)
+        {
+            float pitch = 0.0f;
+            float roll = 0.0f;
+            float yaw = 0.0f;
+            a_transform.rotate.ToEulerAnglesXYZ(pitch, roll, yaw);
+            return std::isfinite(a_transform.translate.x) &&
+                std::isfinite(a_transform.translate.y) &&
+                std::isfinite(a_transform.translate.z) &&
+                std::isfinite(a_transform.scale) && a_transform.scale > 0.0001f &&
+                std::isfinite(pitch) && std::isfinite(roll) && std::isfinite(yaw);
+        }
+
+        void LogPrivateWeaponBridgeFailure(const std::string_view a_reason)
+        {
+            if (g_privateWeaponBridgeFailureLogged) { return; }
+            g_privateWeaponBridgeFailureLogged = true;
+            logger::error(std::format("[PipOS][3D][ANIM] private Weapon bridge unavailable: {}", a_reason));
+        }
+
+        PrivateWeaponBridgeResult ApplyPrivateWeaponTransformBridge(RE::NiAVObject& a_previewRoot)
+        {
+            PrivateWeaponBridgeResult result;
+            auto* flattened = FindPreviewFlattenedBoneTree(std::addressof(a_previewRoot));
+            if (!flattened) {
+                LogPrivateWeaponBridgeFailure("preview flattened skeleton is missing");
+                return result;
+            }
+
+            result.weaponBone = FindPreviewFlattenedBone(*flattened, "Weapon");
+            if (!result.weaponBone) {
+                LogPrivateWeaponBridgeFailure("flattened Weapon bone is missing");
+                return result;
+            }
+            if (result.weaponBone->parent < 0 || result.weaponBone->parent >= flattened->boneCount) {
+                LogPrivateWeaponBridgeFailure("flattened Weapon parent index is invalid");
+                return result;
+            }
+            result.handBone = std::addressof(flattened->bone[result.weaponBone->parent]);
+            const char* handBoneName = result.handBone->name.c_str();
+            if (!handBoneName || std::string_view(handBoneName) != "RArm_Hand") {
+                LogPrivateWeaponBridgeFailure("flattened Weapon parent is not RArm_Hand");
+                return result;
+            }
+
+            result.hand = result.handBone->node ? result.handBone->node->IsNode() : nullptr;
+            if (!result.hand) {
+                auto* handObject = a_previewRoot.GetObjectByName(RE::BSFixedString("RArm_Hand"));
+                result.hand = handObject ? handObject->IsNode() : nullptr;
+            }
+            if (!result.hand) {
+                LogPrivateWeaponBridgeFailure("ordinary RArm_Hand node is missing");
+                return result;
+            }
+
+            result.wrapper = FindDirectPreviewChild(*result.hand, "Weapon");
+            if (!result.wrapper) {
+                LogPrivateWeaponBridgeFailure("ordinary Weapon wrapper beneath RArm_Hand is missing");
+                return result;
+            }
+            if (result.weaponBone->node && result.weaponBone->node.get() != result.wrapper) {
+                LogPrivateWeaponBridgeFailure("flattened Weapon node points to a different object");
+                result.wrapper = nullptr;
+                return result;
+            }
+            if (!IsFinitePrivateTransform(result.weaponBone->local)) {
+                LogPrivateWeaponBridgeFailure("private graph produced a non-finite Weapon local");
+                result.wrapper = nullptr;
+                return result;
+            }
+
+            result.wrapperBefore = result.wrapper->GetLocalTransform();
+            // Both transforms are relative to RArm_Hand, so publish only the graph-owned local to the ordinary
+            // wrapper. This assignment is also idempotent if a future skeleton maps the flattened bone directly
+            // to the same wrapper. The complete weapon clone remains an unchanged child beneath this wrapper.
+            result.wrapper->SetLocalTransform(result.weaponBone->local);
+            result.copiedGraphLocal = true;
+            return result;
+        }
+
+        void LogPrivateWeaponBridgeAudit(const PrivateWeaponBridgeResult& a_result)
+        {
+            if (g_privateWeaponBridgeLogged || !a_result.wrapper || !a_result.hand ||
+                !a_result.weaponBone || !a_result.handBone) {
+                return;
+            }
+            g_privateWeaponBridgeLogged = true;
+
+            std::uint32_t objectCount = 0;
+            std::uint32_t geometryCount = 0;
+            std::uint32_t culledObjectCount = 0;
+            std::uint32_t culledGeometryCount = 0;
+            std::uint32_t zeroFadeCount = 0;
+            std::uint32_t transparentShaderCount = 0;
+            ForEachPreviewObject(a_result.wrapper, [&](RE::NiAVObject& a_object) {
+                ++objectCount;
+                if (a_object.GetAppCulled()) { ++culledObjectCount; }
+                if (a_object.fadeAmount <= 0.0f) { ++zeroFadeCount; }
+                auto* geometry = a_object.IsGeometry();
+                if (!geometry) { return; }
+                ++geometryCount;
+                if (geometry->GetAppCulled()) { ++culledGeometryCount; }
+                for (auto& property : geometry->properties) {
+                    if (auto* shader = netimmerse_cast<RE::BSShaderProperty*>(property.get());
+                        shader && shader->alpha <= 0.0f) {
+                        ++transparentShaderCount;
+                    }
+                }
+            });
+
+            const auto wrapperAfter = a_result.wrapper->GetLocalTransform();
+            float beforePitch = 0.0f;
+            float beforeRoll = 0.0f;
+            float beforeYaw = 0.0f;
+            float graphPitch = 0.0f;
+            float graphRoll = 0.0f;
+            float graphYaw = 0.0f;
+            a_result.wrapperBefore.rotate.ToEulerAnglesXYZ(beforePitch, beforeRoll, beforeYaw);
+            a_result.weaponBone->local.rotate.ToEulerAnglesXYZ(graphPitch, graphRoll, graphYaw);
+            constexpr float kRadiansToDegrees = 57.2957795f;
+            logger::info(
+                "[PipOS][3D][ANIM] private Weapon bridge active: flattenedNode={} handNodeMatches={} copiedGraphLocal={} before=({:.2f},{:.2f},{:.2f}; {:.1f},{:.1f},{:.1f}; s={:.3f}) graphLocal=({:.2f},{:.2f},{:.2f}; {:.1f},{:.1f},{:.1f}; s={:.3f}) after=({:.2f},{:.2f},{:.2f})",
+                a_result.weaponBone->node != nullptr,
+                a_result.handBone->node.get() == a_result.hand,
+                a_result.copiedGraphLocal,
+                a_result.wrapperBefore.translate.x,
+                a_result.wrapperBefore.translate.y,
+                a_result.wrapperBefore.translate.z,
+                beforePitch * kRadiansToDegrees,
+                beforeRoll * kRadiansToDegrees,
+                beforeYaw * kRadiansToDegrees,
+                a_result.wrapperBefore.scale,
+                a_result.weaponBone->local.translate.x,
+                a_result.weaponBone->local.translate.y,
+                a_result.weaponBone->local.translate.z,
+                graphPitch * kRadiansToDegrees,
+                graphRoll * kRadiansToDegrees,
+                graphYaw * kRadiansToDegrees,
+                a_result.weaponBone->local.scale,
+                wrapperAfter.translate.x,
+                wrapperAfter.translate.y,
+                wrapperAfter.translate.z);
+
+            const auto& wrapperWorld = a_result.wrapper->GetWorldTransform();
+            const auto& handWorld = a_result.hand->GetWorldTransform();
+            auto* settings = Settings::GetSingleton();
+            logger::info(
+                "[PipOS][3D][ANIM] private Weapon draw audit: objects={} geometries={} culledObjects={} culledGeometries={} zeroFade={} transparentShaders={} wrapperCulled={} hideSetting={} sheatheSetting={} graphHandWorld=({:.2f},{:.2f},{:.2f}) ordinaryHandWorld=({:.2f},{:.2f},{:.2f}) graphWeaponWorld=({:.2f},{:.2f},{:.2f}) wrapperWorld=({:.2f},{:.2f},{:.2f}) bound=({:.2f},{:.2f},{:.2f}; r={:.2f})",
+                objectCount,
+                geometryCount,
+                culledObjectCount,
+                culledGeometryCount,
+                zeroFadeCount,
+                transparentShaderCount,
+                a_result.wrapper->GetAppCulled(),
+                settings ? settings->Char3DHideWeaponIdle() : false,
+                settings ? settings->Char3DSheatheWeaponIdle() : false,
+                a_result.handBone->world.translate.x,
+                a_result.handBone->world.translate.y,
+                a_result.handBone->world.translate.z,
+                handWorld.translate.x,
+                handWorld.translate.y,
+                handWorld.translate.z,
+                a_result.weaponBone->world.translate.x,
+                a_result.weaponBone->world.translate.y,
+                a_result.weaponBone->world.translate.z,
+                wrapperWorld.translate.x,
+                wrapperWorld.translate.y,
+                wrapperWorld.translate.z,
+                a_result.wrapper->worldBound.center.x,
+                a_result.wrapper->worldBound.center.y,
+                a_result.wrapper->worldBound.center.z,
+                a_result.wrapper->worldBound.fRadius);
+        }
 
         struct HkbBehaviorGraphDiagnostic
         {
@@ -92,10 +336,7 @@ namespace PipOS::CharacterAnimation
             "attackStop", "attackStateEnter", "attackStateExit", "attackInterrupt", "AttackEnd",
             "reloadStart", "reloadStateEnter", "reloadStateExit", "reloadReserveStart", "meleeattackStart",
             "meleeattackSprintStart", "meleeAttackGun", "blockStart", "grenadeThrowStart", "mineThrowStart",
-            "weapEquip", "weapUnequip", "Unequip", "weaponDraw", "weaponSheathe", "BeginWeaponDraw",
-            "BeginWeaponSheathe", "weaponAttach", "weaponDetach", "rifleSightedStart", "rifleSightedEnd",
-            "rifleSightedStartOver", "sightedStateEnter", "sightedStateExit", "UpdateSighted", "SyncLeft",
-            "SyncRight", "SyncCycleEnd", "syncIdleStart", "syncIdleStop"
+            "SyncLeft", "SyncRight", "SyncCycleEnd"
         });
 
         template <std::size_t N>
@@ -127,16 +368,20 @@ namespace PipOS::CharacterAnimation
                 return settings->Char3DMirrorThrowable();
             }
             if (lower.find("attack") != std::string::npos) { return settings->Char3DMirrorWeaponFire(); }
-            return true; // draw/sheathe, ready-state, sighted, and synchronization lifecycle events
+            return true; // remaining private-graph synchronization events
         }
 
         class PreviewHolder final : public Holder
         {
         public:
-            PreviewHolder(RE::PlayerCharacter& a_player, RE::NiAVObject& a_target) :
+            PreviewHolder(
+                RE::PlayerCharacter& a_player,
+                RE::NiAVObject& a_target,
+                const bool a_weaponEquipped) :
                 sourceActor_(std::addressof(a_player)),
                 sourceHolder_(static_cast<Holder*>(std::addressof(a_player))),
-                target_(std::addressof(a_target))
+                target_(std::addressof(a_target)),
+                weaponEquipped_(a_weaponEquipped)
             {}
 
             ~PreviewHolder() override { manager_.reset(); }
@@ -284,33 +529,6 @@ namespace PipOS::CharacterAnimation
                 }
             }
 
-            std::uint64_t SourceIntentSignature() const
-            {
-                auto* middleHigh = sourceActor_ && sourceActor_->currentProcess ?
-                    sourceActor_->currentProcess->middleHigh : nullptr;
-                if (!middleHigh) { return 0; }
-                std::uint64_t hash = 1469598103934665603ull;
-                const auto mix = [&](const auto& ids) {
-                    for (const auto& id : ids) {
-                        hash ^= id.identifier;
-                        hash *= 1099511628211ull;
-                    }
-                };
-                const auto& defaults = middleHigh->requestedDefaultSubGraphID.empty() ?
-                    middleHigh->currentDefaultSubGraphID : middleHigh->requestedDefaultSubGraphID;
-                const auto& weapons = middleHigh->requestedWeaponSubGraphID.empty() ?
-                    middleHigh->currentWeaponSubGraphID : middleHigh->requestedWeaponSubGraphID;
-                mix(defaults);
-                mix(weapons);
-                return hash;
-            }
-
-            bool NeedsSubgraphReconcile() const
-            {
-                const auto current = SourceIntentSignature();
-                return current != 0 && sourceIntentSignature_ != 0 && current != sourceIntentSignature_;
-            }
-
             bool Create(const char* a_project)
             {
                 if (!a_project || !g_createManager(this, a_project) || !manager_) {
@@ -336,7 +554,6 @@ namespace PipOS::CharacterAnimation
                     logger::error("[PipOS][3D][ANIM] ActivateAnimationGraphManager failed");
                     return false;
                 }
-                sourceIntentSignature_ = SourceIntentSignature();
                 return true;
             }
 
@@ -451,6 +668,14 @@ namespace PipOS::CharacterAnimation
                 }
             }
 
+            [[nodiscard]] int EffectiveIdleState() const
+            {
+                const int sessionState = g_sessionIdleState.load();
+                if (sessionState >= 0) { return sessionState; }
+                auto* settings = Settings::GetSingleton();
+                return settings ? settings->Char3DIdleState() : 0;
+            }
+
             void Update(float a_delta)
             {
                 if (!manager_) { return; }
@@ -467,8 +692,8 @@ namespace PipOS::CharacterAnimation
                     logger::info("[PipOS][3D][ANIM] private state machine pre-rolled into idleState={}",
                         settings->Char3DIdleState());
                 }
-                if (initialized_ && (settings->Char3DIdleState() != appliedIdleState_ ||
-                                        HasEquippedWeapon() != appliedWeaponEquipped_)) {
+                if (initialized_ && (EffectiveIdleState() != appliedIdleState_ ||
+                                         HasEquippedWeapon() != appliedWeaponEquipped_)) {
                     // Use the instant base-state entry and fully settle Ready/Sighted before the next visible
                     // renderer pass. The target idle clip then continues normally from its settled loop.
                     ApplyConfiguredIdleState(true);
@@ -514,9 +739,9 @@ namespace PipOS::CharacterAnimation
             {
                 auto* settings = Settings::GetSingleton();
                 if (!settings) { return; }
-                const int state = settings->Char3DIdleState();
+                const int state = EffectiveIdleState();
                 const bool weaponEquipped = HasEquippedWeapon();
-                if (!a_instant && appliedIdleState_ == settings->Char3DIdleState() &&
+                if (!a_instant && appliedIdleState_ == state &&
                     appliedWeaponEquipped_ == weaponEquipped) {
                     return;
                 }
@@ -533,7 +758,7 @@ namespace PipOS::CharacterAnimation
                 if (weaponEquipped) {
                     ApplyConfiguredWeaponPoseEvents();
                 }
-                appliedIdleState_ = settings->Char3DIdleState();
+                appliedIdleState_ = state;
                 resolvedIdleState_ = state;
                 appliedWeaponEquipped_ = weaponEquipped;
                 logger::info("[PipOS][3D][ANIM] idle state applied: configured={} weaponEquipped={} pose='{}' accepted={}",
@@ -546,7 +771,7 @@ namespace PipOS::CharacterAnimation
                 auto* settings = Settings::GetSingleton();
                 if (!settings || !HasEquippedWeapon()) { return; }
                 (void)NotifyAnimationGraphImpl(RE::BSFixedString("weapEquip"));
-                if (settings->Char3DIdleState() == 1) {
+                if (EffectiveIdleState() == 1) {
                     (void)NotifyAnimationGraphImpl(RE::BSFixedString("rifleSightedStart"));
                     (void)NotifyAnimationGraphImpl(RE::BSFixedString("sightedStateEnter"));
                     (void)NotifyAnimationGraphImpl(RE::BSFixedString("UpdateSighted"));
@@ -556,16 +781,24 @@ namespace PipOS::CharacterAnimation
                 }
             }
 
+            void ApplySessionPoseTransition()
+            {
+                if (!initialized_ || !HasEquippedWeapon()) { return; }
+                // Session right-clicks intentionally retain the ordinary Ready/Sighted behavior blend.
+                // Persisted setting changes continue to use the separate fast-forward path in Update().
+                ApplyConfiguredWeaponPoseEvents();
+                appliedIdleState_ = EffectiveIdleState();
+                appliedWeaponEquipped_ = true;
+                ApplyWeaponIdleVisibility();
+                logger::info("[PipOS][3D][ANIM] session pose transition requested: pose='{}'",
+                    appliedIdleState_ == 1 ? "sighted" : "ready");
+            }
+
             [[nodiscard]] bool HasEquippedWeapon() const
             {
-                const auto& biped = sourceActor_ ? sourceActor_->GetBiped(false) : nullptr;
-                if (!biped) { return false; }
-                for (std::int32_t slot = 32; slot <= 43; ++slot) {
-                    if (slot == 40) { continue; }
-                    const auto* form = biped->object[slot].parent.object;
-                    if (form && form->Is(RE::ENUM_FORM_ID::kWEAP)) { return true; }
-                }
-                return false;
+                // Equipment ownership is captured with the private preview generation. Do not let a gameplay
+                // draw/holster/equip transition change the menu graph before that generation is rebuilt.
+                return weaponEquipped_;
             }
 
             void ApplyWeaponIdleVisibility()
@@ -588,7 +821,7 @@ namespace PipOS::CharacterAnimation
                     SetGraphVariableInt(RE::BSFixedString("iSyncWeaponDrawState"), 0);
                     SetGraphVariableInt(RE::BSFixedString("iSyncGunDown"), 0);
                     SetGraphVariableInt(RE::BSFixedString("iSyncReadyAlertRelaxed"), 2);
-                    const bool sighted = settings->Char3DIdleState() == 1;
+                    const bool sighted = EffectiveIdleState() == 1;
                     SetGraphVariableInt(RE::BSFixedString("iSyncSightedState"), sighted ? 1 : 0);
                     // TF3DHUD keeps aim IK disabled in a stationary preview and selects the sighted branch via
                     // iSyncSightedState/events. Enabling live aim without an aim target can pull the hands away
@@ -604,10 +837,10 @@ namespace PipOS::CharacterAnimation
             RE::PlayerCharacter* sourceActor_{ nullptr };
             Holder* sourceHolder_{ nullptr };
             RE::NiAVObject* target_{ nullptr };
+            bool weaponEquipped_{ false };
             RE::BSTSmartPointer<Manager> manager_;
             std::vector<RE::SubgraphHandle> subgraphHandles_;
             std::int32_t subgraphPriority_{ 0 };
-            std::uint64_t sourceIntentSignature_{ 0 };
             int appliedIdleState_{ -1 };
             int resolvedIdleState_{ -1 };
             bool appliedWeaponEquipped_{ false };
@@ -647,11 +880,13 @@ namespace PipOS::CharacterAnimation
             }
         }
 
-        bool Ensure(RE::PlayerCharacter& a_player, RE::NiAVObject& a_target)
+        bool Ensure(
+            RE::PlayerCharacter& a_player,
+            RE::NiAVObject& a_target,
+            const bool a_weaponEquipped)
         {
             if (g_holder && g_source == std::addressof(a_player) && g_target == std::addressof(a_target)) {
-                if (!g_holder->NeedsSubgraphReconcile()) { return true; }
-                logger::info("[PipOS][3D][ANIM] source subgraph intent changed; rebuilding private manager");
+                return true;
             }
             g_holder.reset();
             g_source = nullptr;
@@ -665,7 +900,7 @@ namespace PipOS::CharacterAnimation
                 logger::error("[PipOS][3D][ANIM] live actor behavior project unavailable");
                 return false;
             }
-            auto holder = std::make_unique<PreviewHolder>(a_player, a_target);
+            auto holder = std::make_unique<PreviewHolder>(a_player, a_target, a_weaponEquipped);
             if (!holder->Create(project)) {
                 logger::error(std::format("[PipOS][3D][ANIM] private graph creation failed for '{}'", project));
                 g_failedTarget = std::addressof(a_target);
@@ -682,14 +917,21 @@ namespace PipOS::CharacterAnimation
         }
     }
 
-    void Update(RE::PlayerCharacter& a_player, RE::NiAVObject& a_previewRoot, float a_deltaTime)
+    void Update(
+        RE::PlayerCharacter& a_player,
+        RE::NiAVObject& a_previewRoot,
+        const bool a_weaponEquipped,
+        float a_deltaTime)
     {
         std::scoped_lock lock(g_lock);
-        if (!Ensure(a_player, a_previewRoot) || !g_holder) { return; }
+        if (!Ensure(a_player, a_previewRoot, a_weaponEquipped) || !g_holder) { return; }
         DrainPendingRequests();
         g_holder->Update(a_deltaTime);
+        const auto weaponBridge = a_weaponEquipped ?
+            ApplyPrivateWeaponTransformBridge(a_previewRoot) : PrivateWeaponBridgeResult{};
         RE::NiUpdateData updateData;
         a_previewRoot.Update(updateData);
+        if (a_weaponEquipped) { LogPrivateWeaponBridgeAudit(weaponBridge); }
     }
 
     void ObserveGraphRequest(
@@ -705,6 +947,21 @@ namespace PipOS::CharacterAnimation
         g_pendingRequests.push_back({ a_manager, RE::BSFixedString(a_eventName), a_result });
     }
 
+    void ToggleReadySighted()
+    {
+        std::scoped_lock lock(g_lock);
+        const int sessionState = g_sessionIdleState.load();
+        auto* settings = Settings::GetSingleton();
+        const int current = sessionState >= 0 ? sessionState : (settings ? settings->Char3DIdleState() : 0);
+        g_sessionIdleState.store(current == 1 ? 0 : 1);
+        if (g_holder) { g_holder->ApplySessionPoseTransition(); }
+    }
+
+    void ResetSessionPose()
+    {
+        g_sessionIdleState.store(-1);
+    }
+
     void Reset()
     {
         std::scoped_lock lock(g_lock);
@@ -713,6 +970,8 @@ namespace PipOS::CharacterAnimation
         g_source = nullptr;
         g_failedTarget = nullptr;
         g_retryAfter = {};
+        g_privateWeaponBridgeLogged = false;
+        g_privateWeaponBridgeFailureLogged = false;
         std::scoped_lock pendingLock(g_pendingLock);
         g_pendingRequests.clear();
     }

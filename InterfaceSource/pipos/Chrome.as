@@ -420,9 +420,18 @@ package pipos
          this.buildPower();
 
          this.paintTabs(this._lastPage);   // initial draw (all inactive until first tick reads CurrentPage)
+         // The engine-owned map uses its own centered viewport rather than the generic content grid. Keep the
+         // theme overlay tight to that live viewport so it reads as the map's bezel instead of a page-wide box.
+         // Filled edges avoid the retained GFx line-pen artifacts that affected stroked frames elsewhere.
          var mapG:Graphics = this._mapFrame.graphics;
-         Theme.frameRect(mapG, Theme.CX, Theme.BY, Theme.CW, Theme.BB - Theme.BY, Theme.PHOS, 0.72, 0.55);
-         Theme.brackets(mapG, Theme.CX, Theme.BY, Theme.CW, Theme.BB - Theme.BY, 18, Theme.PHOS_BRIGHT, 0.75);
+         var mapX:Number = Theme.mx(301);
+         var mapY:Number = Theme.my(61);
+         // Inset the overlay two authored pixels from the viewport bounds. The prior outside frame remained
+         // visibly larger than the rounded vanilla plate at runtime.
+         var mapW:Number = Theme.ms(998);
+         var mapH:Number = Theme.ms(698);
+         Theme.frameRect(mapG, mapX, mapY, mapW, mapH, Theme.PHOS_BRIGHT, 0.92, 3);
+         Theme.brackets(mapG, mapX, mapY, mapW, mapH, Theme.ms(22), Theme.PHOS_BRIGHT, 0.95);
          if (this._dbg != null) { this._dbg.mark("built"); }
       }
 

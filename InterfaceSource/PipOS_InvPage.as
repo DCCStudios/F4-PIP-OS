@@ -42,8 +42,13 @@ package
       private var _subtabs:Sprite;
       private var _equip:Sprite;
       private var _char:Sprite;
+      private var _charHit:Sprite;
       private var _vb:VaultBoy;
       private var _charCap:TextField;      // 0.0.60: figure-slot caption ("LIVE CAPTURE" only when 3D active)
+      private var _charDragging:Boolean = false;
+      private var _charDragStartX:Number = 0;
+      private var _charDragStartYaw:Number = 0;
+      private var _charYawOffset:Number = 0;
       private var _list:PipList;
       private var _card:Sprite;
       private var _cardBg:Sprite;   // item-card border/background, faded with its contents during list expansion
@@ -266,6 +271,10 @@ package
          // ITEM CARD owns a separate graphics layer so expand/collapse can fade the whole window, including
          // its border, without redrawing the shared chrome Graphics object.
          this._cardBg = new Sprite(); addChild(this._cardBg);
+         var cardG:* = this._cardBg.graphics;
+         cardG.beginFill(Theme.PANEL, 0.88);
+         cardG.drawRoundRect(this.LX, cardTop, this.LW, Theme.BB - cardTop, Theme.ms(8), Theme.ms(8));
+         cardG.endFill();
          Theme.panel(this._cardBg.graphics, this.LX, cardTop, this.LW, Theme.BB - cardTop);
          this._panels.push({ x:this.LX, y:cardTop, w:this.LW, h:Theme.BB - cardTop });
          this._wIcon = new Sprite(); addChild(this._wIcon);
@@ -277,6 +286,14 @@ package
          try { this._vb = new VaultBoy(400); this._vb.x = this.CCW / 2; this._vb.y = 34; this._char.addChild(this._vb); } catch (e:Error) { this._vb = null; }
          var cg:* = this._char.graphics;
          cg.beginFill(Theme.PHOS, 0.10); cg.drawEllipse(this.CCW / 2 - 55, gh - 118, 110, 18); cg.endFill();
+         // Interaction ends above QUICK ACCESS so the favorite boxes keep their original hit targets.
+         // A nearly transparent fill is still a real GFx hit surface without introducing visible artwork.
+         this._charHit = new Sprite();
+         this._charHit.graphics.beginFill(0x000000, 0.004);
+         this._charHit.graphics.drawRect(0, 0, this.CCW, gh - 84);
+         this._charHit.graphics.endFill();
+         this._charHit.addEventListener(MouseEvent.MOUSE_DOWN, this.onCharMouseDown);
+         this._char.addChild(this._charHit);
          this._quick = new Sprite(); this._quick.x = this.CCX; this._quick.y = Theme.BB - 84; addChild(this._quick);
          // List panel background in its own sprite (below rows + headers) so expand redraws only this.
          this._listBg = new Sprite(); addChild(this._listBg); this.drawListBg(this._listH);
@@ -398,7 +415,7 @@ package
          // 0.0.60: equip-change PULSE layer -- a short bright bar at each row's left edge that flares when that
          // slot's item changes (live feedback for equipping from the list). Graphics-only; faded in onCharPoll.
          this._eqPulseLayer = new Shape(); this._equip.addChild(this._eqPulseLayer);
-         this._charCap = Theme.mk(this._char, 9, Theme.PHOS_DIM, false, "center"); this._charCap.autoSize = "none"; this._charCap.width = this.CCW - 2 * P; this._charCap.multiline = true; this._charCap.wordWrap = true; this._charCap.x = P; this._charCap.y = gh - 150; Theme.setText(this._charCap, "");   // 0.0.60: caption managed by onCharPoll ("LIVE CAPTURE" only when the 3D figure is live)
+         this._charCap = Theme.mk(this._char, 9, Theme.PHOS_DIM, false, "center"); this._charCap.autoSize = "none"; this._charCap.width = this.CCW - 2 * P; this._charCap.multiline = true; this._charCap.wordWrap = true; this._charCap.x = P; this._charCap.y = gh - 136; Theme.setText(this._charCap, "");   // 0.0.110: caption moved 14px down; onCharPoll supplies "LIVE CAPTURE" only while the 3D figure is live
          // Parity #qa: the QUICK ACCESS label sits BELOW the icon-box row (mockup order = slots then label). Boxes
          // live in _quick (top at Theme.BB - 84, height 44 -> bottom Theme.BB - 40); the label sits ~6px under them.
          var ql:TextField = Theme.mk(this, 10, Theme.PHOS_DIM, true, "center"); ql.autoSize = "none"; ql.width = this.CCW; ql.x = this.CCX; ql.y = Theme.BB - 34; var qf:* = ql.defaultTextFormat; qf.letterSpacing = 1.6; ql.defaultTextFormat = qf; Theme.setText(ql, "QUICK ACCESS");
@@ -1705,6 +1722,11 @@ package
          else { bottom = TIP_PAD + 30; }
          this._tipH = bottom + TIP_PAD;
          var g:* = this._tip.graphics; g.clear();
+         // The hover popup needs an opaque-enough field of its own; the shared Theme.panel helper deliberately
+         // draws only its frame/hit region so it cannot hide content on the permanent page panels.
+         g.beginFill(Theme.PANEL, 0.94);
+         g.drawRoundRect(0, 0, TIP_W, this._tipH, Theme.ms(7), Theme.ms(7));
+         g.endFill();
          Theme.panel(g, 0, 0, TIP_W, this._tipH, 0.5);
       }
       // Reposition the Sprite CONTAINER by .x/.y (allowed -- moving a Sprite never reformats text). Clamped to the
@@ -1720,8 +1742,43 @@ package
          if (oy < minY) { oy = minY; } if (oy > maxY) { oy = maxY; }
          this._tip.x = ox; this._tip.y = oy;
       }
-      // Cursor follow: reposition only while visible (cheap; Sprite .x/.y move).
-      private function onMouseMove(e:MouseEvent):void { if (this._tip != null && this._tip.visible) { this.positionTip(); } }
+      // Cursor follow plus session-only figure yaw. The drag publishes an offset, never the persisted setting.
+      private function onMouseMove(e:MouseEvent):void
+      {
+         if (this._tip != null && this._tip.visible) { this.positionTip(); }
+         if (this._charDragging) {
+            this._charYawOffset = this._charDragStartYaw - (e.stageX - this._charDragStartX) * 0.5;
+            this.publishCharacterInteraction();
+         }
+      }
+
+      private function onCharMouseDown(e:MouseEvent):void
+      {
+         if (!this._char3dOn) { return; }
+         this._charDragging = true;
+         this._charDragStartX = e.stageX;
+         this._charDragStartYaw = this._charYawOffset;
+         e.stopPropagation();
+      }
+
+      private function onCharMouseUp(e:MouseEvent):void
+      {
+         this._charDragging = false;
+      }
+
+      private function publishCharacterInteraction():void
+      {
+         try {
+            var rr:* = this._rrPoll;
+            if (rr == null) { return; }
+            var hovered:Boolean = false;
+            if (this._charHit != null && stage != null) {
+               hovered = this._charHit.hitTestPoint(stage.mouseX, stage.mouseY, false);
+            }
+            rr.PipOS_charHover = this._char3dOn && hovered;
+            rr.PipOS_charYawOffset = this._charYawOffset;
+         } catch (eci:*) {}
+      }
 
       // Sub-type line (caliber for weapons, else the category word). Pure string derivation (no TextField access).
       private function tipSubStr(stats:Object, type:String):String
@@ -2282,9 +2339,18 @@ package
       {
          this.ensureText(); if (this._dbg != null) this._dbg.mark("add");
          this.publishInventoryPage(true);
+         this._charDragging = false;
+         // root1 survives page navigation but is recreated with the Pip-Boy movie. Preserve the temporary yaw
+         // when visiting another page in this menu session; a fresh menu has no member and therefore resets.
+         try {
+            if (this._rrPoll != null && this._rrPoll.PipOS_charYawOffset != undefined) {
+               this._charYawOffset = Number(this._rrPoll.PipOS_charYawOffset);
+            } else { this._charYawOffset = 0; }
+         } catch (eyaw:*) { this._charYawOffset = 0; }
          if (stage != null) {
             stage.addEventListener(KeyboardEvent.KEY_DOWN, this.onKey);
             stage.addEventListener(MouseEvent.MOUSE_MOVE, this.onMouseMove);   // B: tooltip cursor-follow
+            stage.addEventListener(MouseEvent.MOUSE_UP, this.onCharMouseUp);
             stage.addEventListener(MouseEvent.MOUSE_WHEEL, this.onInspectWheel);   // inspect emblem zoom (acts only while inspecting)
             // P0-B page-mouse diagnostic (0.0.25) RETIRED in 0.0.27: the Loader-transparency fix in
             // Chrome.onAdded is field-confirmed (sub-tabs/list rows/hover all clickable), so the capture-phase
@@ -2336,6 +2402,7 @@ package
          // re-apply every ~15 frames (applyEquip is diff-only, so unchanged pushes cost 10 string compares).
          if (++this._eqPollN >= 15) { this._eqPollN = 0; this.applyEquip(); }
          this.tickEquipPulse(dt);
+         this.publishCharacterInteraction();
          // 0.0.62 DLL-FORWARDED RIGHT-CLICK: GFx never delivered RIGHT_MOUSE_DOWN (0.0.61 log: IV.rc=0), so the
          // DLL polls the right button and bumps root1.PipOS_rclickN on each press. Open the context menu at the
          // row currently under the cursor (PipList tracks the hover). No coords come from the DLL -- we use the
@@ -2367,9 +2434,11 @@ package
       private function onPageUnstage(e:Event):void
       {
          this.publishInventoryPage(false);
+         this._charDragging = false; this._char3dOn = false; this.publishCharacterInteraction();
          if (stage != null) {
             stage.removeEventListener(KeyboardEvent.KEY_DOWN, this.onKey);
             stage.removeEventListener(MouseEvent.MOUSE_MOVE, this.onMouseMove);
+            stage.removeEventListener(MouseEvent.MOUSE_UP, this.onCharMouseUp);
             stage.removeEventListener(MouseEvent.MOUSE_WHEEL, this.onInspectWheel);
          }
          // TEARDOWN: ENTER_FRAME broadcasts fire even off-stage, so a settled inspect (badge pulse) or an

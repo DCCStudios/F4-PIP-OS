@@ -13,7 +13,7 @@ package
    import flash.text.TextField;
 
    // PIP-OS Data page: Quests / Workshops / Stats. Keeps vanilla plumbing (onQuestSelection,
-   // SetQuestActive, ShowQuestOnMap, ShowWorkshopOnMap, PlaySmallTransition).
+   // SetQuestActive, ShowQuestOnMap, ShowWorkshopOnMap).
    public class PipOS_DataPage extends PipboyPage
    {
       private var _title:TextField;
@@ -228,7 +228,27 @@ package
       private function acquireMenu():Object
       {
          if (this._menu != null) { return this._menu; }
-         try { if (stage != null && stage.numChildren > 0) { this._menu = stage.getChildAt(0)["Menu_mc"]; } } catch (er:*) { this._menu = null; }
+         // The repaired page is a direct child of Menu_mc. A fullscreen veil can occupy stage child zero, so
+         // stage.getChildAt(0)["Menu_mc"] is lifecycle-dependent and was returning null on the field build.
+         // Prefer the actual display ancestry, then retain a stage scan only as a compatibility fallback.
+         var cur:Object = this.parent;
+         for (var depth:int = 0; cur != null && depth < 8; depth++) {
+            try {
+               if (cur["TryToSetTab"] != undefined) { this._menu = cur; return this._menu; }
+            } catch (walkErr:*) {}
+            try { cur = cur.parent; } catch (parentErr:*) { cur = null; }
+         }
+         try {
+            if (stage != null) {
+               for (var i:int = 0; i < stage.numChildren; i++) {
+                  var child:Object = stage.getChildAt(i);
+                  if (child != null && child["TryToSetTab"] != undefined) { this._menu = child; break; }
+                  if (child != null && child["Menu_mc"] != null && child["Menu_mc"]["TryToSetTab"] != undefined) {
+                     this._menu = child["Menu_mc"]; break;
+                  }
+               }
+            }
+         } catch (er:*) { this._menu = null; }
          return this._menu;
       }
       private function onSubtabClick(e:MouseEvent):void
@@ -239,10 +259,13 @@ package
          // PBT extra slots: only route if a PBT tab actually occupies that index right now.
          if (i >= 3 && (_TabNames == null || i >= _TabNames.length)) { return; }
          this.sfx("UIMenuPrevNext");
-         BGSExternalInterface.call(this.codeObj,"PlaySmallTransition");
+         Theme.life("DA.k" + i);
+         // TryToSetTab owns both the stock transition and the engine onNewTab call. Calling codeObj.onNewTab
+         // directly returns normally but does not route the DATA state in this shell, which is why the click
+         // telemetry showed DA.k1/DA.k2 with no subsequent change event.
          var m:Object = this.acquireMenu();
          var routed:Boolean = false;
-         if (m != null) { try { m.TryToSetTab(i); routed = true; } catch (er:*) { routed = false; } }
+         if (m != null) { try { m.TryToSetTab(i); routed = true; } catch (er:*) {} }
          if (!routed) { BGSExternalInterface.call(this.codeObj,"onNewTab",i); }
       }
 
